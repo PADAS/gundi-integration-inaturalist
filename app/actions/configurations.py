@@ -83,7 +83,7 @@ class PullEventsConfig(PullActionConfiguration):
             raise ValueError(f"NE Latitude {v[0]} must be greater than SW Latitude {v[2]}")
         
         if(v[1] <= v[3]):
-            raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[2]}")
+            raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
         
         return v
 
