@@ -58,23 +58,43 @@ def get_inaturalist_observations(integration: Integration, config: PullEventsCon
                        "uri", "photos", "user", "location", "place_ids", "taxon", "photos.large_url", "photos.url", "taxon.id", "taxon.rank", "taxon.name",
                        "taxon.preferred_common_name", "taxon.wikipedia_url", "taxon.conservation_status", "user.id", "user.name", "user.login",
                        "annotations.controlled_attribute_id", "annotations.controlled_value_id"])
-
-    inat_count_req = get_observations_v2(page = 1, per_page = 0, updated_since = since, project_id = config.projects, quality_grade = config.quality_grade,
-                                      taxon_id=target_taxa, nelat = float(nelat), nelng = float(nelng), swlat = float(swlat), swlng = float(swlng),
-                                      order_by = "updated_at", order="asc")
-
+    get_observations_params = { "page": 1,
+                                "per_page": 0,
+                                "updated_since": since,
+                                "project_id" : config.projects,
+                                "quality_grade" : config.quality_grade,
+                                "taxon_id" : target_taxa, 
+                                "order_by" : "updated_at", 
+                                "order" : "asc"}
+    if nelat and nelng and swlat and swlng:
+        get_observations_params["nelat"] = nelat
+        get_observations_params["nelng"] = nelng
+        get_observations_params["swlat"] = swlat
+        get_observations_params["swlng"] = swlng
+    inat_count_req = get_observations_v2(get_observations_params)
     inat_count = inat_count_req.get("total_results")
     pages = ceil(inat_count/200)
 
     observation_map = {}
     for page in range(1,pages+1):
         logger.debug(f"Loading page {page} of {pages} from iNaturalist")
-
-        response = get_observations_v2(page = page, per_page = 200, updated_since = since, project_id = config.projects,
-                                       quality_grade = config.quality_grade, taxon_id = target_taxa,
-                                       nelat = nelat, nelng = nelng, swlat = swlat, swlng = swlng,
-                                       order_by = 'updated_at', order="asc", fields=fields)
-
+        get_observations_v2_params = {
+            "page" : page,
+            "per_page" : 200, 
+            "updated_since" : since, 
+            "project_id" : config.projects,
+            "quality_grade" : config.quality_grade, 
+            "taxon_id" : target_taxa,
+            "order_by" : 'updated_at', 
+            "order":"asc", 
+            "fields":fields
+        }
+        if nelat and nelng and swlat and swlng:
+            get_observations_v2_params["nelat"] = nelat
+            get_observations_v2_params["nelng"] = nelng
+            get_observations_v2_params["swlat"] = swlat
+            get_observations_v2_params["swlng"] = swlng
+        response = get_observations_v2(get_observations_v2_params)
         observations = Observation.from_json_list(response)
 
         logger.info(f"Loaded {len(observations)} observations from iNaturalist before annotation filters.")
