@@ -71,7 +71,7 @@ def get_inaturalist_observations(integration: Integration, config: PullEventsCon
         get_observations_params["nelng"] = nelng
         get_observations_params["swlat"] = swlat
         get_observations_params["swlng"] = swlng
-    inat_count_req = get_observations_v2(get_observations_params)
+    inat_count_req = get_observations_v2(**get_observations_params)
     inat_count = inat_count_req.get("total_results")
     pages = ceil(inat_count/200)
 
@@ -94,7 +94,7 @@ def get_inaturalist_observations(integration: Integration, config: PullEventsCon
             get_observations_v2_params["nelng"] = nelng
             get_observations_v2_params["swlat"] = swlat
             get_observations_v2_params["swlng"] = swlng
-        response = get_observations_v2(get_observations_v2_params)
+        response = get_observations_v2(**get_observations_v2_params)
         observations = Observation.from_json_list(response)
 
         logger.info(f"Loaded {len(observations)} observations from iNaturalist before annotation filters.")
