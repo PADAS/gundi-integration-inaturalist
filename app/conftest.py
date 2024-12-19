@@ -717,20 +717,14 @@ def mock_gundi_sensors_client_class(
 def events_created_response():
     return [
         {
-            "id": "e1e1e1e1-e1e1-e1e1-e1e1-e1e1e1e1e1e1",
-            "title": "Animal Sighting",
-            "event_type": "wildlife_sighting_rep",
-            "recorded_at": "2024-01-29 20:51:10-03:00",
-            "location": {"lat": -51.688645, "lon": -72.704421},
-            "event_details": {"site_name": "MM Spot", "species": "lion"},
+            "object_id": "ebe214af-3b8a-4ff3-be5b-739883aa25c0",
+            "created_at": "2024-12-18T20:04:38.507384Z",
+            "updated_at": None,
         },
         {
-            "id": "e1e1e1e1-e1e1-e1e1-e1e1-e1e1e1e1e1e2",
-            "title": "Animal Sighting",
-            "event_type": "wildlife_sighting_rep",
-            "recorded_at": "2024-01-29 20:51:25-03:00",
-            "location": {"lat": -51.688646, "lon": -72.704421},
-            "event_details": {"site_name": "MM Spot", "species": "lion"},
+            "object_id": "ebe214af-3b8a-4ff3-be5b-739883aa25c1",
+            "created_at": "2024-12-19T20:04:38.507384Z",
+            "updated_at": None,
         },
     ]
 
