@@ -24,7 +24,7 @@ async def test_execute_pull_observations_action(
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted")
+    assert response["result"].get("events_extracted") == 7
     assert response["result"].get("events_updated") == 0
     assert response["result"].get("photos_attached")
     assert mock_get_observations_v2.called
@@ -52,7 +52,7 @@ async def test_execute_pull_observations_action_without_bounding_box(
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted")
+    assert response["result"].get("events_extracted") == 7
     assert response["result"].get("events_updated") == 0
     assert response["result"].get("photos_attached")
     assert mock_get_observations_v2.called
