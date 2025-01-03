@@ -33,7 +33,7 @@ async def execute_action(integration_id: str, action_id: str, config_overrides: 
                 # ToDo: Store configs and update it on changes (event-driven architecture)
                 integration = await _portal.get_integration_details(integration_id=integration_id)
     except Exception as e:
-        message = f"Error retrieving configuration for integration '{integration_id}': {e}"
+        message = f"Error retrieving integration '{integration_id}': {type(e)}: {e}"
         logger.exception(message)
         await publish_event(
             event=IntegrationActionFailed(
@@ -118,7 +118,7 @@ async def execute_action(integration_id: str, action_id: str, config_overrides: 
             content=jsonable_encoder({"detail": message}),
         )
     except Exception as e:
-        message = f"Internal error executing action '{action_id}': {e}"
+        message = f"Internal error executing action '{action_id}' for integration '{integration_id}': {type(e)}: {e}"
         logger.exception(message)
         await publish_event(
             event=IntegrationActionFailed(
