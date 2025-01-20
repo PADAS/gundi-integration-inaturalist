@@ -2,6 +2,7 @@ from typing import Optional, List, Dict
 import json
 import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     api_key: pydantic.SecretStr = pydantic.Field(..., title = "eBird API Key", 
@@ -16,7 +17,14 @@ class PullEventsConfig(PullActionConfiguration):
     event_prefix: str = pydantic.Field("iNat: ", title="Event prefix",
         description = "A string to prefix to the observed species to set a title when creating the event.  Default: 'iNat: '")
 
-    days_to_load: int = pydantic.Field(30, title = "Default number of days to load",
+    days_to_load: int = FieldWithUIOptions(
+        30,
+        title = "Default number of days to load",
+        ge=1,
+        le=30,
+        ui_options=UIOptions(
+            widget="range",  # This will be rendered ad a range slider
+        ),
         description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box for search area.  Of the format [ne_latitude, ne_longitude, sw_latitude, sw_longitude]")
@@ -35,6 +43,20 @@ class PullEventsConfig(PullActionConfiguration):
 
     include_photos: Optional[bool] = pydantic.Field(True, title="Include photos",
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
+
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
+        order=[
+            "taxa",
+            "projects",
+            "days_to_load",
+            "annotations",
+            "bounding_box",
+            "quality_grade",
+            "event_type",
+            "event_prefix",
+            "include_photos",
+        ],
+    )
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
