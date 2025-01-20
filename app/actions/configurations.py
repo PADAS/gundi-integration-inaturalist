@@ -45,6 +45,8 @@ class PullEventsConfig(PullActionConfiguration):
 
     @pydantic.validator("annotations", always=True)
     def validate_json(cls, v):
+        if not v:
+            return None
         v = v.strip()
         if(v == ""):
             return None
