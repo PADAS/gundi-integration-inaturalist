@@ -29,7 +29,7 @@ class PullEventsConfig(PullActionConfiguration):
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box for search area.  Of the format [ne_latitude, ne_longitude, sw_latitude, sw_longitude]")
 
-    projects: Optional[List[int]] = pydantic.Field(title = "Project IDs", 
+    projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist.")
     
     taxa: Optional[List[str]] = pydantic.Field(title = "Taxa IDs", 
