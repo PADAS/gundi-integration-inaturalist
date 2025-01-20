@@ -48,10 +48,10 @@ class PullEventsConfig(PullActionConfiguration):
         order=[
             "taxa",
             "projects",
+            "quality_grade",
             "days_to_load",
             "annotations",
             "bounding_box",
-            "quality_grade",
             "event_type",
             "event_prefix",
             "include_photos",
