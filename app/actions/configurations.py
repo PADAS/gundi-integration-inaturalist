@@ -5,8 +5,8 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
-    api_key: pydantic.SecretStr = pydantic.Field(..., title = "eBird API Key", 
-                                  description = "API key generated from eBird's website at https://ebird.org/api/keygen",
+    api_key: pydantic.SecretStr = pydantic.Field(..., title = "iNaturalist API Key",
+                                  description = "API key generated from iNat",
                                   format="password")
     
 class PullEventsConfig(PullActionConfiguration):
