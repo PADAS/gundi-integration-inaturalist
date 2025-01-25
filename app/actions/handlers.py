@@ -172,8 +172,8 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
             if response:
                 # Send images as attachments (if available)
                 if action_config.include_photos:
-                    response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
-                    attachment_count += len(response)
+                    attachments_response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
+                    attachment_count += attachments_response
                 # Process events to patch
                 await save_events_state(response, to_add_chunk, integration)
 
@@ -188,7 +188,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
 
     if events_to_patch:
         # Process events to patch
-        logger.info(f"Updating {len(events_to_patch)} from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
+        logger.info(f"Updating {len(events_to_patch)} events from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
         response = await patch_events(events_to_patch, action_config, integration)
         updated_count += len(response)
         
@@ -198,7 +198,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
 
 
 async def process_attachments(events, response, all_event_photos, integration):
-    responses = []
+    attachments_processed = 0
     for event, event_id in zip(events, response):
         inat_id = event['event_details']['inat_id']
         gundi_id = event_id['object_id']
@@ -217,7 +217,8 @@ async def process_attachments(events, response, all_event_photos, integration):
                 attachments=attachments,
                 integration_id=str(integration.id)
             )
-            responses.append(response)
+            if response:
+                attachments_processed += len(attachments)
         except Exception as e:
             message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}."
             logger.exception(message, extra={
@@ -225,7 +226,7 @@ async def process_attachments(events, response, all_event_photos, integration):
                 "attention_needed": True
             })
             raise e
-    return responses
+    return attachments_processed
 
 
 async def patch_events(events, updated_config_data, integration):
