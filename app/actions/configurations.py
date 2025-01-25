@@ -18,10 +18,10 @@ class PullEventsConfig(PullActionConfiguration):
         description = "A string to prefix to the observed species to set a title when creating the event.  Default: 'iNat: '")
 
     days_to_load: int = FieldWithUIOptions(
-        30,
+        5,
         title = "Default number of days to load",
         ge=1,
-        le=30,
+        le=10,
         ui_options=UIOptions(
             widget="range",  # This will be rendered ad a range slider
         ),

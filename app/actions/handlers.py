@@ -1,24 +1,21 @@
 import httpx
 import logging
-import json
+
 from datetime import datetime, timezone, timedelta
 from math import ceil
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_events_to_gundi, update_event_in_gundi, send_event_attachments_to_gundi
 from app.services.state import IntegrationStateManager
-from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
-from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
 from pyinaturalist import get_observations_v2, Observation, Annotation
-from pydantic import BaseModel, parse_obj_as
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
 import re
 
-GUNDI_SUBMISSION_CHUNK_SIZE = 10
+GUNDI_SUBMISSION_CHUNK_SIZE = 100
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -112,88 +109,159 @@ def chunk_list(list_a, chunk_size):
     yield list_a[i:i + chunk_size]
 
 @activity_logger()
-async def action_pull_events(integration:Integration, action_config: PullEventsConfig):
+async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
 
     logger.info(f"Executing 'pull_events' action with integration {integration} and action_config {action_config}...")
 
     state = await state_manager.get_state(integration.id, "pull_events")
 
     last_run = state.get('updated_to') or state.get('last_run')
-    load_since = None
     now = datetime.now(tz=timezone.utc)
     if(last_run):
         load_since = datetime.strptime(last_run, '%Y-%m-%d %H:%M:%S%z')
     else:
         load_since = now - timedelta(days=action_config.days_to_load)
 
-
     observations = get_inaturalist_observations(integration, action_config, load_since)
     logger.info(f"Processing {len(observations)} observations from iNaturalist.")
-    
-    all_event_photos = {}
-    newest = None
-    events_to_process = []
-    for ob in observations.values():
-        
-        if(not newest or (newest < ob.created_at)):
-            newest = ob.created_at
 
-        e = _transform_inat_to_gundi_event(ob, action_config)
-        events_to_process.append(e)
-        
-        inat_id = e['event_details']['inat_id']
-        all_event_photos[inat_id] = []
-        for photo in ob.photos:
-            all_event_photos[inat_id].append((photo.id, photo.large_url if photo.large_url else photo.url))
+    async def get_inaturalist_events_to_patch():
+        # Get through the events and check if state_manager has it recorded from a previous execution
+        patch_these_events = []
+        obs_to_filter = observations.copy()
+        for event_id, observation in obs_to_filter.items():
+            saved_event = await state_manager.get_state(str(integration.id), "pull_events", str(event_id))
+            if saved_event:
+                # Event already exists, will patch it
+                patch_these_events.append((saved_event.get("object_id"), observation))
+                observations.pop(event_id)
+        return observations, patch_these_events
 
-    id_map = state.get("inat_to_gundi", {})
+    observations, events_to_patch = await get_inaturalist_events_to_patch()
 
-    logger.info(f"Submitting {len(events_to_process)} iNaturalist observations to Gundi")
-    i = 0
     updated_count = 0
     added_count = 0
     attachment_count = 0
-    for to_add_chunk in chunk_list(events_to_process, GUNDI_SUBMISSION_CHUNK_SIZE):
-        
-        if(len(events_to_process) > GUNDI_SUBMISSION_CHUNK_SIZE):
-            i += 1
-            logger.info(f"Processing chunk #{i}")
-    
-        for e in to_add_chunk:
-            e_id = e['event_details']['inat_id']
-            if(e_id) in id_map: 
-                await update_event_in_gundi(event_id = id_map[e_id], event = e, integration_id=str(integration.id))
-                updated_count += 1
-            
-            else:
-                response = await send_events_to_gundi(events=[e], integration_id=str(integration.id))
-                added_count += 1
-                
-                inat_id = e['event_details']['inat_id']
-                id_map[inat_id] = response[0]['object_id']
 
-                if(action_config.include_photos):
-                    for (photo_id, photo_url) in all_event_photos[inat_id]:
-                        gundi_id = response[0]['object_id']
+    if observations:
+        all_event_photos = {}
+        newest = None
+        events_to_process = []
+        for ob in observations.values():
 
-                        logger.info(f"Adding {photo_url} from iNat event {inat_id} to Gundi event {gundi_id}")
-                        fp = urlretrieve(photo_url)
-                        path = urlparse(photo_url).path
-                        ext = re.split(r".*\.", path)[1]
-                        filename = str(photo_id) + "." + ext
-                        attachments = [(filename, open(fp[0], 'rb'))]
-                        await send_event_attachments_to_gundi(event_id = gundi_id, attachments = attachments, integration_id=str(integration.id))
-                        attachment_count += 1
+            if(not newest or (newest < ob.created_at)):
+                newest = ob.created_at
 
-            last_updated = e['event_details']['updated_at']
+            e = _transform_inat_to_gundi_event(ob, action_config)
+            events_to_process.append(e)
+
+            inat_id = e['event_details']['inat_id']
+            all_event_photos[inat_id] = []
+            for photo in ob.photos:
+                all_event_photos[inat_id].append((photo.id, photo.large_url if photo.large_url else photo.url))
+
+        logger.info(f"Submitting {len(events_to_process)} iNaturalist observations to Gundi")
+
+        for i, to_add_chunk in enumerate(chunk_list(events_to_process, GUNDI_SUBMISSION_CHUNK_SIZE)):
+
+            logger.info(f"Processing chunk #{i+1}")
+
+            response = await send_events_to_gundi(events=to_add_chunk, integration_id=str(integration.id))
+            added_count += len(response)
+
+            if response:
+                # Send images as attachments (if available)
+                if action_config.include_photos:
+                    response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
+                    attachment_count += len(response)
+                # Process events to patch
+                await save_events_state(response, to_add_chunk, integration)
+
+        last_updated = events_to_process[-1]['event_details']['updated_at']
 
         logger.info(f"Updating state through {last_updated}")
-        state = {"last_run": last_updated.strftime('%Y-%m-%d %H:%M:%S%z'), "inat_to_gundi": id_map}
+        state = {"last_run": last_updated.strftime('%Y-%m-%d %H:%M:%S%z')}
         await state_manager.set_state(str(integration.id), "pull_events", state)
+
+    else:
+        logger.info(f"No new iNaturalist observations to process for integration ID: {str(integration.id)}.")
+
+    if events_to_patch:
+        # Process events to patch
+        logger.info(f"Updating {len(events_to_patch)} from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
+        response = await patch_events(events_to_patch, action_config, integration)
+        updated_count += len(response)
         
     return {'result': {'events_extracted': added_count,
                        'events_updated': updated_count,
                        'photos_attached': attachment_count}}
+
+
+async def process_attachments(events, response, all_event_photos, integration):
+    responses = []
+    for event, event_id in zip(events, response):
+        inat_id = event['event_details']['inat_id']
+        gundi_id = event_id['object_id']
+        attachments = []
+        try:
+            for photo_id, photo_url in all_event_photos.get(inat_id, []):
+                logger.info(f"Adding {photo_url} from iNat event {inat_id} to Gundi event {gundi_id}")
+                fp = urlretrieve(photo_url)
+                path = urlparse(photo_url).path
+                ext = re.split(r".*\.", path)[1]
+                filename = str(photo_id) + "." + ext
+                attachments.append((filename, open(fp[0], 'rb')))
+
+            response = await send_event_attachments_to_gundi(
+                event_id=gundi_id,
+                attachments=attachments,
+                integration_id=str(integration.id)
+            )
+            responses.append(response)
+        except Exception as e:
+            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}."
+            logger.exception(message, extra={
+                "integration_id": str(integration.id),
+                "attention_needed": True
+            })
+            raise e
+    return responses
+
+
+async def patch_events(events, updated_config_data, integration):
+    responses = []
+    for event in events:
+        gundi_object_id = event[0]
+        new_event = event[1]
+        transformed_data = _transform_inat_to_gundi_event(new_event, updated_config_data)
+        if transformed_data:
+            response = update_event_in_gundi(
+                event_id=gundi_object_id,
+                event=transformed_data,
+                integration_id=str(integration.id)
+            )
+            responses.append(response)
+    return responses
+
+
+async def save_events_state(response, events, integration):
+    for saved_event, event in zip(response, events):
+        try:
+            event_id = event["event_details"]["inat_id"]
+            await state_manager.set_state(
+                integration_id=str(integration.id),
+                action_id="pull_events",
+                state=saved_event,
+                source_id=event_id
+            )
+        except Exception as e:
+            message = f"Error while saving event ID '{event.get('event_id')}'. Exception: {e}."
+            logger.exception(message, extra={
+                "integration_id": str(integration.id),
+                "attention_needed": True
+            })
+            raise e
+
 
 def _match_annotations_to_config(annotations: List[Annotation], config: Dict[int, List[int]]):
     annot_map = {}
@@ -216,7 +284,7 @@ def _transform_inat_to_gundi_event(ob: Observation, config: PullEventsConfig):
     
     event = {
         "event_type": config.event_type,
-        "recorded_at": ob.observed_on if ob.observed_on else ob.created_at,
+        "recorded_at": ob.observed_on.replace(tzinfo=timezone.utc) if ob.observed_on else ob.created_at,
         "event_details": {
             "inat_id": str(ob.id),
             "captive": ob.captive,
