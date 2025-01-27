@@ -54,7 +54,7 @@ def inaturalist_integration_v2():
         'days_to_load': {
             'type': 'integer',
             'title': 'Default number of days to load',
-            'default': 5,
+            'default': 30,
             'description': 'The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.'
         },
         'event_prefix': {
@@ -85,7 +85,7 @@ def inaturalist_integration_v2():
     'event_type': 'inat_observation',
     'annotations': '',
     'bounding_box': '[-27.698830, 48.472099, -27.759075, -48.527430]',
-    'days_to_load': 5,
+    'days_to_load': 30,
     'event_prefix': 'iNat: ',
     'quality_grade': [],
     'include_photos': True
@@ -141,7 +141,7 @@ def inaturalist_integration_v2_without_bounding_box():
         'days_to_load': {
             'type': 'integer',
             'title': 'Default number of days to load',
-            'default': 5,
+            'default': 30,
             'description': 'The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.'
         },
         'event_prefix': {
@@ -172,7 +172,7 @@ def inaturalist_integration_v2_without_bounding_box():
     'event_type': 'inat_observation',
     'annotations': '',
     'bounding_box': '',
-    'days_to_load': 5,
+    'days_to_load': 30,
     'event_prefix': 'iNat: ',
     'quality_grade': [],
     'include_photos': True
