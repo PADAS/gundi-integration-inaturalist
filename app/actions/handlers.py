@@ -236,7 +236,7 @@ async def patch_events(events, updated_config_data, integration):
         new_event = event[1]
         transformed_data = _transform_inat_to_gundi_event(new_event, updated_config_data)
         if transformed_data:
-            response = update_event_in_gundi(
+            response = await update_event_in_gundi(
                 event_id=gundi_object_id,
                 event=transformed_data,
                 integration_id=str(integration.id)
