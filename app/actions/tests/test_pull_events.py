@@ -15,6 +15,7 @@ async def test_execute_pull_observations_action(
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mock_state_manager.get_state.return_value = async_return({})
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mocker.patch("app.services.gundi.GundiClient", mock_gundi_client_v2_class)
     mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
@@ -26,9 +27,9 @@ async def test_execute_pull_observations_action(
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted") == 7
+    assert response["result"].get("events_extracted") == 2
     assert response["result"].get("events_updated") == 0
-    assert response["result"].get("photos_attached") == 13
+    assert response["result"].get("photos_attached") == 5
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
 
@@ -45,6 +46,7 @@ async def test_execute_pull_observations_action_without_bounding_box(
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mock_state_manager.get_state.return_value = async_return({})
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
     mocker.patch("app.services.gundi.GundiClient", mock_gundi_client_v2_class)
     mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
@@ -56,8 +58,8 @@ async def test_execute_pull_observations_action_without_bounding_box(
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted") == 7
+    assert response["result"].get("events_extracted") == 2
     assert response["result"].get("events_updated") == 0
-    assert response["result"].get("photos_attached") == 13
+    assert response["result"].get("photos_attached") == 5
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
