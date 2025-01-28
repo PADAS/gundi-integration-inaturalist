@@ -4,10 +4,10 @@ import logging
 from datetime import datetime, timezone, timedelta
 from math import ceil
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig
-from app.services.activity_logger import activity_logger
+from app.services.activity_logger import activity_logger, log_activity
 from app.services.gundi import send_events_to_gundi, update_event_in_gundi, send_event_attachments_to_gundi
 from app.services.state import IntegrationStateManager
-from gundi_core.schemas.v2 import Integration
+from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import get_observations_v2, Observation, Annotation
 from typing import Dict, List
 from urllib.parse import urlparse
@@ -123,31 +123,48 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         load_since = now - timedelta(days=action_config.days_to_load)
 
     observations = get_inaturalist_observations(integration, action_config, load_since)
+
+    if not observations:
+        msg = f"No new iNaturalist observations to process for integration ID: {str(integration.id)}."
+        logger.info(msg)
+        await log_activity(
+            integration_id=integration.id,
+            action_id="pull_events",
+            level=LogLevel.WARNING,
+            title=msg,
+            data={"message": msg}
+        )
+        return {'result': {'events_extracted': 0,
+                           'events_updated': 0,
+                           'photos_attached': 0}}
+
     logger.info(f"Processing {len(observations)} observations from iNaturalist.")
 
     async def get_inaturalist_events_to_patch():
         # Get through the events and check if state_manager has it recorded from a previous execution
         patch_these_events = []
-        obs_to_filter = observations.copy()
-        for event_id, observation in obs_to_filter.items():
+        process_these_events = []
+        for event_id, observation in observations.items():
             saved_event = await state_manager.get_state(str(integration.id), "pull_events", str(event_id))
             if saved_event:
                 # Event already exists, will patch it
                 patch_these_events.append((saved_event.get("object_id"), observation))
-                observations.pop(event_id)
-        return observations, patch_these_events
+            else:
+                process_these_events.append(observation)
+        return process_these_events, patch_these_events
 
-    observations, events_to_patch = await get_inaturalist_events_to_patch()
+    filtered_observations, events_to_patch = await get_inaturalist_events_to_patch()
+
+    events_to_process = []
 
     updated_count = 0
     added_count = 0
     attachment_count = 0
 
-    if observations:
+    if filtered_observations:
         all_event_photos = {}
         newest = None
-        events_to_process = []
-        for ob in observations.values():
+        for ob in filtered_observations:
 
             if(not newest or (newest < ob.created_at)):
                 newest = ob.created_at
@@ -177,12 +194,6 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
                 # Process events to patch
                 await save_events_state(response, to_add_chunk, integration)
 
-        last_updated = events_to_process[-1]['event_details']['updated_at']
-
-        logger.info(f"Updating state through {last_updated}")
-        state = {"last_run": last_updated.strftime('%Y-%m-%d %H:%M:%S%z')}
-        await state_manager.set_state(str(integration.id), "pull_events", state)
-
     else:
         logger.info(f"No new iNaturalist observations to process for integration ID: {str(integration.id)}.")
 
@@ -191,6 +202,13 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         logger.info(f"Updating {len(events_to_patch)} events from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
         response = await patch_events(events_to_patch, action_config, integration)
         updated_count += len(response)
+
+    # Taking the most recent 'updated_at' date from all the extracted obs from iNaturalist
+    last_updated = max(ob.updated_at for ob in observations.values())
+
+    logger.info(f"Updating state through {last_updated}")
+    state = {"last_run": last_updated.strftime('%Y-%m-%d %H:%M:%S%z')}
+    await state_manager.set_state(str(integration.id), "pull_events", state)
         
     return {'result': {'events_extracted': added_count,
                        'events_updated': updated_count,
