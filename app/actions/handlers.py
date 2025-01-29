@@ -248,12 +248,15 @@ async def process_attachments(events, response, all_event_photos, integration):
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
+            log_data = {"message": message}
+            if server_response := getattr(e, "response", None):
+                log_data["server_response_body"] = server_response.text
             await log_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
                 level=LogLevel.WARNING,
                 title=message,
-                data={"message": message}
+                data=log_data
             )
             continue
     return attachments_processed
