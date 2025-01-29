@@ -220,9 +220,12 @@ async def process_attachments(events, response, all_event_photos, integration):
     for event, event_id in zip(events, response):
         inat_id = event['event_details']['inat_id']
         gundi_id = event_id['object_id']
+        available_photos = all_event_photos.get(inat_id, [])
+        if not available_photos:
+            continue
         attachments = []
         try:
-            for photo_id, photo_url in all_event_photos.get(inat_id, []):
+            for photo_id, photo_url in available_photos:
                 logger.info(f"Adding {photo_url} from iNat event {inat_id} to Gundi event {gundi_id}")
                 fp = urlretrieve(photo_url)
                 path = urlparse(photo_url).path
