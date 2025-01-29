@@ -238,12 +238,24 @@ async def process_attachments(events, response, all_event_photos, integration):
             if response:
                 attachments_processed += len(attachments)
         except Exception as e:
-            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}."
+            request = {
+                "event_id": gundi_id,
+                "attachments": attachments,
+                "integration_id": str(integration.id)
+            }
+            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"
             logger.exception(message, extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
-            raise e
+            await log_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.WARNING,
+                title=message,
+                data={"message": message}
+            )
+            continue
     return attachments_processed
 
 
