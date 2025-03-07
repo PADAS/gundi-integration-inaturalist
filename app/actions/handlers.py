@@ -3,17 +3,15 @@ import logging
 
 from datetime import datetime, timezone, timedelta
 from math import ceil
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessAttachmentsPerChunkConfig
+from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_events_to_gundi, update_event_in_gundi, send_event_attachments_to_gundi
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import get_observations_v2, Observation, Annotation
 from typing import Dict, List
-from urllib.parse import urlparse
-from urllib.request import urlretrieve
 
-import re
 
 GUNDI_SUBMISSION_CHUNK_SIZE = 100
 
@@ -159,7 +157,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
 
     updated_count = 0
     added_count = 0
-    attachment_count = 0
+    triggered_process_attachments_actions = 0
 
     if filtered_observations:
         all_event_photos = {}
@@ -189,8 +187,14 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
             if response:
                 # Send images as attachments (if available)
                 if action_config.include_photos:
-                    attachments_response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
-                    attachment_count += attachments_response
+                    # Trigger 'process_attachments' action for each chunk
+                    config = ProcessAttachmentsPerChunkConfig(
+                        observations_chunk=to_add_chunk,
+                        observations_response=response,
+                        event_photos=all_event_photos
+                    )
+                    await trigger_action(integration.id, "process_attachments_per_chunk", config=config)
+                    triggered_process_attachments_actions += 1
                 # Process events to patch
                 await save_events_state(response, to_add_chunk, integration)
 
@@ -212,15 +216,16 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         
     return {'result': {'events_extracted': added_count,
                        'events_updated': updated_count,
-                       'photos_attached': attachment_count}}
+                       'triggered_process_attachments_actions': triggered_process_attachments_actions}}
 
 
-async def process_attachments(events, response, all_event_photos, integration):
+@activity_logger()
+async def action_process_attachments_per_chunk(integration: Integration, action_config: ProcessAttachmentsPerChunkConfig):
     attachments_processed = 0
-    for event, event_id in zip(events, response):
+    for event, event_id in zip(action_config.observations_chunk, action_config.observations_response):
         inat_id = event['event_details']['inat_id']
         gundi_id = event_id['object_id']
-        available_photos = all_event_photos.get(inat_id, [])
+        available_photos = action_config.event_photos.get(inat_id, [])
         if not available_photos:
             continue
         attachments = []
@@ -267,7 +272,7 @@ async def process_attachments(events, response, all_event_photos, integration):
                 data=log_data
             )
             continue
-    return attachments_processed
+    return {'result': {'attachments_processed': attachments_processed}}
 
 
 async def patch_events(events, updated_config_data, integration):

@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict
 import json
 import pydantic
-from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -123,3 +123,8 @@ class PullEventsConfig(PullActionConfiguration):
             ],
             "required": ["bounding_box", "days_to_load"]
         }
+
+class ProcessAttachmentsPerChunkConfig(InternalActionConfiguration):
+    observations_chunk: List[dict]
+    observations_response: List[dict]
+    event_photos: dict
