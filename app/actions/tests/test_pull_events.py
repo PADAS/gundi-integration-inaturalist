@@ -17,8 +17,12 @@ async def test_execute_pull_observations_action(
     mock_config_manager.get_integration_details.return_value = async_return(inaturalist_integration_v2)
     mock_config_manager.get_action_configuration.return_value = async_return(inaturalist_integration_v2.configurations[0])
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.execute_action", return_value=None)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mock_state_manager.get_state.return_value = async_return({})
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
@@ -38,6 +42,8 @@ async def test_execute_pull_observations_action(
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
 
+    mock_trigger_action.assert_called_once()
+
 
 @pytest.mark.asyncio
 async def test_execute_pull_observations_action_without_bounding_box(
@@ -51,8 +57,12 @@ async def test_execute_pull_observations_action_without_bounding_box(
     mock_config_manager.get_integration_details.return_value = async_return(inaturalist_integration_v2_without_bounding_box)
     mock_config_manager.get_action_configuration.return_value = async_return(inaturalist_integration_v2_without_bounding_box.configurations[0])
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.execute_action", return_value=None)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mock_state_manager.get_state.return_value = async_return({})
     mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
