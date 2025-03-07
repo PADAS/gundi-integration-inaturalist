@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from math import ceil
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig
-from app.services.activity_logger import activity_logger, log_activity
+from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import send_events_to_gundi, update_event_in_gundi, send_event_attachments_to_gundi
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2 import Integration, LogLevel
@@ -127,7 +127,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     if not observations:
         msg = f"No new iNaturalist observations to process for integration ID: {str(integration.id)}."
         logger.info(msg)
-        await log_activity(
+        await log_action_activity(
             integration_id=integration.id,
             action_id="pull_events",
             level=LogLevel.WARNING,
@@ -227,11 +227,16 @@ async def process_attachments(events, response, all_event_photos, integration):
         try:
             for photo_id, photo_url in available_photos:
                 logger.info(f"Adding {photo_url} from iNat event {inat_id} to Gundi event {gundi_id}")
-                fp = urlretrieve(photo_url)
-                path = urlparse(photo_url).path
-                ext = re.split(r".*\.", path)[1]
-                filename = str(photo_id) + "." + ext
-                attachments.append((filename, open(fp[0], 'rb')))
+
+                filename = str(photo_id) + "." + photo_url.split(".")[-1]
+
+                async with httpx.AsyncClient(timeout=120, verify=False) as session:
+                    image_response = await session.get(photo_url)
+                    image_response.raise_for_status()
+
+                img = await image_response.aread()
+
+                attachments.append((filename, img))
 
             response = await send_event_attachments_to_gundi(
                 event_id=gundi_id,
@@ -254,7 +259,7 @@ async def process_attachments(events, response, all_event_photos, integration):
             log_data = {"message": message}
             if server_response := getattr(e, "response", None):
                 log_data["server_response_body"] = server_response.text
-            await log_activity(
+            await log_action_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
                 level=LogLevel.WARNING,
