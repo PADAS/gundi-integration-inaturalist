@@ -1,4 +1,6 @@
 import pytest
+
+from app import settings
 from app.conftest import async_return
 from app.services.action_runner import execute_action
 
@@ -9,6 +11,9 @@ async def test_execute_pull_observations_action(
         mock_get_gundi_api_key, mock_gundi_sensors_client_class, mock_config_manager,
         mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class
 ):
+    settings.TRIGGER_ACTIONS_ALWAYS_SYNC = False
+    settings.INTEGRATION_COMMANDS_TOPIC = "inaturalist-actions-topic"
+
     mock_config_manager.get_integration_details.return_value = async_return(inaturalist_integration_v2)
     mock_config_manager.get_action_configuration.return_value = async_return(inaturalist_integration_v2.configurations[0])
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
@@ -40,6 +45,9 @@ async def test_execute_pull_observations_action_without_bounding_box(
         mock_get_gundi_api_key, mock_gundi_sensors_client_class, mock_config_manager,
         mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class
 ):
+    settings.TRIGGER_ACTIONS_ALWAYS_SYNC = False
+    settings.INTEGRATION_COMMANDS_TOPIC = "inaturalist-actions-topic"
+
     mock_config_manager.get_integration_details.return_value = async_return(inaturalist_integration_v2_without_bounding_box)
     mock_config_manager.get_action_configuration.return_value = async_return(inaturalist_integration_v2_without_bounding_box.configurations[0])
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
