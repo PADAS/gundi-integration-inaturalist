@@ -81,3 +81,5 @@ async def test_execute_pull_observations_action_without_bounding_box(
     assert response["result"].get("triggered_process_attachments_actions") == 1
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
+
+    mock_trigger_action.assert_called_once()
