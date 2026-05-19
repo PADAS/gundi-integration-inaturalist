@@ -180,6 +180,21 @@ def inaturalist_integration_v2_without_bounding_box():
 
 
 @pytest.fixture
+def inaturalist_integration_v2_with_taxa_string():
+    return Integration(id = UUID('f03ec73e-f3fe-41b6-8597-3eb89dde5ae1'), name = 'Test iNaturalist', type = IntegrationType(id = UUID('7ea7b0a7-71fc-4577-936d-268dd45137f0'), name = 'iNaturalist', value = 'inaturalist', description = 'Default type for integrations with Inaturalist', actions = [IntegrationAction(id = UUID('6e17fd45-903a-4cb2-bd61-ee2db7abf31a'), type = 'pull', name = 'Pull Events', value = 'pull_events', description = 'Inaturalist Pull Events action', action_schema = {}, ui_schema = {})], webhook = None), base_url = '', enabled = True, owner = Organization(id = UUID('9d0ceb0f-648f-4ffa-91ea-f2973796ffa2'), name = 'Chicago Parks', description = ''), configurations = [IntegrationActionConfiguration(id = UUID('39e0a6db-c7cd-4ab1-a9d8-13416eee04ab'), integration = UUID('f03ec73e-f3fe-41b6-8597-3eb89dde5ae1'), action = IntegrationActionSummary(id = UUID('6e17fd45-903a-4cb2-bd61-ee2db7abf31a'), type = 'pull', name = 'Pull Events', value = 'pull_events'), data = {
+    'taxa': '1633134, 1314810, 1128559',
+    'projects': [],
+    'event_type': 'inat_observation',
+    'annotations': '',
+    'bounding_box': '',
+    'days_to_load': 5,
+    'event_prefix': 'iNat: ',
+    'quality_grade': [],
+    'include_photos': True
+})], webhook_configuration = None, default_route = ConnectionRoute(id = UUID('a3a1f096-43fe-4102-8742-bd4f2c539a4d'), name = 'Test iNaturalist - Default Route'), additional = {}, status = 'healthy', status_details = 'No issues detected')
+
+
+@pytest.fixture
 def mock_get_observations_v2(mocker, 
                              mock_get_observations_v2_first_response,
                              mock_get_observations_v2_page_response,
