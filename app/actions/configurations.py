@@ -32,8 +32,8 @@ class PullEventsConfig(PullActionConfiguration):
     projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist.")
     
-    taxa: Optional[List[str]] = pydantic.Field(title = "Taxa IDs", 
-        description="List of iNaturalist taxa IDs for which to load observations.")
+    taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
+        description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890').")
     
     quality_grade: Optional[List[str]] = pydantic.Field(title = "Quality Grade",
         description = "If present, only observations that have one of the entered quality grades will be included.  As of November, 2024, valid iNaturalist values are casual, needs_id and/or research.")
@@ -57,6 +57,12 @@ class PullEventsConfig(PullActionConfiguration):
             "include_photos",
         ],
     )
+
+    @pydantic.validator("taxa", pre=True, always=True)
+    def coerce_taxa_list_to_str(cls, v):
+        if isinstance(v, list):
+            return ",".join(str(t) for t in v if t)
+        return v
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)

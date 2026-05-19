@@ -41,11 +41,45 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
     return True
 
 
+TAXA_BATCH_SIZE = 100
+INAT_PAGE_SIZE = 200
+
+
+def _get_observations_for_taxa_batch(
+    base_params: Dict,
+    taxa_batch: Optional[str],
+    annotations: Optional[Dict],
+    fields: str,
+) -> Dict[int, Observation]:
+    params = {**base_params}
+    if taxa_batch:
+        params["taxon_id"] = taxa_batch
+
+    count_params = {**params, "page": 1, "per_page": 0}
+    inat_count = (get_observations_v2(**count_params).get("total_results") or 0)
+    pages = ceil(inat_count / INAT_PAGE_SIZE) if inat_count else 0
+
+    observation_map = {}
+    for page in range(1, pages + 1):
+        logger.debug("Loading page %s of %s from iNaturalist", page, pages)
+        response = get_observations_v2(**{**params, "page": page, "per_page": INAT_PAGE_SIZE, "fields": fields})
+        observations = Observation.from_json_list(response)
+        logger.info("Loaded %s observations from iNaturalist before annotation filters.", len(observations))
+        for o in observations:
+            if annotations:
+                if _match_annotations_to_config(o.annotations, annotations):
+                    observation_map[o.id] = o
+            else:
+                observation_map[o.id] = o
+
+    return observation_map
+
+
 def get_observations(
     since: datetime,
     *,
     bounding_box: Optional[List[float]] = None,
-    taxa: Optional[List[str]] = None,
+    taxa: Optional[str] = None,
     projects: Optional[List[str]] = None,
     quality_grade: Optional[List[str]] = None,
     annotations: Optional[Dict] = None,
@@ -60,7 +94,6 @@ def get_observations(
     if bounding_box and len(bounding_box) >= 4:
         nelat, nelng, swlat, swlng = bounding_box[:4]
 
-    target_taxa = ",".join(str(t) for t in (taxa or []))
     fields = ",".join(OBSERVATION_FIELDS)
 
     base_params = {
@@ -68,8 +101,6 @@ def get_observations(
         "order_by": "updated_at",
         "order": "asc",
     }
-    if target_taxa:
-        base_params["taxon_id"] = target_taxa
     if projects is not None:
         base_params["project_id"] = projects
     if quality_grade is not None:
@@ -80,32 +111,18 @@ def get_observations(
         base_params["swlat"] = swlat
         base_params["swlng"] = swlng
 
-    count_params = {**base_params, "page": 1, "per_page": 0}
-    inat_count_req = get_observations_v2(**count_params)
-    inat_count = inat_count_req.get("total_results") or 0
-    pages = ceil(inat_count / 200) if inat_count else 0
+    if taxa:
+        taxa_ids = [t.strip() for t in taxa.split(",") if t.strip()]
+        batches = [
+            ",".join(taxa_ids[i:i + TAXA_BATCH_SIZE])
+            for i in range(0, len(taxa_ids), TAXA_BATCH_SIZE)
+        ]
+    else:
+        batches = [None]
 
     observation_map = {}
-    for page in range(1, pages + 1):
-        logger.debug("Loading page %s of %s from iNaturalist", page, pages)
-        page_params = {
-            **base_params,
-            "page": page,
-            "per_page": 200,
-            "fields": fields,
-        }
-        response = get_observations_v2(**page_params)
-        observations = Observation.from_json_list(response)
-
-        logger.info(
-            "Loaded %s observations from iNaturalist before annotation filters.",
-            len(observations),
-        )
-        for o in observations:
-            if annotations:
-                if _match_annotations_to_config(o.annotations, annotations):
-                    observation_map[o.id] = o
-            else:
-                observation_map[o.id] = o
+    for batch in batches:
+        batch_results = _get_observations_for_taxa_batch(base_params, batch, annotations, fields)
+        observation_map.update(batch_results)
 
     return observation_map
