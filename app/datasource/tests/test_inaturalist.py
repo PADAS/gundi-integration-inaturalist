@@ -113,7 +113,7 @@ def test_get_observations_passes_bounding_box_and_filters(mocker):
     get_observations(
         datetime(2024, 1, 1, tzinfo=timezone.utc),
         bounding_box=[10.0, 20.0, -10.0, -20.0],
-        taxa=["123", "456"],
+        taxa="123, 456",
         projects=["p1"],
         quality_grade=["research"],
     )
