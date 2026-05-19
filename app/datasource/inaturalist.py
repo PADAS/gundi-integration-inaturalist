@@ -111,8 +111,8 @@ def get_observations(
         base_params["swlat"] = swlat
         base_params["swlng"] = swlng
 
-    if taxa:
-        taxa_ids = [t.strip() for t in taxa.split(",") if t.strip()]
+    taxa_ids = [t.strip() for t in taxa.split(",") if t.strip()] if taxa else []
+    if taxa_ids:
         batches = [
             ",".join(taxa_ids[i:i + TAXA_BATCH_SIZE])
             for i in range(0, len(taxa_ids), TAXA_BATCH_SIZE)
