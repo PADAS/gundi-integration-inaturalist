@@ -1,7 +1,7 @@
 """iNaturalist API client for fetching observations."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import ceil
 from typing import Dict, List, Optional
 
@@ -84,13 +84,24 @@ def _get_observations_for_taxa_batch(
 
         if inat_count <= INAT_MAX_RESULTS_PER_QUERY:
             break
-        if last_updated_at is None or last_updated_at == updated_since:
+        if last_updated_at is None:
             logger.warning(
-                "Cannot advance updated_since cursor past %s; %s observations in this "
-                "window are beyond iNaturalist's %s-result pagination limit and were skipped.",
-                updated_since, inat_count - INAT_MAX_RESULTS_PER_QUERY, INAT_MAX_RESULTS_PER_QUERY,
+                "iNaturalist reported %s results for updated_since=%s but returned no "
+                "observations; stopping to avoid an infinite query loop.",
+                inat_count, updated_since,
             )
             break
+        if last_updated_at == updated_since:
+            # 10,000+ observations share this exact timestamp; the overflow within it
+            # is unreachable (iNat can't paginate past 10k), but the rest of the
+            # backlog is — step just past the timestamp and keep going.
+            logger.warning(
+                "More than %s observations share updated_at=%s; %s of them are beyond "
+                "iNaturalist's pagination limit and were skipped. Advancing cursor by 1s.",
+                INAT_MAX_RESULTS_PER_QUERY, updated_since, inat_count - INAT_MAX_RESULTS_PER_QUERY,
+            )
+            updated_since = last_updated_at + timedelta(seconds=1)
+            continue
         logger.info(
             "Window matched %s observations (over the %s pagination limit); "
             "continuing from updated_since=%s.",

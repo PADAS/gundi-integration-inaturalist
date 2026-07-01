@@ -225,6 +225,65 @@ def test_get_observations_windows_past_10k_pagination_cap(mocker):
     assert set(result.keys()) == set(range(1, total + 1))
 
 
+def test_get_observations_advances_past_pathological_shared_timestamp(mocker):
+    """When 10,000+ observations share the exact updated_since timestamp, the
+    overflow within that second is unreachable (iNat can't paginate past 10k),
+    but fetching must still advance past the timestamp and load the rest of
+    the backlog instead of stopping — otherwise the persisted cursor stays
+    pinned and every run re-fetches the same 50 pages.
+    """
+    from datetime import timedelta
+
+    import requests
+
+    base = datetime(2026, 6, 19, tzinfo=timezone.utc)
+    shared_ts = 10_400  # all at updated_at == base (the cursor timestamp)
+    later = 300  # strictly after the pathological second
+
+    def make_obs(i, updated_at):
+        return {
+            "id": i,
+            "updated_at": updated_at.isoformat(),
+            "photos": [],
+            "annotations": [],
+        }
+
+    all_obs = [make_obs(i, base) for i in range(1, shared_ts + 1)]
+    all_obs += [
+        make_obs(shared_ts + i, base + timedelta(seconds=i))
+        for i in range(1, later + 1)
+    ]
+
+    def side_effect(**kwargs):
+        page = kwargs.get("page", 1)
+        per_page = kwargs.get("per_page")
+        if per_page and page * per_page > 10_000:
+            raise requests.exceptions.HTTPError(
+                "500 Server Error: Internal Server Error"
+            )
+        since = kwargs["updated_since"]
+        matching = [
+            o for o in all_obs
+            if datetime.fromisoformat(o["updated_at"]) >= since
+        ]
+        if per_page == 0:
+            return {"total_results": len(matching), "results": []}
+        start = (page - 1) * per_page
+        return {
+            "total_results": len(matching),
+            "page": page,
+            "per_page": per_page,
+            "results": matching[start:start + per_page],
+        }
+
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=side_effect)
+    result = get_observations(base)
+    # The first 10,000 of the shared-timestamp observations plus every later
+    # observation; only the 400 overflow within the shared second are skipped.
+    assert len(result) == 10_000 + later
+    assert all(shared_ts + i in result for i in range(1, later + 1))
+
+
 def test_observation_fields_constant():
     assert "id" in OBSERVATION_FIELDS
     assert "observed_on" in OBSERVATION_FIELDS
