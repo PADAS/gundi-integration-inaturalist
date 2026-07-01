@@ -96,9 +96,11 @@ def _get_observations_for_taxa_batch(
             # is unreachable (iNat can't paginate past 10k), but the rest of the
             # backlog is — step just past the timestamp and keep going.
             logger.warning(
-                "More than %s observations share updated_at=%s; %s of them are beyond "
-                "iNaturalist's pagination limit and were skipped. Advancing cursor by 1s.",
-                INAT_MAX_RESULTS_PER_QUERY, updated_since, inat_count - INAT_MAX_RESULTS_PER_QUERY,
+                "The first %s results for updated_since=%s all share that updated_at "
+                "timestamp; advancing the cursor by 1s to continue past it. Any further "
+                "observations with that exact timestamp are beyond iNaturalist's "
+                "pagination limit and will be skipped.",
+                INAT_MAX_RESULTS_PER_QUERY, updated_since,
             )
             updated_since = last_updated_at + timedelta(seconds=1)
             continue
