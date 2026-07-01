@@ -43,6 +43,10 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
 
 TAXA_BATCH_SIZE = 100
 INAT_PAGE_SIZE = 200
+# iNat rejects pagination past 10,000 results (page * per_page > 10,000 -> 500),
+# so windows deeper than that are re-queried with updated_since advanced instead.
+INAT_MAX_RESULTS_PER_QUERY = 10_000
+MAX_PAGES_PER_WINDOW = INAT_MAX_RESULTS_PER_QUERY // INAT_PAGE_SIZE
 
 
 def _get_observations_for_taxa_batch(
@@ -55,22 +59,44 @@ def _get_observations_for_taxa_batch(
     if taxa_batch:
         params["taxon_id"] = taxa_batch
 
-    count_params = {**params, "page": 1, "per_page": 0}
-    inat_count = (get_observations_v2(**count_params).get("total_results") or 0)
-    pages = ceil(inat_count / INAT_PAGE_SIZE) if inat_count else 0
-
     observation_map = {}
-    for page in range(1, pages + 1):
-        logger.debug("Loading page %s of %s from iNaturalist", page, pages)
-        response = get_observations_v2(**{**params, "page": page, "per_page": INAT_PAGE_SIZE, "fields": fields})
-        observations = Observation.from_json_list(response)
-        logger.info("Loaded %s observations from iNaturalist before annotation filters.", len(observations))
-        for o in observations:
-            if annotations:
-                if _match_annotations_to_config(o.annotations, annotations):
+    updated_since = params["updated_since"]
+    while True:
+        window_params = {**params, "updated_since": updated_since}
+        count_params = {**window_params, "page": 1, "per_page": 0}
+        inat_count = (get_observations_v2(**count_params).get("total_results") or 0)
+        pages = min(ceil(inat_count / INAT_PAGE_SIZE), MAX_PAGES_PER_WINDOW) if inat_count else 0
+
+        last_updated_at = None
+        for page in range(1, pages + 1):
+            logger.debug("Loading page %s of %s from iNaturalist", page, pages)
+            response = get_observations_v2(**{**window_params, "page": page, "per_page": INAT_PAGE_SIZE, "fields": fields})
+            observations = Observation.from_json_list(response)
+            logger.info("Loaded %s observations from iNaturalist before annotation filters.", len(observations))
+            for o in observations:
+                if o.updated_at:
+                    last_updated_at = o.updated_at
+                if annotations:
+                    if _match_annotations_to_config(o.annotations, annotations):
+                        observation_map[o.id] = o
+                else:
                     observation_map[o.id] = o
-            else:
-                observation_map[o.id] = o
+
+        if inat_count <= INAT_MAX_RESULTS_PER_QUERY:
+            break
+        if last_updated_at is None or last_updated_at == updated_since:
+            logger.warning(
+                "Cannot advance updated_since cursor past %s; %s observations in this "
+                "window are beyond iNaturalist's %s-result pagination limit and were skipped.",
+                updated_since, inat_count - INAT_MAX_RESULTS_PER_QUERY, INAT_MAX_RESULTS_PER_QUERY,
+            )
+            break
+        logger.info(
+            "Window matched %s observations (over the %s pagination limit); "
+            "continuing from updated_since=%s.",
+            inat_count, INAT_MAX_RESULTS_PER_QUERY, last_updated_at,
+        )
+        updated_since = last_updated_at
 
     return observation_map
 
