@@ -1,2 +1,4 @@
-# Add your integration-specific dependencies here
 pyinaturalist==0.19
+# pyinaturalist 0.19 imports the pyrate-limiter v2 API via requests-ratelimiter;
+# newer requests-ratelimiter pulls pyrate-limiter v3+ and breaks at import time.
+requests-ratelimiter~=0.7.0
