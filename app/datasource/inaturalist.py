@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from math import ceil
 from typing import Dict, List, Optional
 
+import requests
 from pyinaturalist import Annotation, Observation, get_observations_v2
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,44 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
     return True
 
 
+class INatRequestError(Exception):
+    """An iNaturalist API request failed; carries the message iNat returned."""
+
+
+def _error_detail(response) -> Optional[str]:
+    """Pull iNat's own error message out of an error response body."""
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        messages = [
+            err["message"] for err in body.get("errors") or []
+            if isinstance(err, dict) and err.get("message")
+        ]
+        if messages:
+            return "; ".join(messages)
+    return (response.text or "").strip()[:500] or None
+
+
+def _call_inat(**params) -> Dict:
+    """Call the iNat observations endpoint, surfacing iNat's own error messages.
+
+    requests raises a bare "422 Client Error: ... for url: <query string>", which
+    hides the actual reason (unknown project slug, bad taxon id, ...). iNat puts
+    that in the response body, so lift it into the exception message.
+    """
+    try:
+        return get_observations_v2(**params)
+    except requests.HTTPError as e:
+        detail = _error_detail(e.response)
+        raise INatRequestError(
+            f"iNaturalist rejected the request: {detail}" if detail
+            else "iNaturalist rejected the request"
+        ) from e
+
 TAXA_BATCH_SIZE = 100
 INAT_PAGE_SIZE = 200
 # iNat rejects pagination past 10,000 results (page * per_page > 10,000 -> 500),
@@ -64,13 +103,13 @@ def _get_observations_for_taxa_batch(
     while True:
         window_params = {**params, "updated_since": updated_since}
         count_params = {**window_params, "page": 1, "per_page": 0}
-        inat_count = (get_observations_v2(**count_params).get("total_results") or 0)
+        inat_count = (_call_inat(**count_params).get("total_results") or 0)
         pages = min(ceil(inat_count / INAT_PAGE_SIZE), MAX_PAGES_PER_WINDOW) if inat_count else 0
 
         last_updated_at = None
         for page in range(1, pages + 1):
             logger.debug("Loading page %s of %s from iNaturalist", page, pages)
-            response = get_observations_v2(**{**window_params, "page": page, "per_page": INAT_PAGE_SIZE, "fields": fields})
+            response = _call_inat(**{**window_params, "page": page, "per_page": INAT_PAGE_SIZE, "fields": fields})
             observations = Observation.from_json_list(response)
             logger.info("Loaded %s observations from iNaturalist before annotation filters.", len(observations))
             for o in observations:

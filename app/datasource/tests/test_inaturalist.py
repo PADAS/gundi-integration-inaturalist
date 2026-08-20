@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
+import requests
 
 from app.datasource.inaturalist import (
     OBSERVATION_FIELDS,
+    INatRequestError,
     get_observations,
+    _call_inat,
     _match_annotations_to_config,
 )
 
@@ -288,3 +291,45 @@ def test_observation_fields_constant():
     assert "id" in OBSERVATION_FIELDS
     assert "observed_on" in OBSERVATION_FIELDS
     assert "taxon.id" in OBSERVATION_FIELDS
+
+
+# --- error message surfacing ---
+
+
+def _http_error(payload=None, text=""):
+    response = MagicMock()
+    response.json.side_effect = ValueError if payload is None else None
+    if payload is not None:
+        response.json.return_value = payload
+    response.text = text
+    return requests.HTTPError("422 Client Error: Unprocessable Entity for url: ...", response=response)
+
+
+def test_call_inat_surfaces_inat_error_message(monkeypatch):
+    """Unknown project slugs should say so, not just "422 Client Error"."""
+    payload = {"status": "422", "errors": [{"errorCode": "422", "message": "Unknown project_id: [nope]"}]}
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(payload)),
+    )
+    with pytest.raises(INatRequestError, match=r"Unknown project_id: \[nope\]"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_falls_back_to_response_text(monkeypatch):
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(text="upstream exploded")),
+    )
+    with pytest.raises(INatRequestError, match="upstream exploded"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_get_observations_raises_inat_request_error(monkeypatch):
+    payload = {"errors": [{"message": "Unknown project_id: [nope]"}]}
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(payload)),
+    )
+    with pytest.raises(INatRequestError, match=r"Unknown project_id"):
+        get_observations(datetime(2026, 1, 1, tzinfo=timezone.utc), projects=["nope"])
