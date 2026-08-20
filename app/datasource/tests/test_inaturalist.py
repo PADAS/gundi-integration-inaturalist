@@ -302,6 +302,7 @@ def _http_error(payload=None, text=""):
     if payload is not None:
         response.json.return_value = payload
     response.text = text
+    response.request = MagicMock()
     return requests.HTTPError("422 Client Error: Unprocessable Entity for url: ...", response=response)
 
 
@@ -314,6 +315,18 @@ def test_call_inat_surfaces_inat_error_message(monkeypatch):
     )
     with pytest.raises(INatRequestError, match=r"Unknown project_id: \[nope\]"):
         _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_preserves_request_and_response(monkeypatch):
+    """action_runner._handle_error reads .request/.response off the exception."""
+    error = _http_error({"errors": [{"message": "Unknown project_id: [nope]"}]})
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error)
+    )
+    with pytest.raises(INatRequestError) as excinfo:
+        _call_inat(page=1, per_page=0)
+    assert excinfo.value.response is error.response
+    assert excinfo.value.request is error.request
 
 
 def test_call_inat_falls_back_to_response_text(monkeypatch):

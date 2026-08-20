@@ -42,8 +42,12 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
     return True
 
 
-class INatRequestError(Exception):
-    """An iNaturalist API request failed; carries the message iNat returned."""
+class INatRequestError(requests.HTTPError):
+    """An iNaturalist API request failed; carries the message iNat returned.
+
+    Subclasses requests.HTTPError so the request/response metadata that
+    action_runner._handle_error reports keeps flowing through.
+    """
 
 
 def _error_detail(response) -> Optional[str]:
@@ -78,7 +82,10 @@ def _call_inat(**params) -> Dict:
         return get_observations_v2(**params)
     except requests.HTTPError as e:
         detail = _error_detail(e.response)
-        raise INatRequestError(f"{e} - {detail}" if detail else str(e)) from e
+        raise INatRequestError(
+            f"{e} - {detail}" if detail else str(e),
+            request=e.request, response=e.response,
+        ) from e
 
 
 TAXA_BATCH_SIZE = 100
