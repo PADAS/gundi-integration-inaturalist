@@ -321,7 +321,17 @@ def test_call_inat_falls_back_to_response_text(monkeypatch):
         "app.datasource.inaturalist.get_observations_v2",
         MagicMock(side_effect=_http_error(text="upstream exploded")),
     )
-    with pytest.raises(INatRequestError, match="upstream exploded"):
+    with pytest.raises(INatRequestError, match="422 Client Error.*upstream exploded"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_ignores_html_error_body(monkeypatch):
+    """An HTML error page has no quotable message; keep just the status line."""
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(text="<html><body>502 Bad Gateway</body></html>")),
+    )
+    with pytest.raises(INatRequestError, match=r"^422 Client Error[^<]*$"):
         _call_inat(page=1, per_page=0)
 
 

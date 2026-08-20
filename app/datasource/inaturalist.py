@@ -61,7 +61,10 @@ def _error_detail(response) -> Optional[str]:
         ]
         if messages:
             return "; ".join(messages)
-    return (response.text or "").strip()[:500] or None
+    text = (response.text or "").strip()
+    if text.startswith("<"):  # HTML error page from iNat or a proxy; nothing quotable
+        return None
+    return text[:500] or None
 
 
 def _call_inat(**params) -> Dict:
@@ -75,10 +78,8 @@ def _call_inat(**params) -> Dict:
         return get_observations_v2(**params)
     except requests.HTTPError as e:
         detail = _error_detail(e.response)
-        raise INatRequestError(
-            f"iNaturalist rejected the request: {detail}" if detail
-            else "iNaturalist rejected the request"
-        ) from e
+        raise INatRequestError(f"{e} - {detail}" if detail else str(e)) from e
+
 
 TAXA_BATCH_SIZE = 100
 INAT_PAGE_SIZE = 200
