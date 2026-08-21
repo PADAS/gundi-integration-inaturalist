@@ -329,6 +329,29 @@ def test_call_inat_preserves_request_and_response(monkeypatch):
     assert excinfo.value.request is error.request
 
 
+def test_call_inat_handles_non_string_messages(monkeypatch):
+    """Rails-style payloads can nest the message; coerce instead of blowing up."""
+    payload = {"errors": [{"message": {"base": ["Unknown project"]}}]}
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(payload)),
+    )
+    with pytest.raises(INatRequestError, match="Unknown project"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_truncates_long_detail(monkeypatch):
+    """A batch of bad ids can return hundreds of errors; keep the message bounded."""
+    payload = {"errors": [{"message": f"Unknown taxon_id: [{i}]"} for i in range(500)]}
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(payload)),
+    )
+    with pytest.raises(INatRequestError) as excinfo:
+        _call_inat(page=1, per_page=0)
+    assert len(str(excinfo.value)) < 700
+
+
 def test_call_inat_falls_back_to_response_text(monkeypatch):
     monkeypatch.setattr(
         "app.datasource.inaturalist.get_observations_v2",

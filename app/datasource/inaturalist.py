@@ -60,11 +60,11 @@ def _error_detail(response) -> Optional[str]:
         body = None
     if isinstance(body, dict):
         messages = [
-            err["message"] for err in body.get("errors") or []
+            str(err["message"]) for err in body.get("errors") or []
             if isinstance(err, dict) and err.get("message")
         ]
         if messages:
-            return "; ".join(messages)
+            return "; ".join(messages)[:500]
     text = (response.text or "").strip()
     if text.startswith("<"):  # HTML error page from iNat or a proxy; nothing quotable
         return None
