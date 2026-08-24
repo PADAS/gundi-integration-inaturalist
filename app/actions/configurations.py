@@ -4,6 +4,9 @@ import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
+QUALITY_GRADES = ["casual", "needs_id", "research"]
+
+
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     api_key: pydantic.SecretStr = pydantic.Field(..., title = "iNaturalist API Key",
                                   description = "API key generated from iNat",
@@ -82,6 +85,17 @@ class PullEventsConfig(PullActionConfiguration):
             v = json.loads(v)
         except:
             raise ValueError(f"Could not parse json: {v}")
+        return v
+
+    @pydantic.validator("quality_grade", always=True)
+    def validate_quality_grade(cls, v):
+        if not v:
+            return v
+        invalid = [g for g in v if not g or g not in QUALITY_GRADES]
+        if invalid:
+            raise ValueError(
+                f"Invalid quality_grade value(s) {invalid}; must be one of {QUALITY_GRADES}."
+            )
         return v
 
     @pydantic.validator("bounding_box", always=True)
