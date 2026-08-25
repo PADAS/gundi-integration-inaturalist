@@ -158,6 +158,16 @@ def test_quality_grade_validator_allows_none():
     assert config.quality_grade is None
 
 
+def test_quality_grade_validator_coerces_empty_string_to_empty_list():
+    config = PullEventsConfig(quality_grade="", days_to_load=3, event_prefix="iNat: ")
+    assert config.quality_grade == []
+
+
+def test_quality_grade_validator_coerces_whitespace_string_to_empty_list():
+    config = PullEventsConfig(quality_grade="  ", days_to_load=3, event_prefix="iNat: ")
+    assert config.quality_grade == []
+
+
 def test_quality_grade_validator_allows_empty_list():
     config = PullEventsConfig(quality_grade=[], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []

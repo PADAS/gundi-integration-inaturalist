@@ -88,10 +88,10 @@ class PullEventsConfig(PullActionConfiguration):
 
     @pydantic.validator("quality_grade", pre=True, always=True)
     def validate_quality_grade(cls, v):
-        if not v:
-            return v
         if isinstance(v, str):
             v = v.split(",")
+        if not v:
+            return v
         # iNat accepts space/case variants (e.g. "needs id"); normalize like pyinaturalist does.
         normalized = [str(g).strip().lower().replace(" ", "_") for g in v if g and str(g).strip()]
         invalid = [g for g in normalized if g not in QUALITY_GRADES]
