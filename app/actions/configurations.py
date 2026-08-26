@@ -1,8 +1,10 @@
 from typing import Optional, List, Dict
 import json
 import pydantic
+from pyinaturalist.constants import QUALITY_GRADES
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
+
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     api_key: pydantic.SecretStr = pydantic.Field(..., title = "iNaturalist API Key",
@@ -84,6 +86,29 @@ class PullEventsConfig(PullActionConfiguration):
         except:
             raise ValueError(f"Could not parse json: {v}")
         return v
+
+    @pydantic.validator("quality_grade", pre=True, always=True)
+    def validate_quality_grade(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            v = v.split(",")
+        elif not isinstance(v, (list, tuple, set)):
+            # A mis-typed scalar becomes a one-item list so it reaches the message
+            # naming the value, rather than pydantic's "value is not a valid list".
+            v = [v]
+        if not v:
+            return v
+        # iNat accepts space/case variants (e.g. "needs id"); normalize like pyinaturalist does.
+        # Drop only unset entries (None / blank strings); anything else must validate,
+        # so a wrong value like 0 raises instead of silently disabling the filter.
+        normalized = [str(g).strip().lower().replace(" ", "_") for g in v if g is not None and str(g).strip()]
+        invalid = [g for g in normalized if g not in QUALITY_GRADES]
+        if invalid:
+            raise ValueError(
+                f"Invalid quality_grade value(s) {invalid}; must be one of {QUALITY_GRADES}."
+            )
+        return normalized
 
     @pydantic.validator("bounding_box", always=True)
     def validate_bounding_box(cls, v):
