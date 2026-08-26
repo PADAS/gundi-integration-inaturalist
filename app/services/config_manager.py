@@ -109,7 +109,14 @@ class IntegrationConfigurationManager:
             config = await self.get_action_configuration(integration_id, action.value, ttl)
             if config:
                 configurations.append(config)
-        webhook_configuration = await self.get_webhook_configuration(integration_id, ttl)
+        # Only integration types that declare a webhook can have a webhook config.
+        # Asking for one otherwise always misses the cache (no key is ever written
+        # for an absent config) and forces a full portal reload on every action run.
+        webhook_configuration = (
+            await self.get_webhook_configuration(integration_id, ttl)
+            if integration_summary.type.webhook
+            else None
+        )
         return Integration(
             id=integration_summary.id,
             name=integration_summary.name,

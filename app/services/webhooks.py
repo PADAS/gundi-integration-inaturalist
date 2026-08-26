@@ -79,6 +79,9 @@ async def _validate_diagnostic_url(url: str) -> None:
         raise ValueError(f"Cannot resolve diagnostic URL hostname '{hostname}': {e}")
     for _, _, _, _, sockaddr in addr_infos:
         ip = ipaddress.ip_address(sockaddr[0])
+        # ::ffff:127.0.0.1 and friends sit outside every listed network but
+        # connect to the mapped IPv4 address, so compare on the mapped form.
+        ip = getattr(ip, "ipv4_mapped", None) or ip
         if any(ip in net for net in _BLOCKED_NETWORKS):
             raise ValueError(
                 f"Diagnostic URL resolves to a private or reserved address ({ip}), "
@@ -95,7 +98,7 @@ async def forward_payload_to_diagnostic_url(
         await _validate_diagnostic_url(destination_url)
         metadata = {
             "integration_id": integration_id,
-            "received_at": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         if isinstance(json_content, dict):
             body = {**json_content, "__gundi_diagnostic_metadata": metadata}
@@ -149,7 +152,12 @@ async def process_webhook(request: Request):
         # Try to relate the request to an integration
         integration = await get_integration(request=request)
         if not integration:
-            logger.warning(f"No integration found for webhook request: headers: {request.headers}, query_params: {request.query_params}")
+            logger.warning(
+                "No integration found for webhook request "
+                f"(x-consumer-username: '{request.headers.get('x-consumer-username')}', "
+                f"x-gundi-integration-id: '{request.headers.get('x-gundi-integration-id')}', "
+                f"integration_id param: '{request.query_params.get('integration_id')}')."
+            )
             return {}
         # Look for the handler function in webhooks/handlers.py
         webhook_handler, payload_model, config_model = get_webhook_handler()
