@@ -88,8 +88,14 @@ class PullEventsConfig(PullActionConfiguration):
 
     @pydantic.validator("quality_grade", pre=True, always=True)
     def validate_quality_grade(cls, v):
+        if v is None:
+            return v
         if isinstance(v, str):
             v = v.split(",")
+        elif not isinstance(v, (list, tuple, set)):
+            # A mis-typed scalar becomes a one-item list so it reaches the message
+            # naming the value, rather than pydantic's "value is not a valid list".
+            v = [v]
         if not v:
             return v
         # iNat accepts space/case variants (e.g. "needs id"); normalize like pyinaturalist does.

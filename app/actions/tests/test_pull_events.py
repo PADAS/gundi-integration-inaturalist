@@ -158,6 +158,16 @@ def test_quality_grade_validator_allows_none():
     assert config.quality_grade is None
 
 
+@pytest.mark.parametrize("bad_scalar", [0, False, 5, 0.0])
+def test_quality_grade_validator_rejects_mistyped_scalars_with_clear_message(bad_scalar):
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        PullEventsConfig(quality_grade=bad_scalar, days_to_load=3, event_prefix="iNat: ")
+    message = str(exc_info.value)
+    assert "must be one of" in message
+    assert "not a valid list" not in message
+    assert "not iterable" not in message
+
+
 def test_quality_grade_validator_rejects_falsy_non_string_entries():
     with pytest.raises(pydantic.ValidationError) as exc_info:
         PullEventsConfig(quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
