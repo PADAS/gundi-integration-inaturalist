@@ -57,6 +57,7 @@ class PullEventsConfig(PullActionConfiguration):
             "event_type",
             "event_prefix",
             "include_photos",
+            "run_on_schedule",
         ],
     )
 

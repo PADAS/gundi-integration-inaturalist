@@ -37,6 +37,16 @@ async def test_register_integration_with_slug_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -51,13 +61,17 @@ async def test_register_integration_with_slug_setting(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code", 
+                                "type": ["string", "null"]
+                            }
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -68,7 +82,22 @@ async def test_register_integration_with_slug_setting(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
+
             ],
             "webhook": {
                 "name": "X Tracker Webhook",
@@ -78,6 +107,11 @@ async def test_register_integration_with_slug_setting(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -88,10 +122,11 @@ async def test_register_integration_with_slug_setting(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -132,6 +167,16 @@ async def test_register_integration_with_slug_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -146,13 +191,17 @@ async def test_register_integration_with_slug_arg(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -163,6 +212,20 @@ async def test_register_integration_with_slug_arg(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -173,6 +236,11 @@ async def test_register_integration_with_slug_arg(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -183,10 +251,11 @@ async def test_register_integration_with_slug_arg(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -229,6 +298,16 @@ async def test_register_integration_with_service_url_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -243,13 +322,17 @@ async def test_register_integration_with_service_url_arg(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -260,6 +343,20 @@ async def test_register_integration_with_service_url_arg(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -270,6 +367,11 @@ async def test_register_integration_with_service_url_arg(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -280,10 +382,11 @@ async def test_register_integration_with_service_url_arg(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -329,6 +432,16 @@ async def test_register_integration_with_service_url_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -343,13 +456,17 @@ async def test_register_integration_with_service_url_setting(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -360,6 +477,20 @@ async def test_register_integration_with_service_url_setting(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -370,6 +501,11 @@ async def test_register_integration_with_service_url_setting(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -380,10 +516,11 @@ async def test_register_integration_with_service_url_setting(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -451,6 +588,11 @@ async def test_register_integration_with_executable_action(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -465,6 +607,7 @@ async def test_register_integration_with_executable_action(
                     "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
