@@ -158,6 +158,22 @@ def test_quality_grade_validator_allows_none():
     assert config.quality_grade is None
 
 
+def test_quality_grade_validator_rejects_falsy_non_string_entries():
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        PullEventsConfig(quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
+    assert "0" in str(exc_info.value)
+
+
+def test_quality_grade_validator_rejects_boolean_entries():
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(quality_grade=[False], days_to_load=3, event_prefix="iNat: ")
+
+
+def test_quality_grade_validator_drops_none_entries():
+    config = PullEventsConfig(quality_grade=["research", None], days_to_load=3, event_prefix="iNat: ")
+    assert config.quality_grade == ["research"]
+
+
 def test_quality_grade_validator_coerces_empty_string_to_empty_list():
     config = PullEventsConfig(quality_grade="", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []

@@ -93,7 +93,9 @@ class PullEventsConfig(PullActionConfiguration):
         if not v:
             return v
         # iNat accepts space/case variants (e.g. "needs id"); normalize like pyinaturalist does.
-        normalized = [str(g).strip().lower().replace(" ", "_") for g in v if g and str(g).strip()]
+        # Drop only unset entries (None / blank strings); anything else must validate,
+        # so a wrong value like 0 raises instead of silently disabling the filter.
+        normalized = [str(g).strip().lower().replace(" ", "_") for g in v if g is not None and str(g).strip()]
         invalid = [g for g in normalized if g not in QUALITY_GRADES]
         if invalid:
             raise ValueError(
