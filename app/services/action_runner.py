@@ -5,7 +5,6 @@ import traceback
 from enum import Enum
 from typing import Optional
 
-import httpx
 import pydantic
 import stamina
 from gundi_client_v2 import GundiClient
@@ -20,8 +19,8 @@ from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, Lo
 from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
-from .utils import find_config_for_action
 from .activity_logger import publish_event, log_action_activity
+from .errors import classify_error, format_classified_error, IntegrationError
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -57,26 +56,55 @@ class ActionTrigger(str, Enum):
 
 async def _handle_error(
         exc: Exception, integration_id: str, action_id: Optional[str] = None,
-        config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        *, classify_heuristics: bool = False
 ):
     """
     Handles errors by logging, extracting details as available, and publishing events for activity logs.
     Returns a JSON response with error details too.
     """
 
-    message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
-    logger.exception(message)
+    # Classified errors (auth, connectivity, rate limit, bad response) get
+    # short human-first text — the portal prepends "Error running action
+    # '<id>': " and truncates, so the useful part must come first. Anything
+    # unclassified keeps the verbose format. Full details always remain in
+    # error_traceback and the request/response fields below.
+    #
+    # Explicit IntegrationError subclasses classify everywhere — they're
+    # unambiguous. Heuristic classification (status codes / connection
+    # exception types) is scoped to action-handler execution failures only
+    # (classify_heuristics=True), because the same signals mean something
+    # different elsewhere — e.g. a 401 from the Gundi portal's own
+    # get_integration_details call is a portal auth problem, not a
+    # third-party provider one, and must not render as "Authentication
+    # failed" (which would misdirect operators at the provider).
+    classified = classify_error(exc) if (classify_heuristics or isinstance(exc, IntegrationError)) else None
+    log_message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
+    message = format_classified_error(classified) if classified else log_message
+    # The application log always keeps the verbose form — the action and
+    # integration ids are what server-side log searches key on; the clean
+    # text is only for the portal-facing event and JSON response.
+    logger.exception(log_message)
 
     error_details = {
         "integration_id": integration_id,
         "action_id": action_id,
         "config_data": config_data or {},
         "error": message,
+        # Machine-readable category. Only reaches the JSON response below;
+        # ActionExecutionFailed is a gundi-core model that drops unknown fields.
+        "error_type": classified.error_type if classified else None,
         "error_traceback": traceback.format_exc()
     }
 
-    # Extract additional request/response details if available
-    if (request := getattr(exc, "request", None)) is not None:
+    # Extract additional request/response details if available.
+    # httpx exceptions expose .request as a property that raises RuntimeError
+    # when the error was constructed without one — treat that as "no request".
+    try:
+        request = getattr(exc, "request", None)
+    except RuntimeError:
+        request = None
+    if request is not None:
         error_details.update({
             "request_verb": str(request.method),
             "request_url": str(request.url),
@@ -272,7 +300,7 @@ async def execute_action(
         }
         if parsed_data:
             handler_kwargs["data"] = parsed_data
-        if metadata:
+        if metadata is not None:
             handler_kwargs["metadata"] = metadata
         result = await asyncio.wait_for(
             handler(**handler_kwargs),
@@ -283,11 +311,13 @@ async def execute_action(
             asyncio.TimeoutError(f"Action '{action_id}' timed out"),
             integration_id, action_id,
             config_data={"configurations": [c.dict() for c in integration.configurations]},
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            classify_heuristics=True,
         )
     except Exception as e:
         return await _handle_error(e, integration_id, action_id,
-                                   config_data={"configurations": [c.dict() for c in integration.configurations]})
+                                   config_data={"configurations": [c.dict() for c in integration.configurations]},
+                                   classify_heuristics=True)
 
     # Success. Log the execution time and return the result
     end_time = time.monotonic()
