@@ -6,6 +6,19 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
+class AnnotationFilter(pydantic.BaseModel):
+    term: str = pydantic.Field(
+        ...,
+        title="Annotation term",
+        description="iNaturalist controlled term ID (e.g. '22' for Evidence of Presence).",
+    )
+    values: List[str] = pydantic.Field(
+        default_factory=list,
+        title="Allowed values",
+        description="Controlled value IDs required for this term (e.g. '24' for Organism).",
+    )
+
+
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     api_key: pydantic.SecretStr = pydantic.Field(..., title = "iNaturalist API Key",
                                   description = "API key generated from iNat",
@@ -43,8 +56,17 @@ class PullEventsConfig(PullActionConfiguration):
         description="If present, only observations that have one of the selected quality grades will be included.",
     )
 
-    annotations: Optional[str] = pydantic.Field(title = "Annotations",
-        description='Map of annotation terms and the values which to include.  For example, {"22": ["24", "25"], "1": ["2"]} would only include observations of Adults (annotation 1 == 2) that had the Evidence of Presence annotation (22) set to Organism (24) or Scat (25).  Entries in the Dict are treated as ORs, whereas values in the Lists are treated as ANDs.')
+    annotations: Optional[List[AnnotationFilter]] = pydantic.Field(
+        None,
+        title="Annotations",
+        description=(
+            "Annotation filters. Each row selects a controlled term and the values required "
+            "for that term — e.g. term 22 (Evidence of Presence) with values 24 (Organism) "
+            "or 25 (Scat). All terms listed must be present on an observation; within a "
+            "term, all listed values must be present. Legacy JSON-string configs "
+            '(e.g. {"22": ["24", "25"]}) are still accepted.'
+        ),
+    )
 
     include_photos: Optional[bool] = pydantic.Field(True, title="Include photos",
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
@@ -77,17 +99,25 @@ class PullEventsConfig(PullActionConfiguration):
             return None
         return v
 
-    @pydantic.validator("annotations", always=True)
-    def validate_json(cls, v):
-        if not v:
+    @pydantic.validator("annotations", pre=True, always=True)
+    def coerce_annotations(cls, v):
+        # Legacy configs stored this as a JSON-encoded string (or raw dict) of
+        # {term: [values]}; coerce both into the structured row shape.
+        if v is None:
             return None
-        v = v.strip()
-        if(v == ""):
-            return None
-        try:
-            v = json.loads(v)
-        except:
-            raise ValueError(f"Could not parse json: {v}")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                v = json.loads(v)
+            except Exception:
+                raise ValueError(f"Could not parse json: {v}")
+        if isinstance(v, dict):
+            return [
+                {"term": str(term), "values": [str(value) for value in (values or [])]}
+                for term, values in v.items()
+            ]
         return v
 
     @pydantic.validator("quality_grade", pre=True, always=True)
@@ -145,6 +175,13 @@ class PullEventsConfig(PullActionConfiguration):
             raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
         
         return v
+
+    @property
+    def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
+        """The {term: [values]} shape the datasource's annotation matcher consumes."""
+        if not self.annotations:
+            return None
+        return {f.term: f.values for f in self.annotations}
 
     class Config:
         schema_extra = {

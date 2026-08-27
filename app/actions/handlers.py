@@ -79,7 +79,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         taxa=action_config.taxa,
         projects=action_config.projects,
         quality_grade=action_config.quality_grade,
-        annotations=action_config.annotations,
+        annotations=action_config.annotations_dict,
     )
 
     if not observations:
