@@ -2,11 +2,17 @@
 
 import logging
 from datetime import datetime, timedelta
-from math import ceil
-from typing import Dict, List, Optional
+from math import asin, ceil, cos, radians, sin, sqrt
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from pyinaturalist import Annotation, Observation, get_observations_v2
+from pyinaturalist import (
+    Annotation,
+    Observation,
+    get_controlled_terms,
+    get_observations_v2,
+    get_projects,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +26,11 @@ OBSERVATION_FIELDS = [
     "user.id", "user.name", "user.login",
     "annotations.controlled_attribute_id", "annotations.controlled_value_id",
 ]
+
+# Reference-action project search: one page of nearest projects; the portal's
+# combobox allows free text for anything beyond it (truncated=True signals the cap).
+PROJECTS_PAGE_SIZE = 200
+MAX_PROJECT_SEARCH_RADIUS_KM = 500.0
 
 
 def _match_annotations_to_config(annotations: List[Annotation], config: Dict) -> bool:
@@ -40,6 +51,40 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
             if str(value) not in allowed:
                 return False
     return True
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    lat1, lng1, lat2, lng2 = map(radians, (lat1, lng1, lat2, lng2))
+    a = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lng2 - lng1) / 2) ** 2
+    return 2 * 6371.0 * asin(sqrt(a))
+
+
+def bbox_to_search_circle(bounding_box: List[float]) -> Tuple[float, float, float]:
+    """Center and covering radius (km) of a [ne_lat, ne_lng, sw_lat, sw_lng] box.
+
+    iNat project search is point+radius, not box, so the box is approximated by
+    the circle through its corners. Radius is clamped to [1, 500] km: a floor so
+    a tiny box still finds its local projects, a cap because a continent-sized
+    search circle returns noise anyway (the portal keeps free text for the rest).
+    """
+    ne_lat, ne_lng, sw_lat, sw_lng = bounding_box[:4]
+    center_lat = (ne_lat + sw_lat) / 2
+    center_lng = (ne_lng + sw_lng) / 2
+    radius_km = _haversine_km(center_lat, center_lng, ne_lat, ne_lng)
+    return center_lat, center_lng, min(max(radius_km, 1.0), MAX_PROJECT_SEARCH_RADIUS_KM)
+
+
+def list_controlled_terms() -> List[Dict]:
+    """All iNaturalist annotation controlled terms (public endpoint, no auth)."""
+    response = get_controlled_terms()
+    return response.get("results", []) if isinstance(response, dict) else []
+
+
+def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
+    """Nearest-first iNaturalist projects within radius_km of a point (public endpoint)."""
+    return get_projects(
+        lat=lat, lng=lng, radius=radius_km, order_by="distance", per_page=PROJECTS_PAGE_SIZE
+    )
 
 
 class INatRequestError(requests.HTTPError):

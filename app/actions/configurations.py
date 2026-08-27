@@ -1,9 +1,64 @@
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 import json
 import pydantic
 from pyinaturalist.constants import QUALITY_GRADES
-from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
+
+
+def _reference(action: str, params: Optional[dict] = None) -> dict:
+    """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
+    docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
+    Deliberately does NOT set ui:widget — portals without reference support
+    must keep rendering plain text fields. All iNat lookups target "self":
+    this integration's own runner answers every query."""
+    return {
+        "action": action,
+        "target": "self",
+        "params": params or {},
+        "allow_free_text": True,
+    }
+
+
+def parse_bounding_box(v):
+    """Parse and validate a JSON-encoded '[ne_lat, ne_lng, sw_lat, sw_lng]' string."""
+    if not v:
+        return None
+    v = json.loads(v)
+    if len(v) != 4:
+        raise ValueError("Did not receive four values in bounding box configuration.")
+    for i in range(0, 4):
+        try:
+            v[i] = float(v[i])
+        except Exception:
+            raise ValueError(f"Could not parse bounding box values {v}.")
+
+    if v[0] < -90 or v[0] > 90:
+        raise ValueError(f"NE Latitude {v[0]} must be between -90 and 90")
+    if v[1] < -180 or v[1] > 180:
+        raise ValueError(f"NE Longitude {v[1]} must be between -180 and 180")
+    if v[2] < -90 or v[2] > 90:
+        raise ValueError(f"SW Latitude {v[2]} must be between -90 and 90")
+    if v[3] < -180 or v[3] > 180:
+        raise ValueError(f"SW Longitude {v[2]} must be between -180 and 180")
+    if v[0] <= v[2]:
+        raise ValueError(f"NE Latitude {v[0]} must be greater than SW Latitude {v[2]}")
+    if v[1] <= v[3]:
+        raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
+    return v
+
+
+class AnnotationFilter(pydantic.BaseModel):
+    term: str = pydantic.Field(
+        ...,
+        title="Annotation term",
+        description="iNaturalist controlled term ID (e.g. '22' for Evidence of Presence).",
+    )
+    values: List[str] = pydantic.Field(
+        default_factory=list,
+        title="Allowed values",
+        description="Controlled value IDs required for this term (e.g. '24' for Organism).",
+    )
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -37,11 +92,23 @@ class PullEventsConfig(PullActionConfiguration):
     taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
         description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890').")
     
-    quality_grade: Optional[List[str]] = pydantic.Field(title = "Quality Grade",
-        description = "If present, only observations that have one of the entered quality grades will be included.  As of November, 2024, valid iNaturalist values are casual, needs_id and/or research.")
+    quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
+        None,
+        title="Quality Grade",
+        description="If present, only observations that have one of the selected quality grades will be included.",
+    )
 
-    annotations: Optional[str] = pydantic.Field(title = "Annotations",
-        description='Map of annotation terms and the values which to include.  For example, {"22": ["24", "25"], "1": ["2"]} would only include observations of Adults (annotation 1 == 2) that had the Evidence of Presence annotation (22) set to Organism (24) or Scat (25).  Entries in the Dict are treated as ORs, whereas values in the Lists are treated as ANDs.')
+    annotations: Optional[List[AnnotationFilter]] = pydantic.Field(
+        None,
+        title="Annotations",
+        description=(
+            "Annotation filters. Each row selects a controlled term and the values required "
+            "for that term — e.g. term 22 (Evidence of Presence) with values 24 (Organism) "
+            "or 25 (Scat). All terms listed must be present on an observation; within a "
+            "term, all listed values must be present. Legacy JSON-string configs "
+            '(e.g. {"22": ["24", "25"]}) are still accepted.'
+        ),
+    )
 
     include_photos: Optional[bool] = pydantic.Field(True, title="Include photos",
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
@@ -61,6 +128,26 @@ class PullEventsConfig(PullActionConfiguration):
         ],
     )
 
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        """Annotate fields with gundi:reference so the portal renders live
+        dropdowns fed by this runner's reference actions. Inert to portals
+        without reference support. $data paths resolve from the node holding
+        the annotated element: '../bounding_box' climbs from the projects
+        array to the root config; '../term' climbs from a values array to
+        its AnnotationFilter row."""
+        base = super().ui_schema(*args, **kwargs)
+        base["projects"] = {"items": {"gundi:reference": _reference(
+            "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
+        )}}
+        base["annotations"] = {"items": {
+            "term": {"gundi:reference": _reference("list_annotation_terms")},
+            "values": {"items": {"gundi:reference": _reference(
+                "list_annotation_values", params={"term": {"$data": "../term"}},
+            )}},
+        }}
+        return base
+
     @pydantic.validator("taxa", pre=True, always=True)
     def coerce_taxa_list_to_str(cls, v):
         if isinstance(v, list):
@@ -74,17 +161,25 @@ class PullEventsConfig(PullActionConfiguration):
             return None
         return v
 
-    @pydantic.validator("annotations", always=True)
-    def validate_json(cls, v):
-        if not v:
+    @pydantic.validator("annotations", pre=True, always=True)
+    def coerce_annotations(cls, v):
+        # Legacy configs stored this as a JSON-encoded string (or raw dict) of
+        # {term: [values]}; coerce both into the structured row shape.
+        if v is None:
             return None
-        v = v.strip()
-        if(v == ""):
-            return None
-        try:
-            v = json.loads(v)
-        except:
-            raise ValueError(f"Could not parse json: {v}")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return None
+            try:
+                v = json.loads(v)
+            except Exception:
+                raise ValueError(f"Could not parse json: {v}")
+        if isinstance(v, dict):
+            return [
+                {"term": str(term), "values": [str(value) for value in (values or [])]}
+                for term, values in v.items()
+            ]
         return v
 
     @pydantic.validator("quality_grade", pre=True, always=True)
@@ -112,36 +207,23 @@ class PullEventsConfig(PullActionConfiguration):
 
     @pydantic.validator("bounding_box", always=True)
     def validate_bounding_box(cls, v):
-        if(not v):
+        return parse_bounding_box(v)
+
+    @property
+    def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
+        """The {term: [values]} shape the datasource's annotation matcher consumes.
+
+        Multiple rows for the same term are merged (union of values) rather than
+        the last row winning, since the matcher's semantics require all listed
+        values to be present for a term — a union is the faithful merge.
+        """
+        if not self.annotations:
             return None
-        v = json.loads(v)
-        if(len(v) != 4):
-            raise ValueError("Did not receive four values in bounding box configuration.")
-        for i in range(0,4):
-            try:
-                v[i] = float(v[i])
-            except:
-                raise ValueError(f"Could not parse bounding box values {v}.")
-
-        if(v[0] < -90 or v[0] > 90):
-            raise ValueError(f"NE Latitude {v[0]} must be between -90 and 90")
-
-        if(v[1] < -180 or v[1] > 180):
-            raise ValueError(f"NE Longitude {v[1]} must be between -180 and 180")
-        
-        if(v[2] < -90 or v[2] > 90):
-            raise ValueError(f"SW Latitude {v[2]} must be between -90 and 90")
-
-        if(v[3] < -180 or v[3] > 180):
-            raise ValueError(f"SW Longitude {v[2]} must be between -180 and 180")
-        
-        if(v[0] <= v[2]):
-            raise ValueError(f"NE Latitude {v[0]} must be greater than SW Latitude {v[2]}")
-        
-        if(v[1] <= v[3]):
-            raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
-        
-        return v
+        merged: Dict[str, List[str]] = {}
+        for f in self.annotations:
+            bucket = merged.setdefault(f.term, [])
+            bucket.extend(v for v in f.values if v not in bucket)
+        return merged
 
     class Config:
         schema_extra = {
@@ -155,3 +237,28 @@ class PullEventsConfig(PullActionConfiguration):
             ],
             "required": ["bounding_box", "days_to_load"]
         }
+
+
+class ListProjectsQuery(ReferenceActionConfiguration):
+    """Reference query: iNaturalist projects near the configured bounding box."""
+    bounding_box: str = pydantic.Field(
+        ...,
+        title="Bounding box",
+        description="Same JSON format as the pull_events bounding_box: [ne_lat, ne_lng, sw_lat, sw_lng].",
+    )
+
+    @pydantic.validator("bounding_box")
+    def validate_bounding_box(cls, v):
+        parsed = parse_bounding_box(v)
+        if parsed is None:
+            raise ValueError("bounding_box is required to search for nearby projects.")
+        return parsed
+
+
+class ListAnnotationTermsQuery(ReferenceActionConfiguration):
+    """Reference query: all iNaturalist annotation controlled terms (no params)."""
+
+
+class ListAnnotationValuesQuery(ReferenceActionConfiguration):
+    """Reference query: the allowed values of one annotation controlled term."""
+    term: str = pydantic.Field(..., title="Term ID")

@@ -379,3 +379,49 @@ def test_get_observations_raises_inat_request_error(monkeypatch):
     )
     with pytest.raises(INatRequestError, match=r"Unknown project_id"):
         get_observations(datetime(2026, 1, 1, tzinfo=timezone.utc), projects=["nope"])
+
+
+def test_bbox_to_search_circle_centers_and_covers_box():
+    from app.datasource.inaturalist import bbox_to_search_circle
+
+    # ~0.3 degree box around Seattle: [ne_lat, ne_lng, sw_lat, sw_lng]
+    lat, lng, radius_km = bbox_to_search_circle([47.7, -122.2, 47.4, -122.5])
+    assert lat == pytest.approx(47.55)
+    assert lng == pytest.approx(-122.35)
+    # Half-diagonal of the box: ~16.7 km latitude leg, ~11.2 km longitude leg
+    assert 15 < radius_km < 30
+
+
+def test_bbox_to_search_circle_clamps_radius():
+    from app.datasource.inaturalist import bbox_to_search_circle
+
+    _, _, huge = bbox_to_search_circle([60.0, 170.0, -60.0, -170.0])
+    assert huge == 500.0
+    _, _, tiny = bbox_to_search_circle([47.5001, -122.4999, 47.5, -122.5])
+    assert tiny == 1.0
+
+
+def test_list_controlled_terms_unwraps_results(mocker):
+    from app.datasource import inaturalist
+
+    mocker.patch.object(
+        inaturalist, "get_controlled_terms",
+        return_value={"total_results": 1, "results": [
+            {"id": 22, "label": "Evidence of Presence", "values": []},
+        ]},
+    )
+    assert inaturalist.list_controlled_terms() == [
+        {"id": 22, "label": "Evidence of Presence", "values": []},
+    ]
+
+
+def test_search_projects_near_passes_circle_params(mocker):
+    from app.datasource import inaturalist
+
+    get_projects = mocker.patch.object(
+        inaturalist, "get_projects", return_value={"total_results": 0, "results": []}
+    )
+    inaturalist.search_projects_near(47.55, -122.35, 21.0)
+    get_projects.assert_called_once_with(
+        lat=47.55, lng=-122.35, radius=21.0, order_by="distance", per_page=200
+    )

@@ -16,7 +16,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, LogLevel
 
-from app.actions.core import PullActionConfiguration
+from app.actions.core import PullActionConfiguration, ReferenceActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .activity_logger import publish_event, log_action_activity
@@ -244,9 +244,18 @@ async def execute_action(
     is_manual = (triggered_by or "").strip().lower() == ActionTrigger.MANUAL.value
     skippable_pull = is_pull_action and not is_manual
 
+    # Reference actions are stateless: they never have stored config, and a
+    # caller sending no config_overrides (e.g. a zero-param query like
+    # list_annotation_terms) is a legitimate, complete request — not a 404.
+    # Required query params still fail Pydantic validation below with a 422,
+    # which is the correct signal to the portal.
+    is_reference_action = isinstance(config_model, type) and issubclass(
+        config_model, ReferenceActionConfiguration
+    )
+
     # Get the configuration needed to execute the action
     action_config = await config_manager.get_action_configuration(integration_id, action_id)
-    if not action_config and not config_overrides:
+    if not action_config and not config_overrides and not is_reference_action:
         if skippable_pull:
             return _skip_quietly(
                 integration_id, action_id,
@@ -292,6 +301,17 @@ async def execute_action(
         except pydantic.ValidationError as e:
             return await _handle_error(e, integration_id, action_id, data, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
+    # Reference actions are portal-invoked at interactive-fetch frequency (e.g.
+    # every dropdown open), so a handler failure is routine rather than
+    # exceptional (an unknown term after a vocabulary change, a transient 5xx
+    # from the iNat API). Unlike other action types, their errors must not
+    # carry the integration's stored configurations — which can include raw
+    # secrets — into the published IntegrationActionFailed event or the JSON
+    # error response.
+    handler_error_config_data = None if is_reference_action else {
+        "configurations": [c.dict() for c in integration.configurations]
+    }
+
     try:  # Execute the action handler with a timeout
         start_time = time.monotonic()
         handler_kwargs = {
@@ -310,13 +330,13 @@ async def execute_action(
         return await _handle_error(
             asyncio.TimeoutError(f"Action '{action_id}' timed out"),
             integration_id, action_id,
-            config_data={"configurations": [c.dict() for c in integration.configurations]},
+            config_data=handler_error_config_data,
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             classify_heuristics=True,
         )
     except Exception as e:
         return await _handle_error(e, integration_id, action_id,
-                                   config_data={"configurations": [c.dict() for c in integration.configurations]},
+                                   config_data=handler_error_config_data,
                                    classify_heuristics=True)
 
     # Success. Log the execution time and return the result
