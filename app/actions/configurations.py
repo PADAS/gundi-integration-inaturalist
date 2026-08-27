@@ -211,10 +211,19 @@ class PullEventsConfig(PullActionConfiguration):
 
     @property
     def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
-        """The {term: [values]} shape the datasource's annotation matcher consumes."""
+        """The {term: [values]} shape the datasource's annotation matcher consumes.
+
+        Multiple rows for the same term are merged (union of values) rather than
+        the last row winning, since the matcher's semantics require all listed
+        values to be present for a term — a union is the faithful merge.
+        """
         if not self.annotations:
             return None
-        return {f.term: f.values for f in self.annotations}
+        merged: Dict[str, List[str]] = {}
+        for f in self.annotations:
+            bucket = merged.setdefault(f.term, [])
+            bucket.extend(v for v in f.values if v not in bucket)
+        return merged
 
     class Config:
         schema_extra = {

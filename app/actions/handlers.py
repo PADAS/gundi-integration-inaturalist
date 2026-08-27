@@ -411,7 +411,7 @@ async def action_list_projects(integration: Integration, action_config: ListProj
         for project in results
         if project.get("id") is not None
     ]
-    truncated = response.get("total_results", len(options)) > len(options)
+    truncated = response.get("total_results", len(results)) > len(results)
     return ReferenceDataResponse(options=options, truncated=truncated).dict()
 
 

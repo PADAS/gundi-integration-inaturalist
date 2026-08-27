@@ -276,3 +276,32 @@ def test_list_projects_query_rejects_bad_bounding_box():
         ListProjectsQuery(bounding_box="not json")
     with pytest.raises(pydantic.ValidationError):
         ListProjectsQuery(bounding_box="[1, 2, 3]")
+
+
+@pytest.mark.asyncio
+async def test_reference_action_missing_required_param_is_422(
+    mocker, inaturalist_integration_v2, mock_publish_event
+):
+    """A reference query with a required param and no overrides must fail
+    pydantic validation (422 path), not 404 and not execute."""
+    from app.actions.configurations import ListProjectsQuery
+    from app.actions.handlers import action_list_projects
+
+    action_runner = _patch_runner(
+        mocker,
+        {"list_projects": (action_list_projects, ListProjectsQuery, None)},
+        inaturalist_integration_v2,
+    )
+    mocker.patch.object(action_runner, "publish_event", mock_publish_event)
+    handle_error = mocker.patch.object(
+        action_runner, "_handle_error", AsyncMock(return_value="validation-error-response")
+    )
+
+    result = await action_runner.execute_action(
+        integration_id=str(inaturalist_integration_v2.id),
+        action_id="list_projects",
+    )
+
+    assert result == "validation-error-response"
+    import pydantic
+    assert isinstance(handle_error.call_args.args[0], pydantic.ValidationError)

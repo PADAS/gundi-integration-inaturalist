@@ -51,6 +51,17 @@ def test_annotations_accepts_structured_rows():
     assert config.annotations_dict == {"22": ["24"]}
 
 
+def test_annotations_duplicate_term_rows_merge_values():
+    config = PullEventsConfig(
+        days_to_load=3,
+        annotations=[
+            {"term": "22", "values": ["24"]},
+            {"term": "22", "values": ["25", "24"]},
+        ],
+    )
+    assert config.annotations_dict == {"22": ["24", "25"]}
+
+
 @pytest.mark.parametrize("raw", [None, "", "   ", "{}"])
 def test_annotations_empty_inputs_mean_no_filter(raw):
     config = PullEventsConfig(days_to_load=3, annotations=raw)

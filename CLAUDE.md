@@ -52,7 +52,7 @@ If the iNat query returns nothing, the cursor is still advanced to `now()` so th
 
 - Pagination: counts results with `per_page=0`, then walks pages of `INAT_PAGE_SIZE = 200`, ordered by `updated_at asc`. The iNat API rejects pagination past 10,000 results (`page * per_page > 10,000` returns a 500), so fetching is windowed: at most `MAX_PAGES_PER_WINDOW = 50` pages per query, then the query is re-issued with `updated_since` advanced to the last fetched observation's `updated_at` (results are id-deduped across windows).
 - **Taxa batching**: `taxa` is a comma-separated string. The iNat API limits how many taxon IDs fit in a single request, so IDs are split into batches of `TAXA_BATCH_SIZE = 100` and each batch is queried independently; results are merged in a `dict[int, Observation]` (id-deduped). If `taxa` is empty/whitespace, a single batch of `None` is used (no taxon filter).
-- Annotation filtering happens **client-side** after fetch in `_match_annotations_to_config` — `annotations` is `{term: [allowed_values...]}`, terms are ORed across the dict, values within a list are effectively a whitelist for that term.
+- Annotation filtering happens **client-side** after fetch in `_match_annotations_to_config` — `annotations` is `{term: [allowed_values...]}`; all terms in the dict must be present on the observation (AND across terms), and within a term all listed values must be present (AND across values).
 
 ### Configuration (`app/actions/configurations.py`)
 
