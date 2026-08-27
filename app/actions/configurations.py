@@ -2,8 +2,36 @@ from typing import Optional, List, Dict, Literal
 import json
 import pydantic
 from pyinaturalist.constants import QUALITY_GRADES
-from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
+
+
+def parse_bounding_box(v):
+    """Parse and validate a JSON-encoded '[ne_lat, ne_lng, sw_lat, sw_lng]' string."""
+    if not v:
+        return None
+    v = json.loads(v)
+    if len(v) != 4:
+        raise ValueError("Did not receive four values in bounding box configuration.")
+    for i in range(0, 4):
+        try:
+            v[i] = float(v[i])
+        except Exception:
+            raise ValueError(f"Could not parse bounding box values {v}.")
+
+    if v[0] < -90 or v[0] > 90:
+        raise ValueError(f"NE Latitude {v[0]} must be between -90 and 90")
+    if v[1] < -180 or v[1] > 180:
+        raise ValueError(f"NE Longitude {v[1]} must be between -180 and 180")
+    if v[2] < -90 or v[2] > 90:
+        raise ValueError(f"SW Latitude {v[2]} must be between -90 and 90")
+    if v[3] < -180 or v[3] > 180:
+        raise ValueError(f"SW Longitude {v[2]} must be between -180 and 180")
+    if v[0] <= v[2]:
+        raise ValueError(f"NE Latitude {v[0]} must be greater than SW Latitude {v[2]}")
+    if v[1] <= v[3]:
+        raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
+    return v
 
 
 class AnnotationFilter(pydantic.BaseModel):
@@ -145,36 +173,7 @@ class PullEventsConfig(PullActionConfiguration):
 
     @pydantic.validator("bounding_box", always=True)
     def validate_bounding_box(cls, v):
-        if(not v):
-            return None
-        v = json.loads(v)
-        if(len(v) != 4):
-            raise ValueError("Did not receive four values in bounding box configuration.")
-        for i in range(0,4):
-            try:
-                v[i] = float(v[i])
-            except:
-                raise ValueError(f"Could not parse bounding box values {v}.")
-
-        if(v[0] < -90 or v[0] > 90):
-            raise ValueError(f"NE Latitude {v[0]} must be between -90 and 90")
-
-        if(v[1] < -180 or v[1] > 180):
-            raise ValueError(f"NE Longitude {v[1]} must be between -180 and 180")
-        
-        if(v[2] < -90 or v[2] > 90):
-            raise ValueError(f"SW Latitude {v[2]} must be between -90 and 90")
-
-        if(v[3] < -180 or v[3] > 180):
-            raise ValueError(f"SW Longitude {v[2]} must be between -180 and 180")
-        
-        if(v[0] <= v[2]):
-            raise ValueError(f"NE Latitude {v[0]} must be greater than SW Latitude {v[2]}")
-        
-        if(v[1] <= v[3]):
-            raise ValueError(f"NE Longitude {v[1]} must be greater than SW Longitude {v[3]}")
-        
-        return v
+        return parse_bounding_box(v)
 
     @property
     def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
@@ -195,3 +194,28 @@ class PullEventsConfig(PullActionConfiguration):
             ],
             "required": ["bounding_box", "days_to_load"]
         }
+
+
+class ListProjectsQuery(ReferenceActionConfiguration):
+    """Reference query: iNaturalist projects near the configured bounding box."""
+    bounding_box: str = pydantic.Field(
+        ...,
+        title="Bounding box",
+        description="Same JSON format as the pull_events bounding_box: [ne_lat, ne_lng, sw_lat, sw_lng].",
+    )
+
+    @pydantic.validator("bounding_box")
+    def validate_bounding_box(cls, v):
+        parsed = parse_bounding_box(v)
+        if parsed is None:
+            raise ValueError("bounding_box is required to search for nearby projects.")
+        return parsed
+
+
+class ListAnnotationTermsQuery(ReferenceActionConfiguration):
+    """Reference query: all iNaturalist annotation controlled terms (no params)."""
+
+
+class ListAnnotationValuesQuery(ReferenceActionConfiguration):
+    """Reference query: the allowed values of one annotation controlled term."""
+    term: str = pydantic.Field(..., title="Term ID")

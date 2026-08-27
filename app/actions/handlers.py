@@ -6,14 +6,25 @@ import httpx
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import Observation
 
-from app.actions.configurations import PullEventsConfig
+from app.actions.configurations import (
+    PullEventsConfig,
+    ListProjectsQuery,
+    ListAnnotationTermsQuery,
+    ListAnnotationValuesQuery,
+)
+from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import (
     send_event_attachments_to_gundi,
     send_events_to_gundi,
     update_event_in_gundi,
 )
-from app.datasource.inaturalist import get_observations
+from app.datasource.inaturalist import (
+    get_observations,
+    bbox_to_search_circle,
+    list_controlled_terms,
+    search_projects_near,
+)
 from app.services.state import IntegrationStateManager
 
 GUNDI_SUBMISSION_CHUNK_SIZE = 100
@@ -384,3 +395,47 @@ def _transform_inat_to_gundi_event(ob: Observation, config: PullEventsConfig):
     event["title"] = config.event_prefix + event["title"]
 
     return event
+
+
+async def action_list_projects(integration: Integration, action_config: ListProjectsQuery):
+    """Reference action: iNaturalist projects nearest the configured bounding box.
+
+    Uses the public project-search endpoint (no auth), nearest-first, one page —
+    the portal's combobox keeps free text for anything beyond the cap.
+    """
+    lat, lng, radius_km = bbox_to_search_circle(action_config.bounding_box)
+    response = search_projects_near(lat, lng, radius_km)
+    results = response.get("results", [])
+    options = [
+        ReferenceOption(value=str(project["id"]), label=project.get("title") or str(project["id"]))
+        for project in results
+        if project.get("id") is not None
+    ]
+    truncated = response.get("total_results", len(options)) > len(options)
+    return ReferenceDataResponse(options=options, truncated=truncated).dict()
+
+
+async def action_list_annotation_terms(integration: Integration, action_config: ListAnnotationTermsQuery):
+    """Reference action: iNaturalist annotation controlled terms (near-static vocabulary)."""
+    terms = list_controlled_terms()
+    options = [
+        ReferenceOption(value=str(term["id"]), label=term.get("label") or str(term["id"]))
+        for term in terms
+        if term.get("id") is not None
+    ]
+    options.sort(key=lambda o: o.label or o.value)
+    return ReferenceDataResponse(options=options, cache_ttl_seconds=3600).dict()
+
+
+async def action_list_annotation_values(integration: Integration, action_config: ListAnnotationValuesQuery):
+    """Reference action: the allowed values of one annotation controlled term."""
+    terms = list_controlled_terms()
+    term = next((t for t in terms if str(t.get("id")) == action_config.term), None)
+    if term is None:
+        raise ValueError(f"Unknown iNaturalist annotation term '{action_config.term}'.")
+    options = [
+        ReferenceOption(value=str(value["id"]), label=value.get("label") or str(value["id"]))
+        for value in term.get("values", [])
+        if value.get("id") is not None
+    ]
+    return ReferenceDataResponse(options=options, cache_ttl_seconds=3600).dict()
