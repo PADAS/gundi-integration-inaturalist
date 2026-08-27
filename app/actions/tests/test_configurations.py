@@ -69,3 +69,61 @@ def test_annotations_schema_is_structured_rows():
     row = schema["definitions"]["AnnotationFilter"]["properties"]
     assert row["term"]["type"] == "string"
     assert row["values"]["type"] == "array"
+
+
+def _collect_gundi_references(node, found):
+    if isinstance(node, dict):
+        if "gundi:reference" in node:
+            found.append((node, node["gundi:reference"]))
+        for value in node.values():
+            _collect_gundi_references(value, found)
+
+
+def test_gundi_reference_annotations_match_registered_reference_actions():
+    """Drift guard: every gundi:reference annotation must name a real reference
+    action whose query model has the declared params, and must never set
+    ui:widget (forward-compat: old portals ignore the annotation)."""
+    from app.actions.core import ReferenceActionConfiguration, discover_actions
+
+    handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
+    reference_actions = {
+        action_id: config_model
+        for action_id, (func, config_model, data_model) in handlers.items()
+        if issubclass(config_model, ReferenceActionConfiguration)
+    }
+
+    found = []
+    _collect_gundi_references(PullEventsConfig.ui_schema(), found)
+
+    assert {ref["action"] for _, ref in found} == {
+        "list_projects", "list_annotation_terms", "list_annotation_values",
+    }
+    for node, ref in found:
+        assert ref["target"] == "self"
+        assert ref["allow_free_text"] is True
+        assert ref["action"] in reference_actions
+        query_fields = set(reference_actions[ref["action"]].__fields__)
+        assert set(ref.get("params", {})) <= query_fields
+        assert "ui:widget" not in node
+
+
+def test_gundi_reference_annotations_sit_on_the_right_nodes():
+    ui = PullEventsConfig.ui_schema()
+
+    projects_ref = ui["projects"]["items"]["gundi:reference"]
+    assert projects_ref["action"] == "list_projects"
+    assert projects_ref["params"] == {"bounding_box": {"$data": "../bounding_box"}}
+
+    term_ref = ui["annotations"]["items"]["term"]["gundi:reference"]
+    assert term_ref["action"] == "list_annotation_terms"
+    assert term_ref["params"] == {}
+
+    values_ref = ui["annotations"]["items"]["values"]["items"]["gundi:reference"]
+    assert values_ref["action"] == "list_annotation_values"
+    assert values_ref["params"] == {"term": {"$data": "../term"}}
+
+
+def test_ui_schema_override_preserves_existing_ui_options():
+    ui = PullEventsConfig.ui_schema()
+    assert "ui:order" in ui
+    assert ui["days_to_load"] == {"ui:widget": "range"}

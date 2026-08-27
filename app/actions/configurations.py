@@ -6,6 +6,20 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
+def _reference(action: str, params: Optional[dict] = None) -> dict:
+    """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
+    docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
+    Deliberately does NOT set ui:widget — portals without reference support
+    must keep rendering plain text fields. All iNat lookups target "self":
+    this integration's own runner answers every query."""
+    return {
+        "action": action,
+        "target": "self",
+        "params": params or {},
+        "allow_free_text": True,
+    }
+
+
 def parse_bounding_box(v):
     """Parse and validate a JSON-encoded '[ne_lat, ne_lng, sw_lat, sw_lng]' string."""
     if not v:
@@ -113,6 +127,26 @@ class PullEventsConfig(PullActionConfiguration):
             "run_on_schedule",
         ],
     )
+
+    @classmethod
+    def ui_schema(cls, *args, **kwargs):
+        """Annotate fields with gundi:reference so the portal renders live
+        dropdowns fed by this runner's reference actions. Inert to portals
+        without reference support. $data paths resolve from the node holding
+        the annotated element: '../bounding_box' climbs from the projects
+        array to the root config; '../term' climbs from a values array to
+        its AnnotationFilter row."""
+        base = super().ui_schema(*args, **kwargs)
+        base["projects"] = {"items": {"gundi:reference": _reference(
+            "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
+        )}}
+        base["annotations"] = {"items": {
+            "term": {"gundi:reference": _reference("list_annotation_terms")},
+            "values": {"items": {"gundi:reference": _reference(
+                "list_annotation_values", params={"term": {"$data": "../term"}},
+            )}},
+        }}
+        return base
 
     @pydantic.validator("taxa", pre=True, always=True)
     def coerce_taxa_list_to_str(cls, v):
