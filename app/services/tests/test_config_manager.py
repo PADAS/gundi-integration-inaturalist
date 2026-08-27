@@ -1,5 +1,3 @@
-from unittest.mock import MagicMock
-
 import pytest
 
 from gundi_core.schemas.v2 import IntegrationSummary, IntegrationActionConfiguration, Integration, WebhookConfiguration
@@ -326,37 +324,37 @@ async def test_get_integration_details_with_ttl(
 
 
 @pytest.mark.asyncio
-async def test_get_integration_details_skips_webhook_lookup_when_type_has_no_webhook(
-        mocker, mock_gundi_client_v2_class, integration_v2,
-        integration_v2_as_json, pull_observations_config_as_json,
+async def test_get_webhook_configuration_caches_absence_sentinel(
+        mocker, mock_redis_empty, mock_gundi_client_v2_class, integration_v2,
 ):
-    # No cache key is ever written for an absent webhook config, so looking one
-    # up always misses redis and falls through to a full portal reload. For an
-    # integration type without a webhook that would mean a live Gundi API call
-    # on every single action run, even with a fully warm cache.
-    integration_id = str(integration_v2.id)
-
-    async def _get(key):
-        if key == f"integration.{integration_id}":
-            return integration_v2_as_json
-        if key.startswith(f"integrationconfig.{integration_id}."):
-            return pull_observations_config_as_json
-        return None  # nothing cached for the webhook key
-
-    redis = MagicMock()
-    redis_client = mocker.MagicMock()
-    redis_client.get = mocker.AsyncMock(side_effect=_get)
-    redis_client.set = mocker.AsyncMock()
-    redis.Redis.return_value = redis_client
-    mocker.patch("app.services.config_manager.redis", redis)
+    mocker.patch("app.services.config_manager.redis", mock_redis_empty)
     mocker.patch("app.services.config_manager.GundiClient", mock_gundi_client_v2_class)
     config_manager = IntegrationConfigurationManager()
-    spy = mocker.spy(config_manager, "get_webhook_configuration")
+    integration_id = str(integration_v2.id)
 
-    integration = await config_manager.get_integration_details(integration_id)
+    webhook_config = await config_manager.get_webhook_configuration(integration_id)
 
-    assert integration.type.webhook is None
-    assert integration.webhook_configuration is None
-    assert not spy.called
-    # The warm cache must be enough -- no portal round-trip.
+    assert webhook_config is None
+    # The absence is cached, so the next cold lookup won't reload from Gundi.
+    mock_redis_empty.Redis.return_value.set.assert_any_call(
+        f"integrationconfig.{integration_id}.webhook", "null", None
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_webhook_configuration_reads_cached_absence_sentinel(
+        mocker, mock_redis_empty, mock_gundi_client_v2_class, integration_v2,
+):
+    import asyncio as _asyncio
+    fut = _asyncio.get_running_loop().create_future()
+    fut.set_result(b"null")
+    mock_redis_empty.Redis.return_value.get.return_value = fut
+    mocker.patch("app.services.config_manager.redis", mock_redis_empty)
+    mocker.patch("app.services.config_manager.GundiClient", mock_gundi_client_v2_class)
+    config_manager = IntegrationConfigurationManager()
+
+    webhook_config = await config_manager.get_webhook_configuration(str(integration_v2.id))
+
+    assert webhook_config is None
+    # Sentinel hit — no reload from the Gundi API.
     assert not mock_gundi_client_v2_class.return_value.get_integration_details.called

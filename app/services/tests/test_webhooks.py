@@ -7,6 +7,9 @@ from app.services.webhooks import (
     forward_payload_to_diagnostic_url,
 )
 
+# URL-validation coverage lives in test_diagnostic_url_validation.py (upstream
+# template). This file covers what that one doesn't: the forwarder itself.
+
 
 def _addr_infos(*addresses):
     # getaddrinfo returns 5-tuples; only sockaddr[0] is read by the validator.
@@ -24,45 +27,14 @@ def mock_getaddrinfo(mocker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "address",
-    [
-        "127.0.0.1",
-        "169.254.169.254",  # cloud metadata endpoint
-        "10.0.0.5",
-        "::1",
-    ],
-)
-async def test_validate_diagnostic_url_blocks_private_addresses(mock_getaddrinfo, address):
+@pytest.mark.parametrize("address", ["127.0.0.1", "169.254.169.254", "10.0.0.5", "::1"])
+async def test_validate_diagnostic_url_blocks_plain_private_addresses(mock_getaddrinfo, address):
+    # test_diagnostic_url_validation.py covers the IPv4-mapped IPv6 spellings;
+    # these are the plain forms, including the cloud metadata endpoint.
     mock_getaddrinfo(address)
 
     with pytest.raises(ValueError, match="private or reserved address"):
         await _validate_diagnostic_url("https://evil.example.com/hook")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "address",
-    [
-        "::ffff:127.0.0.1",
-        "::ffff:169.254.169.254",  # cloud metadata via an IPv4-mapped AAAA record
-        "::ffff:10.0.0.5",
-    ],
-)
-async def test_validate_diagnostic_url_blocks_ipv4_mapped_ipv6(mock_getaddrinfo, address):
-    """An IPv4-mapped IPv6 address is outside every blocked network literally,
-    but connects to the mapped IPv4 address, so it must be normalized first."""
-    mock_getaddrinfo(address)
-
-    with pytest.raises(ValueError, match="private or reserved address"):
-        await _validate_diagnostic_url("https://evil.example.com/hook")
-
-
-@pytest.mark.asyncio
-async def test_validate_diagnostic_url_allows_public_address(mock_getaddrinfo):
-    mock_getaddrinfo("93.184.216.34")
-
-    await _validate_diagnostic_url("https://example.com/hook")
 
 
 @pytest.mark.asyncio
@@ -94,7 +66,10 @@ async def test_forward_payload_posts_payload_with_metadata(mocker, mock_getaddri
     assert metadata["integration_id"] == "779ff3ab-5589-4f4c-9e0a-ae8d6c9edff0"
     # Must be a valid RFC 3339 timestamp -- no doubled UTC designator.
     assert not metadata["received_at"].endswith("+00:00Z")
-    parsed = datetime.datetime.fromisoformat(metadata["received_at"])
+    # Python 3.10's fromisoformat() doesn't accept a literal "Z".
+    parsed = datetime.datetime.fromisoformat(
+        metadata["received_at"].replace("Z", "+00:00")
+    )
     assert parsed.tzinfo is not None
 
 
