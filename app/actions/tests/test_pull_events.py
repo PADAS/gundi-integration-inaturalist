@@ -101,13 +101,13 @@ async def test_execute_pull_observations_action_with_taxa_string(
     assert count_call_kwargs["taxon_id"] == "1633134,1314810,1128559"
 
 
-def test_taxa_validator_coerces_list_to_string():
+def test_taxa_validator_keeps_list():
     config = PullEventsConfig(taxa=["123", "456", "789"], days_to_load=3, event_prefix="iNat: ")
     assert config.taxa == ["123", "456", "789"]
     assert config.taxa_str == "123,456,789"
 
 
-def test_taxa_validator_passes_string_through():
+def test_taxa_validator_splits_string():
     config = PullEventsConfig(taxa="123, 456, 789", days_to_load=3, event_prefix="iNat: ")
     assert config.taxa == ["123", "456", "789"]
     assert config.taxa_str == "123,456,789"
