@@ -425,3 +425,13 @@ def test_search_projects_near_passes_circle_params(mocker):
     get_projects.assert_called_once_with(
         lat=47.55, lng=-122.35, radius=21.0, order_by="distance", per_page=200
     )
+
+
+def test_search_taxa_passes_query(mocker):
+    from app.datasource import inaturalist
+
+    get_taxa_autocomplete = mocker.patch.object(
+        inaturalist, "get_taxa_autocomplete", return_value={"total_results": 0, "results": []}
+    )
+    inaturalist.search_taxa("leo")
+    get_taxa_autocomplete.assert_called_once_with(q="leo")
