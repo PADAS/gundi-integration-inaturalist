@@ -282,3 +282,13 @@ class ListAnnotationTermsQuery(ReferenceActionConfiguration):
 class ListAnnotationValuesQuery(ReferenceActionConfiguration):
     """Reference query: the allowed values of one annotation controlled term."""
     term: str = pydantic.Field(..., title="Term ID")
+
+
+class ListTaxaQuery(ReferenceActionConfiguration):
+    """Reference query: iNaturalist taxa matching a typed search (typeahead).
+
+    q is optional by contract convention (typeahead spec §1): a widget that
+    predates search support fetches without it and must get a clean empty
+    response, never a 422.
+    """
+    q: Optional[str] = pydantic.Field(None, title="Search text")
