@@ -138,3 +138,28 @@ def test_ui_schema_override_preserves_existing_ui_options():
     ui = PullEventsConfig.ui_schema()
     assert "ui:order" in ui
     assert ui["days_to_load"] == {"ui:widget": "range"}
+
+
+def test_taxa_accepts_legacy_comma_string():
+    config = PullEventsConfig(days_to_load=3, taxa="12345, 67890,  ,99")
+    assert config.taxa == ["12345", "67890", "99"]
+    assert config.taxa_str == "12345,67890,99"
+
+
+def test_taxa_accepts_list_and_coerces_ints():
+    config = PullEventsConfig(days_to_load=3, taxa=[12345, "67890"])
+    assert config.taxa == ["12345", "67890"]
+    assert config.taxa_str == "12345,67890"
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", []])
+def test_taxa_empty_inputs_mean_no_filter(raw):
+    config = PullEventsConfig(days_to_load=3, taxa=raw)
+    assert config.taxa_str is None
+
+
+def test_taxa_schema_is_string_array():
+    schema = PullEventsConfig.schema()
+    prop = schema["properties"]["taxa"]
+    assert prop["type"] == "array"
+    assert prop["items"]["type"] == "string"

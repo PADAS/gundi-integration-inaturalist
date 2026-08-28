@@ -87,7 +87,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
-        taxa=action_config.taxa,
+        taxa=action_config.taxa_str,
         projects=action_config.projects,
         quality_grade=action_config.quality_grade,
         annotations=action_config.annotations_dict,

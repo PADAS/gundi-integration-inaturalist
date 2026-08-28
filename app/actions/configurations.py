@@ -89,8 +89,14 @@ class PullEventsConfig(PullActionConfiguration):
     projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist.")
     
-    taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
-        description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890').")
+    taxa: Optional[List[str]] = pydantic.Field(
+        None,
+        title="Taxa IDs",
+        description=(
+            "iNaturalist taxa IDs for which to load observations. Legacy comma-separated "
+            "strings (e.g. '12345, 67890') are still accepted."
+        ),
+    )
     
     quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
         None,
@@ -149,10 +155,17 @@ class PullEventsConfig(PullActionConfiguration):
         return base
 
     @pydantic.validator("taxa", pre=True, always=True)
-    def coerce_taxa_list_to_str(cls, v):
-        if isinstance(v, list):
-            return ",".join(str(t) for t in v if t)
-        return v
+    def coerce_taxa_to_list(cls, v):
+        # Legacy configs stored this as a comma-separated string; the portal now
+        # submits a list. Coerce both (and scalars) into a list of id strings.
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.split(",")
+        elif not isinstance(v, (list, tuple, set)):
+            v = [v]
+        cleaned = [str(t).strip() for t in v if t is not None and str(t).strip()]
+        return cleaned or None
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
@@ -208,6 +221,13 @@ class PullEventsConfig(PullActionConfiguration):
     @pydantic.validator("bounding_box", always=True)
     def validate_bounding_box(cls, v):
         return parse_bounding_box(v)
+
+    @property
+    def taxa_str(self) -> Optional[str]:
+        """The comma-joined string shape the datasource consumes."""
+        if not self.taxa:
+            return None
+        return ",".join(self.taxa)
 
     @property
     def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
