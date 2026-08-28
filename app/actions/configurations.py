@@ -6,18 +6,21 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
-def _reference(action: str, params: Optional[dict] = None) -> dict:
+def _reference(action: str, params: Optional[dict] = None, search: Optional[dict] = None) -> dict:
     """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
     docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
     Deliberately does NOT set ui:widget — portals without reference support
     must keep rendering plain text fields. All iNat lookups target "self":
     this integration's own runner answers every query."""
-    return {
+    annotation = {
         "action": action,
         "target": "self",
         "params": params or {},
         "allow_free_text": True,
     }
+    if search:
+        annotation["search"] = search
+    return annotation
 
 
 def parse_bounding_box(v):
@@ -89,8 +92,14 @@ class PullEventsConfig(PullActionConfiguration):
     projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist.")
     
-    taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
-        description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890').")
+    taxa: Optional[List[str]] = pydantic.Field(
+        None,
+        title="Taxa IDs",
+        description=(
+            "iNaturalist taxa IDs for which to load observations. Legacy comma-separated "
+            "strings (e.g. '12345, 67890') are still accepted."
+        ),
+    )
     
     quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
         None,
@@ -146,13 +155,23 @@ class PullEventsConfig(PullActionConfiguration):
                 "list_annotation_values", params={"term": {"$data": "../term"}},
             )}},
         }}
+        base["taxa"] = {"items": {"gundi:reference": _reference(
+            "list_taxa", search={"param": "q", "min_chars": 2},
+        )}}
         return base
 
     @pydantic.validator("taxa", pre=True, always=True)
-    def coerce_taxa_list_to_str(cls, v):
-        if isinstance(v, list):
-            return ",".join(str(t) for t in v if t)
-        return v
+    def coerce_taxa_to_list(cls, v):
+        # Legacy configs stored this as a comma-separated string; the portal now
+        # submits a list. Coerce both (and scalars) into a list of id strings.
+        if v is None:
+            return None
+        if isinstance(v, str):
+            v = v.split(",")
+        elif not isinstance(v, (list, tuple, set)):
+            v = [v]
+        cleaned = [str(t).strip() for t in v if t is not None and str(t).strip()]
+        return cleaned or None
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
@@ -210,6 +229,13 @@ class PullEventsConfig(PullActionConfiguration):
         return parse_bounding_box(v)
 
     @property
+    def taxa_str(self) -> Optional[str]:
+        """The comma-joined string shape the datasource consumes."""
+        if not self.taxa:
+            return None
+        return ",".join(self.taxa)
+
+    @property
     def annotations_dict(self) -> Optional[Dict[str, List[str]]]:
         """The {term: [values]} shape the datasource's annotation matcher consumes.
 
@@ -262,3 +288,13 @@ class ListAnnotationTermsQuery(ReferenceActionConfiguration):
 class ListAnnotationValuesQuery(ReferenceActionConfiguration):
     """Reference query: the allowed values of one annotation controlled term."""
     term: str = pydantic.Field(..., title="Term ID")
+
+
+class ListTaxaQuery(ReferenceActionConfiguration):
+    """Reference query: iNaturalist taxa matching a typed search (typeahead).
+
+    q is optional by contract convention (typeahead spec §1): a widget that
+    predates search support fetches without it and must get a clean empty
+    response, never a 422.
+    """
+    q: Optional[str] = pydantic.Field(None, title="Search text")

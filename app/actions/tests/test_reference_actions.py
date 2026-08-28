@@ -305,3 +305,46 @@ async def test_reference_action_missing_required_param_is_422(
     assert result == "validation-error-response"
     import pydantic
     assert isinstance(handle_error.call_args.args[0], pydantic.ValidationError)
+
+
+TAXA_RESPONSE = {
+    "total_results": 40,
+    "results": [
+        {"id": 41955, "name": "Panthera pardus", "preferred_common_name": "Leopard", "rank": "species"},
+        {"id": 41963, "name": "Panthera", "rank": "genus"},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_list_taxa_labels_and_truncation(mocker, inaturalist_integration_v2):
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    search = mocker.patch.object(handlers, "search_taxa", return_value=TAXA_RESPONSE)
+
+    result = await handlers.action_list_taxa(
+        inaturalist_integration_v2, ListTaxaQuery(q="leopard")
+    )
+
+    search.assert_called_once_with("leopard")
+    assert [(o["value"], o["label"], o["description"]) for o in result["options"]] == [
+        ("41955", "Leopard (Panthera pardus)", "species"),
+        ("41963", "Panthera", "genus"),
+    ]
+    assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("q", [None, "", "   "])
+async def test_list_taxa_empty_query_returns_no_default_page(mocker, inaturalist_integration_v2, q):
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    search = mocker.patch.object(handlers, "search_taxa")
+
+    result = await handlers.action_list_taxa(inaturalist_integration_v2, ListTaxaQuery(q=q))
+
+    search.assert_not_called()
+    assert result["options"] == []
+    assert result["truncated"] is True

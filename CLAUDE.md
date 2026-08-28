@@ -58,7 +58,10 @@ If the iNat query returns nothing, the cursor is still advanced to `now()` so th
 
 `PullEventsConfig` is the user-facing schema rendered in the Gundi portal:
 
-- `taxa` is a **comma-separated string**, not a list. A pydantic pre-validator coerces incoming lists (legacy portal configs) into the string form. Treat it as a string everywhere downstream.
+- `taxa` is a **list of ID strings** in the config model; a pydantic pre-validator coerces
+  legacy comma-separated strings (and scalars). The datasource boundary stays a string:
+  downstream code uses `action_config.taxa_str` (comma-joined), and `get_observations`
+  is unchanged.
 - `bounding_box` is accepted as a JSON-encoded string `"[ne_lat, ne_lng, sw_lat, sw_lng]"` and validated/parsed into a list of floats with range and ordering checks.
 - `annotations` is accepted as structured rows; legacy JSON-encoded strings/dicts are coerced.
 - `event_type` / `event_prefix` get coerced to `None` when the literal string `"any"` is submitted (workaround for a Gundi Portal limitation — do not remove without coordinating with portal).
@@ -85,9 +88,10 @@ dropdowns. They wrap public, unauthenticated iNat endpoints. Design spec:
   `action_config.annotations_dict` (the legacy `{term: [values]}` shape).
 - `quality_grade` is a `List[Literal[...]]` — the enum must track
   `pyinaturalist.constants.QUALITY_GRADES` (drift-tested).
-- Taxa dropdowns are deliberately absent: they need a typeahead extension to the
-  reference-data contract (`/v1/taxa/autocomplete` exists but the portal can't pass
-  typed text yet).
+- `taxa` is a typeahead: `action_list_taxa` (wrapping `/v1/taxa/autocomplete`) plus a
+  `search: {param: "q", min_chars: 2}` annotation per the typeahead contract extension
+  (`cdip:docs/superpowers/specs/2026-08-27-typeahead-reference-data-design.md`). `q` is
+  optional; empty query returns no options with `truncated: true`.
 
 ### State (`app/services/state.py`)
 

@@ -107,7 +107,7 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
     _collect_gundi_references(PullEventsConfig.ui_schema(), found)
 
     assert {ref["action"] for _, ref in found} == {
-        "list_projects", "list_annotation_terms", "list_annotation_values",
+        "list_projects", "list_annotation_terms", "list_annotation_values", "list_taxa",
     }
     for node, ref in found:
         assert ref["target"] == "self"
@@ -116,6 +116,10 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         query_fields = set(reference_actions[ref["action"]].__fields__)
         assert set(ref.get("params", {})) <= query_fields
         assert "ui:widget" not in node
+        if "search" in ref:
+            assert ref["search"]["param"] in query_fields
+            assert ref["search"]["param"] not in ref.get("params", {})
+            assert isinstance(ref["search"].get("min_chars", 2), int)
 
 
 def test_gundi_reference_annotations_sit_on_the_right_nodes():
@@ -138,3 +142,36 @@ def test_ui_schema_override_preserves_existing_ui_options():
     ui = PullEventsConfig.ui_schema()
     assert "ui:order" in ui
     assert ui["days_to_load"] == {"ui:widget": "range"}
+
+
+def test_taxa_accepts_legacy_comma_string():
+    config = PullEventsConfig(days_to_load=3, taxa="12345, 67890,  ,99")
+    assert config.taxa == ["12345", "67890", "99"]
+    assert config.taxa_str == "12345,67890,99"
+
+
+def test_taxa_accepts_list_and_coerces_ints():
+    config = PullEventsConfig(days_to_load=3, taxa=[12345, "67890"])
+    assert config.taxa == ["12345", "67890"]
+    assert config.taxa_str == "12345,67890"
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", []])
+def test_taxa_empty_inputs_mean_no_filter(raw):
+    config = PullEventsConfig(days_to_load=3, taxa=raw)
+    assert config.taxa_str is None
+
+
+def test_taxa_schema_is_string_array():
+    schema = PullEventsConfig.schema()
+    prop = schema["properties"]["taxa"]
+    assert prop["type"] == "array"
+    assert prop["items"]["type"] == "string"
+
+
+def test_taxa_gundi_reference_is_a_search_annotation():
+    ui = PullEventsConfig.ui_schema()
+    taxa_ref = ui["taxa"]["items"]["gundi:reference"]
+    assert taxa_ref["action"] == "list_taxa"
+    assert taxa_ref["params"] == {}
+    assert taxa_ref["search"] == {"param": "q", "min_chars": 2}

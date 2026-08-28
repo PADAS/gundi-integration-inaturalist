@@ -12,6 +12,7 @@ from pyinaturalist import (
     get_controlled_terms,
     get_observations_v2,
     get_projects,
+    get_taxa_autocomplete,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,11 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
     return get_projects(
         lat=lat, lng=lng, radius=radius_km, order_by="distance", per_page=PROJECTS_PAGE_SIZE
     )
+
+
+def search_taxa(q: str) -> Dict:
+    """iNaturalist taxa matching a typed query (public autocomplete endpoint)."""
+    return get_taxa_autocomplete(q=q)
 
 
 class INatRequestError(requests.HTTPError):
