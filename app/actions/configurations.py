@@ -6,18 +6,21 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
-def _reference(action: str, params: Optional[dict] = None) -> dict:
+def _reference(action: str, params: Optional[dict] = None, search: Optional[dict] = None) -> dict:
     """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
     docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
     Deliberately does NOT set ui:widget — portals without reference support
     must keep rendering plain text fields. All iNat lookups target "self":
     this integration's own runner answers every query."""
-    return {
+    annotation = {
         "action": action,
         "target": "self",
         "params": params or {},
         "allow_free_text": True,
     }
+    if search:
+        annotation["search"] = search
+    return annotation
 
 
 def parse_bounding_box(v):
@@ -152,6 +155,9 @@ class PullEventsConfig(PullActionConfiguration):
                 "list_annotation_values", params={"term": {"$data": "../term"}},
             )}},
         }}
+        base["taxa"] = {"items": {"gundi:reference": _reference(
+            "list_taxa", search={"param": "q", "min_chars": 2},
+        )}}
         return base
 
     @pydantic.validator("taxa", pre=True, always=True)

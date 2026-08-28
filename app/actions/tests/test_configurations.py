@@ -107,7 +107,7 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
     _collect_gundi_references(PullEventsConfig.ui_schema(), found)
 
     assert {ref["action"] for _, ref in found} == {
-        "list_projects", "list_annotation_terms", "list_annotation_values",
+        "list_projects", "list_annotation_terms", "list_annotation_values", "list_taxa",
     }
     for node, ref in found:
         assert ref["target"] == "self"
@@ -116,6 +116,10 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         query_fields = set(reference_actions[ref["action"]].__fields__)
         assert set(ref.get("params", {})) <= query_fields
         assert "ui:widget" not in node
+        if "search" in ref:
+            assert ref["search"]["param"] in query_fields
+            assert ref["search"]["param"] not in ref.get("params", {})
+            assert isinstance(ref["search"].get("min_chars", 2), int)
 
 
 def test_gundi_reference_annotations_sit_on_the_right_nodes():
@@ -163,3 +167,11 @@ def test_taxa_schema_is_string_array():
     prop = schema["properties"]["taxa"]
     assert prop["type"] == "array"
     assert prop["items"]["type"] == "string"
+
+
+def test_taxa_gundi_reference_is_a_search_annotation():
+    ui = PullEventsConfig.ui_schema()
+    taxa_ref = ui["taxa"]["items"]["gundi:reference"]
+    assert taxa_ref["action"] == "list_taxa"
+    assert taxa_ref["params"] == {}
+    assert taxa_ref["search"] == {"param": "q", "min_chars": 2}
