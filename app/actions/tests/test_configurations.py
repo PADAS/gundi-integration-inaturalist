@@ -176,3 +176,7 @@ def test_schema_explains_project_or_taxa_with_bounding_box_rule():
         "Required when no project is selected. "
         "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
     )
+
+
+def test_bounding_box_title_is_short():
+    assert PullEventsConfig.schema()["properties"]["bounding_box"]["title"] == "Bounding box"
