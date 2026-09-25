@@ -138,3 +138,45 @@ def test_ui_schema_override_preserves_existing_ui_options():
     ui = PullEventsConfig.ui_schema()
     assert "ui:order" in ui
     assert ui["days_to_load"] == {"ui:widget": "range"}
+
+
+def test_schema_requires_taxa_and_bounding_box_only_without_projects():
+    """The portal enforces this rule from the registered schema: a project is
+    enough on its own; without one, taxa and a bounding box are both required."""
+    schema = PullEventsConfig.schema()
+    assert schema["required"] == ["days_to_load"]
+    assert schema["if"] == {
+        "properties": {
+            "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
+        }
+    }
+    assert schema["then"] == {"required": ["days_to_load", "taxa", "bounding_box"]}
+    assert schema["else"] == {"required": ["days_to_load"]}
+
+
+def test_config_without_projects_or_taxa_still_parses():
+    """The rule lives only in the portal schema; the runner keeps accepting
+    existing configs so saved connections run unchanged."""
+    config = PullEventsConfig(days_to_load=3, bounding_box="[1, 1, 0, 0]")
+    assert config.projects is None and config.taxa is None
+
+
+def test_schema_explains_project_or_taxa_with_bounding_box_rule():
+    """The portal shows the root description under the section heading and each
+    field description under its field; conditional requirements get no star."""
+    schema = PullEventsConfig.schema()
+    assert schema["description"] == (
+        "Brings iNaturalist observations in as events. "
+        "Choose at least one project, or enter taxa IDs together with a bounding box."
+    )
+    props = schema["properties"]
+    assert "Leave empty to filter by taxa and area instead." in props["projects"]["description"]
+    assert "Required when no project is selected." in props["taxa"]["description"]
+    assert props["bounding_box"]["description"] == (
+        "Required when no project is selected. "
+        "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
+    )
+
+
+def test_bounding_box_title_is_short():
+    assert PullEventsConfig.schema()["properties"]["bounding_box"]["title"] == "Bounding box"

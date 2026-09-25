@@ -220,3 +220,13 @@ def test_get_observations_batches_taxa(mocker):
     assert taxon_id_args[0] == ",".join(taxa_ids[:TAXA_BATCH_SIZE])
     assert taxon_id_args[1] == ",".join(taxa_ids[TAXA_BATCH_SIZE:TAXA_BATCH_SIZE * 2])
     assert taxon_id_args[2] == ",".join(taxa_ids[TAXA_BATCH_SIZE * 2:])
+
+
+def test_actions_register_with_inaturalist_titles():
+    from app.actions import action_handlers
+
+    titles = {action_id: getattr(func, "action_title", None) for action_id, (func, _, _) in action_handlers.items()}
+    assert titles["pull_events"] == "Pull iNaturalist Observations"
+    assert titles["list_projects"] == "List Nearby iNaturalist Projects"
+    assert titles["list_annotation_terms"] == "List iNaturalist Annotation Terms"
+    assert titles["list_annotation_values"] == "List iNaturalist Annotation Values"
