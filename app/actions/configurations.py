@@ -235,7 +235,7 @@ class PullEventsConfig(PullActionConfiguration):
                     "num_days_default": 1
                 }
             ],
-            "required": ["bounding_box", "days_to_load"]
+            "required": ["days_to_load"]
         }
 
 
