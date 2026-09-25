@@ -138,3 +138,24 @@ def test_ui_schema_override_preserves_existing_ui_options():
     ui = PullEventsConfig.ui_schema()
     assert "ui:order" in ui
     assert ui["days_to_load"] == {"ui:widget": "range"}
+
+
+def test_schema_requires_taxa_and_bounding_box_only_without_projects():
+    """The portal enforces this rule from the registered schema: a project is
+    enough on its own; without one, taxa and a bounding box are both required."""
+    schema = PullEventsConfig.schema()
+    assert schema["required"] == ["days_to_load"]
+    assert schema["if"] == {
+        "properties": {
+            "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
+        }
+    }
+    assert schema["then"] == {"required": ["days_to_load", "taxa", "bounding_box"]}
+    assert schema["else"] == {"required": ["days_to_load"]}
+
+
+def test_config_without_projects_or_taxa_still_parses():
+    """The rule lives only in the portal schema; the runner keeps accepting
+    existing configs so saved connections run unchanged."""
+    config = PullEventsConfig(days_to_load=3, bounding_box="[1, 1, 0, 0]")
+    assert config.projects is None and config.taxa is None

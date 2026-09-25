@@ -235,7 +235,19 @@ class PullEventsConfig(PullActionConfiguration):
                     "num_days_default": 1
                 }
             ],
-            "required": ["days_to_load"]
+            "required": ["days_to_load"],
+            # Portal-enforced filter rule: a project is enough on its own; without
+            # one, taxa AND a bounding box are both required. Both branches repeat
+            # the base required list because legacy portal screens replace it with
+            # the branch's list instead of merging, and only apply if/then/else
+            # when both branches are present.
+            "if": {
+                "properties": {
+                    "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
+                }
+            },
+            "then": {"required": ["days_to_load", "taxa", "bounding_box"]},
+            "else": {"required": ["days_to_load"]},
         }
 
 
