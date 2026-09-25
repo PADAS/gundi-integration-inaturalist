@@ -166,6 +166,7 @@ def test_schema_explains_project_or_taxa_with_bounding_box_rule():
     field description under its field; conditional requirements get no star."""
     schema = PullEventsConfig.schema()
     assert schema["description"] == (
+        "Brings iNaturalist observations in as events. "
         "Choose at least one project, or enter taxa IDs together with a bounding box."
     )
     props = schema["properties"]

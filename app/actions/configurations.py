@@ -229,7 +229,7 @@ class PullEventsConfig(PullActionConfiguration):
     class Config:
         schema_extra = {
             # Shown by the portal as a note under the section heading.
-            "description": "Choose at least one project, or enter taxa IDs together with a bounding box.",
+            "description": "Brings iNaturalist observations in as events. Choose at least one project, or enter taxa IDs together with a bounding box.",
             "examples": [
                 {
                     "": 47.5218082,
