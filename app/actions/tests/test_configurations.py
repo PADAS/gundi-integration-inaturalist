@@ -159,3 +159,19 @@ def test_config_without_projects_or_taxa_still_parses():
     existing configs so saved connections run unchanged."""
     config = PullEventsConfig(days_to_load=3, bounding_box="[1, 1, 0, 0]")
     assert config.projects is None and config.taxa is None
+
+
+def test_schema_explains_project_or_taxa_with_bounding_box_rule():
+    """The portal shows the root description under the section heading and each
+    field description under its field; conditional requirements get no star."""
+    schema = PullEventsConfig.schema()
+    assert schema["description"] == (
+        "Choose at least one project, or enter taxa IDs together with a bounding box."
+    )
+    props = schema["properties"]
+    assert "Leave empty to filter by taxa and area instead." in props["projects"]["description"]
+    assert "Required when no project is selected." in props["taxa"]["description"]
+    assert props["bounding_box"]["description"] == (
+        "Required when no project is selected. "
+        "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
+    )

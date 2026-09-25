@@ -84,13 +84,14 @@ class PullEventsConfig(PullActionConfiguration):
         ),
         description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
 
-    bounding_box: Optional[str] = pydantic.Field(title = "Bounding box for search area.  Of the format [ne_latitude, ne_longitude, sw_latitude, sw_longitude]")
+    bounding_box: Optional[str] = pydantic.Field(title = "Bounding box for search area.  Of the format [ne_latitude, ne_longitude, sw_latitude, sw_longitude]",
+        description="Required when no project is selected. Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude].")
 
     projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
-        description="List of project IDs to pull from iNaturalist.")
+        description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")
     
     taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
-        description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890').")
+        description="Comma-separated list of iNaturalist taxa IDs for which to load observations (e.g. '12345, 67890'). Required when no project is selected.")
     
     quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
         None,
@@ -227,6 +228,8 @@ class PullEventsConfig(PullActionConfiguration):
 
     class Config:
         schema_extra = {
+            # Shown by the portal as a note under the section heading.
+            "description": "Choose at least one project, or enter taxa IDs together with a bounding box.",
             "examples": [
                 {
                     "": 47.5218082,
