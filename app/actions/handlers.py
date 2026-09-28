@@ -12,7 +12,7 @@ from app.actions.configurations import (
     ListAnnotationTermsQuery,
     ListAnnotationValuesQuery,
 )
-from app.actions.core import ReferenceDataResponse, ReferenceOption
+from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.gundi import (
     send_event_attachments_to_gundi,
@@ -75,6 +75,7 @@ def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
     yield list_a[i:i + chunk_size]
 
+@action_title("Pull iNaturalist Observations")
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
 
@@ -397,6 +398,7 @@ def _transform_inat_to_gundi_event(ob: Observation, config: PullEventsConfig):
     return event
 
 
+@action_title("List Nearby iNaturalist Projects")
 async def action_list_projects(integration: Integration, action_config: ListProjectsQuery):
     """Reference action: iNaturalist projects nearest the configured bounding box.
 
@@ -415,6 +417,7 @@ async def action_list_projects(integration: Integration, action_config: ListProj
     return ReferenceDataResponse(options=options, truncated=truncated).dict()
 
 
+@action_title("List iNaturalist Annotation Terms")
 async def action_list_annotation_terms(integration: Integration, action_config: ListAnnotationTermsQuery):
     """Reference action: iNaturalist annotation controlled terms (near-static vocabulary)."""
     terms = list_controlled_terms()
@@ -427,6 +430,7 @@ async def action_list_annotation_terms(integration: Integration, action_config: 
     return ReferenceDataResponse(options=options, cache_ttl_seconds=3600).dict()
 
 
+@action_title("List iNaturalist Annotation Values")
 async def action_list_annotation_values(integration: Integration, action_config: ListAnnotationValuesQuery):
     """Reference action: the allowed values of one annotation controlled term."""
     terms = list_controlled_terms()
