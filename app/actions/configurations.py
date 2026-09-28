@@ -249,7 +249,17 @@ class PullEventsConfig(PullActionConfiguration):
                     "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
                 }
             },
-            "then": {"required": ["days_to_load", "taxa", "bounding_box"]},
+            # `required` only checks the key is there, so the patterns make "" or
+            # "  " (and taxa like ",,") count as missing: both become "no filter".
+            # They sit in this branch only, since saved configs with a project
+            # can carry blank taxa (a legacy [] coerces to "").
+            "then": {
+                "required": ["days_to_load", "taxa", "bounding_box"],
+                "properties": {
+                    "taxa": {"type": "string", "pattern": r"[^\s,]"},
+                    "bounding_box": {"type": "string", "pattern": r"\S"},
+                },
+            },
             "else": {"required": ["days_to_load"]},
         }
 

@@ -150,8 +150,29 @@ def test_schema_requires_taxa_and_bounding_box_only_without_projects():
             "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
         }
     }
-    assert schema["then"] == {"required": ["days_to_load", "taxa", "bounding_box"]}
+    assert schema["then"]["required"] == ["days_to_load", "taxa", "bounding_box"]
     assert schema["else"] == {"required": ["days_to_load"]}
+
+
+@pytest.mark.parametrize("field,value,accepted", [
+    ("taxa", "12345", True),
+    ("taxa", " 1, 2 ", True),
+    ("taxa", "", False),
+    ("taxa", "   ", False),
+    ("taxa", ", ,", False),
+    ("bounding_box", "[1, 1, 0, 0]", True),
+    ("bounding_box", "", False),
+    ("bounding_box", "  ", False),
+])
+def test_schema_requires_real_taxa_and_bounding_box_without_projects(field, value, accepted):
+    """`required` only checks the key is present; the branch's patterns stop blank
+    values, which would otherwise mean a pull with no filter at all."""
+    import re
+
+    rule = PullEventsConfig.schema()["then"]["properties"][field]
+    assert rule["type"] == "string"
+    # JSON-schema patterns are unanchored, like re.search.
+    assert bool(re.search(rule["pattern"], value)) is accepted
 
 
 def test_config_without_projects_or_taxa_still_parses():
