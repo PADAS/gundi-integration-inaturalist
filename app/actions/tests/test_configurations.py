@@ -161,6 +161,28 @@ def test_config_without_projects_or_taxa_still_parses():
     assert config.projects is None and config.taxa is None
 
 
+@pytest.mark.parametrize("projects", [[""], ["  "], ["123", ""], [" \t"]])
+def test_blank_project_ids_are_rejected(projects):
+    """A blank entry would count as a project in the schema rule yet be dropped
+    by pyinaturalist, leaving a query with no project, taxa or area filter."""
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(days_to_load=3, projects=projects)
+
+
+def test_schema_rejects_blank_project_ids():
+    """The portal validates against the generated schema, so blank entries must
+    be excluded there too, not only at runtime."""
+    items = PullEventsConfig.schema()["properties"]["projects"]["items"]
+    assert items["type"] == "string"
+    assert items["minLength"] == 1
+    assert items["pattern"] == r"^\s*\S"
+
+
+def test_project_ids_are_trimmed():
+    config = PullEventsConfig(days_to_load=3, projects=[" 123 "])
+    assert config.projects == ["123"]
+
+
 def test_schema_explains_project_or_taxa_with_bounding_box_rule():
     """The portal shows the root description under the section heading and each
     field description under its field; conditional requirements get no star."""
