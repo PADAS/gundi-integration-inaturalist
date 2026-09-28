@@ -87,7 +87,7 @@ class PullEventsConfig(PullActionConfiguration):
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
         description="Required when no project is selected. Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude].")
 
-    projects: Optional[List[pydantic.constr(strip_whitespace=True, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
+    projects: Optional[List[pydantic.constr(strip_whitespace=True, min_length=1, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")
     
     taxa: Optional[str] = pydantic.Field(title = "Taxa IDs",
