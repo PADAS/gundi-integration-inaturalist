@@ -174,7 +174,9 @@ def test_schema_rejects_blank_project_ids():
     be excluded there too, not only at runtime."""
     items = PullEventsConfig.schema()["properties"]["projects"]["items"]
     assert items["type"] == "string"
-    assert items["minLength"] == 1
+    # Pattern only, no minLength: empty and whitespace-only entries then trip the
+    # same keyword, so the portal shows one message for both.
+    assert "minLength" not in items
     assert items["pattern"] == r"^\s*\S"
 
 
