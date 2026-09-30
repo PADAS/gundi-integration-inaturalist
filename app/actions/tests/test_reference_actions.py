@@ -44,25 +44,10 @@ def _dummy_reference_handlers():
 
 
 @pytest.mark.asyncio
-async def test_reference_actions_skipped_from_registration_by_default(mocker):
+async def test_reference_actions_registered_with_reference_type(mocker):
     from app.services import self_registration
 
     mocker.patch.object(self_registration, "action_handlers", _dummy_reference_handlers())
-    gundi_client = MagicMock()
-    gundi_client.register_integration_type = AsyncMock(return_value={})
-
-    await self_registration.register_integration_in_gundi(gundi_client, type_slug="inaturalist")
-
-    data = gundi_client.register_integration_type.call_args.args[0]
-    assert data["actions"] == []
-
-
-@pytest.mark.asyncio
-async def test_reference_actions_registered_with_reference_type_when_enabled(mocker):
-    from app.services import self_registration
-
-    mocker.patch.object(self_registration, "action_handlers", _dummy_reference_handlers())
-    mocker.patch.object(self_registration, "REGISTER_REFERENCE_ACTIONS", True)
     gundi_client = MagicMock()
     gundi_client.register_integration_type = AsyncMock(return_value={})
 
