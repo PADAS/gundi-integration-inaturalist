@@ -138,6 +138,10 @@ class PullEventsConfig(PullActionConfiguration):
         array to the root config; '../term' climbs from a values array to
         its AnnotationFilter row."""
         base = super().ui_schema(*args, **kwargs)
+        # Asks the portal for its map widget; portals without it ignore the
+        # hint and keep the plain text input. The stored value stays the JSON
+        # string '[ne_lat, ne_lng, sw_lat, sw_lng]'.
+        base["bounding_box"] = {**base.get("bounding_box", {}), "ui:widget": "bbox"}
         base["projects"] = {"items": {"gundi:reference": _reference(
             "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
         )}}
