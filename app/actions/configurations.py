@@ -136,10 +136,14 @@ class PullEventsConfig(PullActionConfiguration):
         without reference support. $data paths resolve from the node holding
         the annotated element: '../bounding_box' climbs from the projects
         array to the root config; '../term' climbs from a values array to
-        its AnnotationFilter row."""
+        its AnnotationFilter row. "optional" params are left out of the
+        lookup when empty instead of holding the fetch back."""
         base = super().ui_schema(*args, **kwargs)
         base["projects"] = {"items": {"gundi:reference": _reference(
-            "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
+            "list_projects", params={
+                "bounding_box": {"$data": "../bounding_box", "optional": True},
+                "projects": {"$data": "../projects", "optional": True},
+            },
         )}}
         base["annotations"] = {"items": {
             "term": {"gundi:reference": _reference("list_annotation_terms")},
@@ -265,19 +269,21 @@ class PullEventsConfig(PullActionConfiguration):
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):
-    """Reference query: iNaturalist projects near the configured bounding box."""
-    bounding_box: str = pydantic.Field(
-        ...,
+    """Reference query: the saved iNaturalist projects plus projects near the configured bounding box."""
+    bounding_box: Optional[str] = pydantic.Field(
+        None,
         title="Bounding box",
         description="Same JSON format as the pull_events bounding_box: [ne_lat, ne_lng, sw_lat, sw_lng].",
+    )
+    projects: Optional[List[str]] = pydantic.Field(
+        None,
+        title="Saved project IDs",
+        description="Saved project IDs or slugs, returned as options exactly as stored.",
     )
 
     @pydantic.validator("bounding_box")
     def validate_bounding_box(cls, v):
-        parsed = parse_bounding_box(v)
-        if parsed is None:
-            raise ValueError("bounding_box is required to search for nearby projects.")
-        return parsed
+        return parse_bounding_box(v)
 
 
 class ListAnnotationTermsQuery(ReferenceActionConfiguration):
