@@ -123,7 +123,10 @@ def test_gundi_reference_annotations_sit_on_the_right_nodes():
 
     projects_ref = ui["projects"]["items"]["gundi:reference"]
     assert projects_ref["action"] == "list_projects"
-    assert projects_ref["params"] == {"bounding_box": {"$data": "../bounding_box"}}
+    assert projects_ref["params"] == {
+        "bounding_box": {"$data": "../bounding_box", "optional": True},
+        "projects": {"$data": "../projects", "optional": True},
+    }
 
     term_ref = ui["annotations"]["items"]["term"]["gundi:reference"]
     assert term_ref["action"] == "list_annotation_terms"

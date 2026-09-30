@@ -22,6 +22,7 @@ from app.services.gundi import (
 from app.datasource.inaturalist import (
     get_observations,
     bbox_to_search_circle,
+    get_projects_by_ids_or_slugs,
     list_controlled_terms,
     search_projects_near,
 )
@@ -400,20 +401,42 @@ def _transform_inat_to_gundi_event(ob: Observation, config: PullEventsConfig):
 
 @action_title("List Nearby iNaturalist Projects")
 async def action_list_projects(integration: Integration, action_config: ListProjectsQuery):
-    """Reference action: iNaturalist projects nearest the configured bounding box.
+    """Reference action: the saved projects, then iNaturalist projects nearest the
+    configured bounding box.
 
-    Uses the public project-search endpoint (no auth), nearest-first, one page —
-    the portal's combobox keeps free text for anything beyond the cap.
+    Saved values are resolved by ID or slug and returned exactly as stored, so a
+    saved project always matches an option even when a nearby search cannot find
+    it (collection projects have no location). Nearby projects come from the
+    public project-search endpoint (no auth), nearest-first, one page.
     """
-    lat, lng, radius_km = bbox_to_search_circle(action_config.bounding_box)
-    response = search_projects_near(lat, lng, radius_km)
-    results = response.get("results", [])
-    options = [
-        ReferenceOption(value=str(project["id"]), label=project.get("title") or str(project["id"]))
-        for project in results
-        if project.get("id") is not None
-    ]
-    truncated = response.get("total_results", len(results)) > len(results)
+    options = []
+    seen_ids = set()
+    saved = list(dict.fromkeys(v.strip() for v in action_config.projects or [] if v and v.strip()))
+    if saved:
+        by_key = {}
+        for project in get_projects_by_ids_or_slugs(saved):
+            if project.get("id") is None:
+                continue
+            by_key[str(project["id"])] = project
+            if project.get("slug"):
+                by_key[project["slug"].lower()] = project
+        for value in saved:
+            project = by_key.get(value) or by_key.get(value.lower())
+            if project and project["id"] not in seen_ids:
+                seen_ids.add(project["id"])
+                options.append(ReferenceOption(value=value, label=project.get("title") or value))
+
+    truncated = False
+    if action_config.bounding_box:
+        lat, lng, radius_km = bbox_to_search_circle(action_config.bounding_box)
+        response = search_projects_near(lat, lng, radius_km)
+        results = response.get("results", [])
+        options.extend(
+            ReferenceOption(value=str(project["id"]), label=project.get("title") or str(project["id"]))
+            for project in results
+            if project.get("id") is not None and project["id"] not in seen_ids
+        )
+        truncated = response.get("total_results", len(results)) > len(results)
     return ReferenceDataResponse(options=options, truncated=truncated).dict()
 
 

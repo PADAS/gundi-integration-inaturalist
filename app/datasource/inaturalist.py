@@ -12,6 +12,7 @@ from pyinaturalist import (
     get_controlled_terms,
     get_observations_v2,
     get_projects,
+    get_projects_by_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,17 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
     return get_projects(
         lat=lat, lng=lng, radius=radius_km, order_by="distance", per_page=PROJECTS_PAGE_SIZE
     )
+
+
+def get_projects_by_ids_or_slugs(values: List[str]) -> List[Dict]:
+    """iNaturalist projects for the given numeric IDs or slugs (public endpoint).
+
+    Unknown values are simply absent from the result.
+    """
+    if not values:
+        return []
+    response = get_projects_by_id(values)
+    return response.get("results", []) if isinstance(response, dict) else []
 
 
 class INatRequestError(requests.HTTPError):
