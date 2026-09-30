@@ -85,7 +85,7 @@ class PullEventsConfig(PullActionConfiguration):
         description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
-        description="Required when no project is selected. Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude].")
+        description="Required when no project is selected. Draw a box on the map or enter its coordinates.")
 
     projects: Optional[List[pydantic.constr(strip_whitespace=True, min_length=1, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")

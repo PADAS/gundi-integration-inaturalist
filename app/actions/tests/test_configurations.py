@@ -222,7 +222,7 @@ def test_schema_explains_project_or_taxa_with_bounding_box_rule():
     assert "Required when no project is selected." in props["taxa"]["description"]
     assert props["bounding_box"]["description"] == (
         "Required when no project is selected. "
-        "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
+        "Draw a box on the map or enter its coordinates."
     )
 
 
