@@ -343,14 +343,39 @@ async def test_list_projects_with_no_params_returns_no_options(mocker, inaturali
     assert result["truncated"] is False
 
 
-def test_list_projects_query_rejects_bad_bounding_box():
-    import pydantic
+@pytest.mark.parametrize("box", [
+    "not json",
+    "[1, 2, 3]",
+    '["999999", "99999", "9999999", "11.7"]',
+])
+def test_list_projects_query_treats_an_invalid_bounding_box_as_none(box):
+    """The portal sends the box mid-edit; an unparseable one must not fail the lookup."""
     from app.actions.configurations import ListProjectsQuery
 
-    with pytest.raises(pydantic.ValidationError):
-        ListProjectsQuery(bounding_box="not json")
-    with pytest.raises(pydantic.ValidationError):
-        ListProjectsQuery(bounding_box="[1, 2, 3]")
+    assert ListProjectsQuery(bounding_box=box, projects=["100"]).bounding_box is None
+
+
+@pytest.mark.asyncio
+async def test_list_projects_keeps_nearby_when_saved_lookup_fails(mocker, inaturalist_integration_v2):
+    import requests
+    from app.actions import handlers
+    from app.actions.configurations import ListProjectsQuery
+
+    mocker.patch.object(
+        handlers, "get_projects_by_ids_or_slugs",
+        side_effect=requests.HTTPError("422 Client Error: Unprocessable Entity"),
+    )
+    mocker.patch.object(
+        handlers, "search_projects_near",
+        return_value={"total_results": 1, "results": [{"id": 13305, "title": "Namibian animal tracks"}]},
+    )
+
+    result = await handlers.action_list_projects(
+        inaturalist_integration_v2,
+        ListProjectsQuery(bounding_box="[-17.1, 25.3, -28.6, 11.7]", projects=["kaza"]),
+    )
+
+    assert [o["value"] for o in result["options"]] == ["13305"]
 
 
 @pytest.mark.asyncio
