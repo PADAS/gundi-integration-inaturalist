@@ -14,7 +14,6 @@ import base64
 import json
 
 import httpx
-import requests
 import pytest
 from fastapi.testclient import TestClient
 
@@ -209,8 +208,6 @@ def test_background_mode_acks_before_the_run_finishes(mocker, runner_mocks):
         (ActionTimeoutError("exceeded the cap"), True),
         (httpx.ConnectError("refused"), True),
         (asyncio.TimeoutError(), True),
-        (requests.ConnectionError("iNat unreachable"), True),
-        (requests.Timeout("iNat timed out"), True),
         (_provider_error(502), True),
         (_provider_error(429), True),
         (_provider_error(401), False),

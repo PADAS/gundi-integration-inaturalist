@@ -9,7 +9,6 @@ import aiohttp
 from app import settings  # noqa: F401
 from gundi_client_v2.errors import AuthenticationError, GundiAPIError
 import httpx
-import requests
 
 
 class ActionNotFound(Exception):
@@ -119,10 +118,6 @@ CONNECTIVITY_EXCEPTIONS = (
     ConnectionError,  # builtin: covers ConnectionRefusedError, ConnectionResetError, etc.
     httpx.TransportError,  # covers ConnectError, ReadTimeout, and all transport failures
     aiohttp.ClientConnectionError,
-    # pyinaturalist talks to iNat through requests, whose transport errors
-    # subclass neither the builtin ConnectionError nor TimeoutError.
-    requests.ConnectionError,
-    requests.Timeout,
 )
 
 
