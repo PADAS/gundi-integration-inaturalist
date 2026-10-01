@@ -3,6 +3,7 @@ import logging
 from typing import Dict, List
 
 import httpx
+import requests
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import Observation
 
@@ -413,8 +414,15 @@ async def action_list_projects(integration: Integration, action_config: ListProj
     seen_ids = set()
     saved = list(dict.fromkeys(v.strip() for v in action_config.projects or [] if v and v.strip()))
     if saved:
+        try:
+            saved_projects = get_projects_by_ids_or_slugs(saved)
+        except requests.RequestException as e:
+            # Titles for the saved values are a nicety; the nearby list must
+            # still load, and the portal keeps flagging what didn't resolve.
+            logger.warning(f"Could not resolve saved iNaturalist projects {saved}: {e}")
+            saved_projects = []
         by_key = {}
-        for project in get_projects_by_ids_or_slugs(saved):
+        for project in saved_projects:
             if project.get("id") is None:
                 continue
             by_key[str(project["id"])] = project

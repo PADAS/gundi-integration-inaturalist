@@ -288,7 +288,12 @@ class ListProjectsQuery(ReferenceActionConfiguration):
 
     @pydantic.validator("bounding_box")
     def validate_bounding_box(cls, v):
-        return parse_bounding_box(v)
+        # The portal sends the box while the user is still typing it; a box
+        # that doesn't parse yet means "no nearby search", not a failed lookup.
+        try:
+            return parse_bounding_box(v)
+        except (ValueError, TypeError):
+            return None
 
 
 class ListAnnotationTermsQuery(ReferenceActionConfiguration):
