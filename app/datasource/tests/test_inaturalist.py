@@ -425,3 +425,31 @@ def test_search_projects_near_passes_circle_params(mocker):
     get_projects.assert_called_once_with(
         lat=47.55, lng=-122.35, radius=21.0, order_by="distance", per_page=200
     )
+
+
+def test_get_projects_by_ids_or_slugs_batches_and_skips_malformed(mocker):
+    """iNat takes at most 10 values per by-ID request and rejects the whole
+    request over one value that is neither an ID nor a slug."""
+    from app.datasource import inaturalist
+
+    get_by_id = mocker.patch.object(
+        inaturalist, "get_projects_by_id",
+        side_effect=lambda values: {"results": [{"id": v} for v in values]},
+    )
+    values = [str(i) for i in range(23)] + ["my project name", "a/b", "great-southern_bioblitz"]
+
+    results = inaturalist.get_projects_by_ids_or_slugs(values)
+
+    batches = [call.args[0] for call in get_by_id.call_args_list]
+    assert [len(b) for b in batches] == [10, 10, 4]
+    assert "my project name" not in sum(batches, []) and "a/b" not in sum(batches, [])
+    assert [r["id"] for r in results] == [str(i) for i in range(23)] + ["great-southern_bioblitz"]
+
+
+def test_get_projects_by_ids_or_slugs_with_nothing_to_look_up(mocker):
+    from app.datasource import inaturalist
+
+    get_by_id = mocker.patch.object(inaturalist, "get_projects_by_id")
+
+    assert inaturalist.get_projects_by_ids_or_slugs(["has space"]) == []
+    get_by_id.assert_not_called()
