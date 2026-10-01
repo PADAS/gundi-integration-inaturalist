@@ -430,7 +430,10 @@ async def action_list_projects(integration: Integration, action_config: ListProj
                 by_key[project["slug"].lower()] = project
         for value in saved:
             project = by_key.get(value) or by_key.get(value.lower())
-            if project and project["id"] not in seen_ids:
+            if project:
+                # Every stored string gets its own option, even when a slug and
+                # an ID name the same project; seen_ids only keeps the nearby
+                # search from repeating it.
                 seen_ids.add(project["id"])
                 options.append(ReferenceOption(value=value, label=project.get("title") or value))
 

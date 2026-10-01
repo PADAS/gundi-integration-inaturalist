@@ -293,6 +293,30 @@ async def test_list_projects_returns_saved_values_as_stored(mocker, inaturalist_
 
 
 @pytest.mark.asyncio
+async def test_list_projects_returns_both_slug_and_id_of_the_same_project(mocker, inaturalist_integration_v2):
+    """A config holding a project's slug and its numeric ID gets an option for
+    each, so neither saved value is reported missing."""
+    from app.actions import handlers
+    from app.actions.configurations import ListProjectsQuery
+
+    mocker.patch.object(
+        handlers, "get_projects_by_ids_or_slugs",
+        return_value=[{"id": 183547, "slug": "gsb-2023", "title": "GSB 2023"}],
+    )
+    mocker.patch.object(
+        handlers, "search_projects_near",
+        return_value={"total_results": 1, "results": [{"id": 183547, "title": "GSB 2023"}]},
+    )
+
+    result = await handlers.action_list_projects(
+        inaturalist_integration_v2,
+        ListProjectsQuery(bounding_box="[-17.1, 25.3, -28.6, 11.7]", projects=["gsb-2023", "183547"]),
+    )
+
+    assert [o["value"] for o in result["options"]] == ["gsb-2023", "183547"]
+
+
+@pytest.mark.asyncio
 async def test_list_projects_without_bounding_box_only_resolves_saved(mocker, inaturalist_integration_v2):
     from app.actions import handlers
     from app.actions.configurations import ListProjectsQuery
