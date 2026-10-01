@@ -85,7 +85,7 @@ class PullEventsConfig(PullActionConfiguration):
         description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
-        description="Required when no project is selected. Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude].")
+        description="Required when no project is selected. Draw a box on the map or enter its coordinates.")
 
     projects: Optional[List[pydantic.constr(strip_whitespace=True, min_length=1, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
         description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")
@@ -138,6 +138,11 @@ class PullEventsConfig(PullActionConfiguration):
         array to the root config; '../term' climbs from a values array to
         its AnnotationFilter row."""
         base = super().ui_schema(*args, **kwargs)
+        # Asks the portal for its map widget. The portal must register a
+        # "bbox" widget (gundi-portal PR 380) before this is registered; a
+        # portal without it fails on the unknown widget name. The stored
+        # value stays the JSON string '[ne_lat, ne_lng, sw_lat, sw_lng]'.
+        base["bounding_box"] = {**base.get("bounding_box", {}), "ui:widget": "bbox"}
         base["projects"] = {"items": {"gundi:reference": _reference(
             "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
         )}}
