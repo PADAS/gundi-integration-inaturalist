@@ -73,9 +73,7 @@ portal calls through `/v1/actions/execute` with `config_overrides` to populate c
 dropdowns. They wrap public, unauthenticated iNat endpoints. Design spec:
 `gundi-integration-cmore/docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md`.
 
-- They are hidden from registration unless `REGISTER_REFERENCE_ACTIONS=true`
-  (`app/settings/integration.py`) — flip it only once the Gundi API accepts
-  `"type": "reference"`.
+- They are registered with Gundi as `"type": "reference"` (template behavior).
 - `PullEventsConfig.ui_schema()` carries `gundi:reference` annotations (helper
   `_reference` in `configurations.py`). Never set `ui:widget` on those nodes — old
   portals must keep plain text inputs. A drift test in
