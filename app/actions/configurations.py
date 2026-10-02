@@ -87,18 +87,16 @@ class PullEventsConfig(PullActionConfiguration):
         ),
         description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
 
-    bounding_box: Optional[str] = pydantic.Field(title = "Bounding box for search area.  Of the format [ne_latitude, ne_longitude, sw_latitude, sw_longitude]")
+    bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
+        description="Required when no project is selected. Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude].")
 
-    projects: Optional[List[str]] = pydantic.Field(title = "Project IDs",
-        description="List of project IDs to pull from iNaturalist.")
+    projects: Optional[List[pydantic.constr(strip_whitespace=True, min_length=1, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
+        description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")
     
-    taxa: Optional[List[str]] = pydantic.Field(
+    taxa: Optional[List[pydantic.constr(regex=r"^\d+$")]] = pydantic.Field(
         None,
         title="Taxa IDs",
-        description=(
-            "iNaturalist taxa IDs for which to load observations. Legacy comma-separated "
-            "strings (e.g. '12345, 67890') are still accepted."
-        ),
+        description="iNaturalist taxa IDs for which to load observations. Required when no project is selected.",
     )
     
     quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
@@ -163,15 +161,21 @@ class PullEventsConfig(PullActionConfiguration):
     @pydantic.validator("taxa", pre=True, always=True)
     def coerce_taxa_to_list(cls, v):
         # Legacy configs stored this as a comma-separated string; the portal now
-        # submits a list. Coerce both (and scalars) into a list of id strings.
+        # submits a list. Coerce both (and scalars) into a deduped list of id
+        # strings, splitting list items too so "1,2" can't pass as one id.
         if v is None:
             return None
-        if isinstance(v, str):
-            v = v.split(",")
-        elif not isinstance(v, (list, tuple, set)):
-            v = [v]
-        cleaned = [str(t).strip() for t in v if t is not None and str(t).strip()]
-        return cleaned or None
+        items = v if isinstance(v, (list, tuple, set)) else [v]
+        cleaned = {}
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, bool) or not isinstance(item, (str, int)):
+                raise ValueError(f"Taxa IDs must be strings or integers, got {item!r}.")
+            for part in str(item).split(","):
+                if part.strip():
+                    cleaned[part.strip()] = None
+        return list(cleaned) or None
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
@@ -253,6 +257,8 @@ class PullEventsConfig(PullActionConfiguration):
 
     class Config:
         schema_extra = {
+            # Shown by the portal as a note under the section heading.
+            "description": "Brings iNaturalist observations in as events. Choose at least one project, or enter taxa IDs together with a bounding box.",
             "examples": [
                 {
                     "": 47.5218082,
@@ -261,7 +267,29 @@ class PullEventsConfig(PullActionConfiguration):
                     "num_days_default": 1
                 }
             ],
-            "required": ["bounding_box", "days_to_load"]
+            "required": ["days_to_load"],
+            # Portal-enforced filter rule: a project is enough on its own; without
+            # one, taxa AND a bounding box are both required. Both branches repeat
+            # the base required list because legacy portal screens replace it with
+            # the branch's list instead of merging, and only apply if/then/else
+            # when both branches are present.
+            "if": {
+                "properties": {
+                    "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
+                }
+            },
+            # `required` only checks the key is there, so minItems and the pattern
+            # make an empty taxa list or a blank box count as missing: both mean
+            # "no filter". They sit in this branch only, since saved configs with
+            # a project can carry an empty taxa list.
+            "then": {
+                "required": ["days_to_load", "taxa", "bounding_box"],
+                "properties": {
+                    "taxa": {"type": "array", "minItems": 1},
+                    "bounding_box": {"type": "string", "pattern": r"\S"},
+                },
+            },
+            "else": {"required": ["days_to_load"]},
         }
 
 

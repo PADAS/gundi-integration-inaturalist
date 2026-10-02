@@ -119,7 +119,11 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         if "search" in ref:
             assert ref["search"]["param"] in query_fields
             assert ref["search"]["param"] not in ref.get("params", {})
-            assert isinstance(ref["search"].get("min_chars", 2), int)
+            # The search param must be optional: widgets that predate search
+            # fetch without it and must get an empty list, not a 422.
+            assert not reference_actions[ref["action"]].__fields__[ref["search"]["param"]].required
+            min_chars = ref["search"]["min_chars"]
+            assert type(min_chars) is int and min_chars >= 1
 
 
 def test_gundi_reference_annotations_sit_on_the_right_nodes():
@@ -156,6 +160,18 @@ def test_taxa_accepts_list_and_coerces_ints():
     assert config.taxa_str == "12345,67890"
 
 
+def test_taxa_drops_duplicates_and_splits_list_items():
+    config = PullEventsConfig(days_to_load=3, taxa=["1, 2", "1", 2, "3"])
+    assert config.taxa == ["1", "2", "3"]
+
+
+@pytest.mark.parametrize("raw", [["leopard"], "Panthera pardus", [True], [{"a": 1}], 1.5])
+def test_taxa_rejects_values_that_are_not_ids(raw):
+    """A typed name would be sent as taxon_id and fail every scheduled pull."""
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(days_to_load=3, taxa=raw)
+
+
 @pytest.mark.parametrize("raw", [None, "", "   ", []])
 def test_taxa_empty_inputs_mean_no_filter(raw):
     config = PullEventsConfig(days_to_load=3, taxa=raw)
@@ -175,3 +191,105 @@ def test_taxa_gundi_reference_is_a_search_annotation():
     assert taxa_ref["action"] == "list_taxa"
     assert taxa_ref["params"] == {}
     assert taxa_ref["search"] == {"param": "q", "min_chars": 2}
+
+
+def test_schema_requires_taxa_and_bounding_box_only_without_projects():
+    """The portal enforces this rule from the registered schema: a project is
+    enough on its own; without one, taxa and a bounding box are both required."""
+    schema = PullEventsConfig.schema()
+    assert schema["required"] == ["days_to_load"]
+    assert schema["if"] == {
+        "properties": {
+            "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
+        }
+    }
+    assert schema["then"]["required"] == ["days_to_load", "taxa", "bounding_box"]
+    assert schema["else"] == {"required": ["days_to_load"]}
+
+
+@pytest.mark.parametrize("value,accepted", [
+    ("[1, 1, 0, 0]", True),
+    ("", False),
+    ("  ", False),
+])
+def test_schema_requires_real_bounding_box_without_projects(value, accepted):
+    """`required` only checks the key is present; the branch's pattern stops a
+    blank box, which would otherwise mean a pull with no area filter."""
+    import re
+
+    rule = PullEventsConfig.schema()["then"]["properties"]["bounding_box"]
+    assert rule["type"] == "string"
+    # JSON-schema patterns are unanchored, like re.search.
+    assert bool(re.search(rule["pattern"], value)) is accepted
+
+
+def test_schema_requires_nonempty_taxa_without_projects():
+    """Without a project, an empty taxa list must count as missing."""
+    rule = PullEventsConfig.schema()["then"]["properties"]["taxa"]
+    assert rule == {"type": "array", "minItems": 1}
+
+
+@pytest.mark.parametrize("value,accepted", [
+    ("12345", True),
+    ("", False),
+    (" 1", False),
+    ("leopard", False),
+    ("1,2", False),
+])
+def test_schema_taxa_items_must_be_numeric_ids(value, accepted):
+    """The typeahead allows free text; the portal must reject typed names,
+    which iNat would refuse on every scheduled pull."""
+    import re
+
+    pattern = PullEventsConfig.schema()["properties"]["taxa"]["items"]["pattern"]
+    assert bool(re.search(pattern, value)) is accepted
+
+
+def test_config_without_projects_or_taxa_still_parses():
+    """The rule lives only in the portal schema; the runner keeps accepting
+    existing configs so saved connections run unchanged."""
+    config = PullEventsConfig(days_to_load=3, bounding_box="[1, 1, 0, 0]")
+    assert config.projects is None and config.taxa is None
+
+
+@pytest.mark.parametrize("projects", [[""], ["  "], ["123", ""], [" \t"]])
+def test_blank_project_ids_are_rejected(projects):
+    """A blank entry would count as a project in the schema rule yet be dropped
+    by pyinaturalist, leaving a query with no project, taxa or area filter."""
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(days_to_load=3, projects=projects)
+
+
+def test_schema_rejects_blank_project_ids():
+    """The portal validates against the generated schema, so blank entries must
+    be excluded there too, not only at runtime."""
+    items = PullEventsConfig.schema()["properties"]["projects"]["items"]
+    assert items["type"] == "string"
+    assert items["minLength"] == 1
+    assert items["pattern"] == r"^\s*\S"
+
+
+def test_project_ids_are_trimmed():
+    config = PullEventsConfig(days_to_load=3, projects=[" 123 "])
+    assert config.projects == ["123"]
+
+
+def test_schema_explains_project_or_taxa_with_bounding_box_rule():
+    """The portal shows the root description under the section heading and each
+    field description under its field; conditional requirements get no star."""
+    schema = PullEventsConfig.schema()
+    assert schema["description"] == (
+        "Brings iNaturalist observations in as events. "
+        "Choose at least one project, or enter taxa IDs together with a bounding box."
+    )
+    props = schema["properties"]
+    assert "Leave empty to filter by taxa and area instead." in props["projects"]["description"]
+    assert "Required when no project is selected." in props["taxa"]["description"]
+    assert props["bounding_box"]["description"] == (
+        "Required when no project is selected. "
+        "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
+    )
+
+
+def test_bounding_box_title_is_short():
+    assert PullEventsConfig.schema()["properties"]["bounding_box"]["title"] == "Bounding box"
