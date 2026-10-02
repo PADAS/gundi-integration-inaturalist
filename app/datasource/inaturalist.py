@@ -1,6 +1,7 @@
 """iNaturalist API client for fetching observations."""
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, List, Optional, Tuple
@@ -8,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from pyinaturalist import (
     Annotation,
+    ClientSession,
     Observation,
     get_controlled_terms,
     get_observations_v2,
@@ -88,9 +90,23 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
     )
 
 
+# Typeahead lookups are interactive, so they fail fast instead of using
+# pyinaturalist's default 10s timeout with 5 retries. The session keeps the
+# default rate-limit file, so the daily request budget stays shared with pulls.
+TYPEAHEAD_TIMEOUT_SECONDS = 5
+_typeahead = threading.local()
+
+
+def _typeahead_session() -> ClientSession:
+    # Thread-local like pyinaturalist's own session: callers run in worker threads.
+    if not hasattr(_typeahead, "session"):
+        _typeahead.session = ClientSession(max_retries=0, timeout=TYPEAHEAD_TIMEOUT_SECONDS)
+    return _typeahead.session
+
+
 def search_taxa(q: str) -> Dict:
     """iNaturalist taxa matching a typed query (public autocomplete endpoint)."""
-    return get_taxa_autocomplete(q=q)
+    return get_taxa_autocomplete(q=q, session=_typeahead_session())
 
 
 class INatRequestError(requests.HTTPError):

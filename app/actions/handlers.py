@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
@@ -457,7 +458,9 @@ async def action_list_taxa(integration: Integration, action_config: ListTaxaQuer
     query = (action_config.q or "").strip()
     if not query:
         return ReferenceDataResponse(options=[], truncated=True).dict()
-    response = search_taxa(query)
+    # search_taxa blocks (requests, plus a rate limiter that sleeps), so keep it
+    # off the event loop: the portal calls this on every keystroke.
+    response = await asyncio.to_thread(search_taxa, query)
     results = response.get("results", [])
     options = []
     for taxon in results:

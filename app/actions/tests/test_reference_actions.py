@@ -348,3 +348,23 @@ async def test_list_taxa_empty_query_returns_no_default_page(mocker, inaturalist
     search.assert_not_called()
     assert result["options"] == []
     assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_taxa_searches_off_the_event_loop(mocker, inaturalist_integration_v2):
+    """search_taxa is blocking (requests + a sleeping rate limiter); running it on
+    the loop would stall every other request on the instance per keystroke."""
+    import threading
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    loop_thread = threading.current_thread()
+    seen = []
+    mocker.patch.object(
+        handlers, "search_taxa",
+        side_effect=lambda q: seen.append(threading.current_thread()) or TAXA_RESPONSE,
+    )
+
+    await handlers.action_list_taxa(inaturalist_integration_v2, ListTaxaQuery(q="leopard"))
+
+    assert seen and seen[0] is not loop_thread

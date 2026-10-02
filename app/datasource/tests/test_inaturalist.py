@@ -434,4 +434,15 @@ def test_search_taxa_passes_query(mocker):
         inaturalist, "get_taxa_autocomplete", return_value={"total_results": 0, "results": []}
     )
     inaturalist.search_taxa("leo")
-    get_taxa_autocomplete.assert_called_once_with(q="leo")
+    get_taxa_autocomplete.assert_called_once_with(q="leo", session=mocker.ANY)
+
+
+def test_search_taxa_fails_fast():
+    """Typeahead is interactive: no retries and a short timeout, rather than
+    pyinaturalist's default 10s timeout x 5 retries."""
+    from app.datasource import inaturalist
+
+    session = inaturalist._typeahead_session()
+    assert session.timeout == inaturalist.TYPEAHEAD_TIMEOUT_SECONDS
+    assert session.retries.total == 0
+    assert inaturalist._typeahead_session() is session
