@@ -137,3 +137,6 @@ dmypy.json
 
 .env.local
 sample-docs
+
+# migrate_pull_events_configs backups (customer config data)
+pull_events_configs_backup_*.json
