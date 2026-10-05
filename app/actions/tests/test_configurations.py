@@ -193,6 +193,11 @@ def test_taxa_gundi_reference_is_a_search_annotation():
     assert taxa_ref["search"] == {"param": "q", "min_chars": 2}
 
 
+def test_bounding_box_requests_the_bbox_widget():
+    ui = PullEventsConfig.ui_schema()
+    assert ui["bounding_box"] == {"ui:widget": "bbox"}
+
+
 def test_schema_requires_taxa_and_bounding_box_only_without_projects():
     """The portal enforces this rule from the registered schema: a project is
     enough on its own; without one, taxa and a bounding box are both required."""
@@ -287,7 +292,7 @@ def test_schema_explains_project_or_taxa_with_bounding_box_rule():
     assert "Required when no project is selected." in props["taxa"]["description"]
     assert props["bounding_box"]["description"] == (
         "Required when no project is selected. "
-        "Format: [ne_latitude, ne_longitude, sw_latitude, sw_longitude]."
+        "Draw a box on the map or enter its coordinates."
     )
 
 
