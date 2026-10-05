@@ -10,3 +10,8 @@ env.read_env()
 # Until then this stays off so self-registration never sends a type the API
 # would reject.
 REGISTER_REFERENCE_ACTIONS = env.bool("REGISTER_REFERENCE_ACTIONS", False)
+
+# Requests the portal's map widget for the bounding box. Portals without the
+# "bbox" widget (gundi-portal PR 380) fail to render the whole config form on an
+# unknown widget name, so this stays off until every portal has it.
+PORTAL_BBOX_WIDGET = env.bool("PORTAL_BBOX_WIDGET", False)
