@@ -3,7 +3,6 @@
 import pydantic
 import pytest
 
-from app.actions import configurations
 from app.actions.configurations import PullEventsConfig
 
 
@@ -141,16 +140,9 @@ def test_ui_schema_override_preserves_existing_ui_options():
     assert ui["days_to_load"] == {"ui:widget": "range"}
 
 
-def test_bounding_box_requests_the_bbox_widget_when_enabled(mocker):
-    mocker.patch.object(configurations, "PORTAL_BBOX_WIDGET", True)
+def test_bounding_box_requests_the_bbox_widget():
     ui = PullEventsConfig.ui_schema()
     assert ui["bounding_box"] == {"ui:widget": "bbox"}
-
-
-def test_bounding_box_keeps_the_text_input_when_disabled(mocker):
-    mocker.patch.object(configurations, "PORTAL_BBOX_WIDGET", False)
-    ui = PullEventsConfig.ui_schema()
-    assert "ui:widget" not in ui.get("bounding_box", {})
 
 
 def test_schema_requires_taxa_and_bounding_box_only_without_projects():
