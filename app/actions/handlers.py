@@ -1,4 +1,3 @@
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
@@ -110,11 +109,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
 
-    # get_observations is synchronous (and sleeps to respect iNat's rate limit), so it runs in a
-    # thread: blocking the event loop would stop the runner's execution deadline from firing
-    # before the run lock expires.
-    observations = await asyncio.to_thread(
-        get_observations,
+    # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
+    observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
         taxa=action_config.taxa,

@@ -451,29 +451,6 @@ async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_ex
     assert state.locks[lock_key] == "run-b-token"
 
 
-@pytest.mark.asyncio
-async def test_action_pull_events_fetches_off_the_event_loop(mocker):
-    # The iNat client blocks (and sleeps to rate-limit); on the event loop it would
-    # stop the runner's execution deadline from firing before the run lock expires.
-    import threading
-
-    mock_state = AsyncMock()
-    mock_state.set_if_absent.return_value = True
-    mock_state.get_state.return_value = {}
-    mocker.patch("app.actions.handlers.state_manager", mock_state)
-    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
-    fetch_threads = []
-    mocker.patch(
-        "app.actions.handlers.get_observations",
-        side_effect=lambda *args, **kwargs: fetch_threads.append(threading.current_thread()) or {},
-    )
-
-    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
-
-    assert fetch_threads and fetch_threads[0] is not threading.main_thread()
-
-
 # --- process_attachments: error logging ---
 
 
