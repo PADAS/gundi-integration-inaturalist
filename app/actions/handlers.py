@@ -1,6 +1,8 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from uuid import uuid4
 
 import httpx
 from gundi_core.schemas.v2 import Integration, LogLevel
@@ -37,7 +39,8 @@ STATE_LAST_RUN_KEY = "last_run"
 STATE_DATETIME_FMT = "%Y-%m-%d %H:%M:%S%z"
 # Per-observation state: when we last synced this observation to Gundi (so we only patch when it changes)
 STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
-# Per-integration run lock: held while a pull runs, expires if a run dies without releasing it
+# Per-integration run lock: held while a pull runs, expires if a run dies without releasing it.
+# Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
 RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
 
@@ -70,8 +73,10 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     integration_id = str(integration.id)
     if ephemeral_run.get():
         return await _pull_events(integration, action_config)
+    lock_token = uuid4().hex
     acquired = await state_manager.set_if_absent(
-        integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID
+        integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
+        value=lock_token,
     )
     if not acquired:
         msg = f"Skipping iNaturalist pull for integration ID: {integration_id}: another run is in progress."
@@ -90,7 +95,9 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         return await _pull_events(integration, action_config)
     finally:
         try:
-            await state_manager.delete_state(integration_id, "pull_events", source_id=STATE_RUN_LOCK_SOURCE_ID)
+            await state_manager.delete_state_if_value(
+                integration_id, "pull_events", lock_token, source_id=STATE_RUN_LOCK_SOURCE_ID
+            )
         except Exception:
             # The lock expires on its own; don't mask the run's own outcome.
             logger.exception(f"Error releasing the pull lock for integration ID: {integration_id}.")
@@ -103,8 +110,11 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
 
-    # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
-    observations = get_observations(
+    # get_observations is synchronous (and sleeps to respect iNat's rate limit), so it runs in a
+    # thread: blocking the event loop would stop the runner's execution deadline from firing
+    # before the run lock expires.
+    observations = await asyncio.to_thread(
+        get_observations,
         load_since,
         bounding_box=action_config.bounding_box,
         taxa=action_config.taxa,

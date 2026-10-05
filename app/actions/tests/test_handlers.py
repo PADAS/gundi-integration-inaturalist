@@ -318,7 +318,7 @@ async def test_action_pull_events_skips_when_another_run_holds_the_lock(mocker):
 
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
     mock_get_observations.assert_not_called()
-    mock_state.delete_state.assert_not_called()
+    mock_state.delete_state_if_value.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -336,7 +336,10 @@ async def test_action_pull_events_releases_the_lock_after_a_run(mocker):
 
     mock_state.set_if_absent.assert_called_once()
     assert mock_state.set_if_absent.call_args.kwargs["source_id"] == "run_lock"
-    mock_state.delete_state.assert_called_once_with(str(integration.id), "pull_events", source_id="run_lock")
+    lock_token = mock_state.set_if_absent.call_args.kwargs["value"]
+    mock_state.delete_state_if_value.assert_called_once_with(
+        str(integration.id), "pull_events", lock_token, source_id="run_lock"
+    )
 
 
 @pytest.mark.asyncio
@@ -352,7 +355,10 @@ async def test_action_pull_events_releases_the_lock_when_the_run_fails(mocker):
     with pytest.raises(RuntimeError, match="iNat down"):
         await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
 
-    mock_state.delete_state.assert_called_once_with(str(integration.id), "pull_events", source_id="run_lock")
+    lock_token = mock_state.set_if_absent.call_args.kwargs["value"]
+    mock_state.delete_state_if_value.assert_called_once_with(
+        str(integration.id), "pull_events", lock_token, source_id="run_lock"
+    )
 
 
 @pytest.mark.asyncio
@@ -360,7 +366,7 @@ async def test_action_pull_events_lock_release_failure_does_not_mask_the_result(
     mock_state = AsyncMock()
     mock_state.set_if_absent.return_value = True
     mock_state.get_state.return_value = {}
-    mock_state.delete_state.side_effect = ConnectionError("redis down")
+    mock_state.delete_state_if_value.side_effect = ConnectionError("redis down")
     mocker.patch("app.actions.handlers.state_manager", mock_state)
     mocker.patch("app.actions.handlers.get_observations", return_value={})
     mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
@@ -389,7 +395,83 @@ async def test_action_pull_events_ephemeral_run_skips_the_lock(mocker):
         ephemeral_run.reset(token)
 
     mock_state.set_if_absent.assert_not_called()
-    mock_state.delete_state.assert_not_called()
+    mock_state.delete_state_if_value.assert_not_called()
+
+
+class _InMemoryLockState:
+    """Just the lock calls of IntegrationStateManager, with Redis semantics."""
+
+    def __init__(self):
+        self.locks = {}
+
+    async def get_state(self, *args, **kwargs):
+        return {}
+
+    async def set_state(self, *args, **kwargs):
+        pass
+
+    async def set_if_absent(self, integration_id, action_id, *, ttl_seconds, source_id="no-source", value="1"):
+        key = (integration_id, action_id, source_id)
+        if key in self.locks:
+            return False
+        self.locks[key] = value
+        return True
+
+    async def delete_state(self, integration_id, action_id, source_id="no-source"):
+        self.locks.pop((integration_id, action_id, source_id), None)
+
+    async def delete_state_if_value(self, integration_id, action_id, value, source_id="no-source"):
+        key = (integration_id, action_id, source_id)
+        if self.locks.get(key) != value:
+            return False
+        del self.locks[key]
+        return True
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_expired(mocker):
+    # Run A outlives its lock; run B takes the expired lock while A is still running.
+    # A's cleanup must leave B's lock in place, or a third run could overlap B.
+    integration = _lock_test_integration()
+    lock_key = (str(integration.id), "pull_events", "run_lock")
+    state = _InMemoryLockState()
+    mocker.patch("app.actions.handlers.state_manager", state)
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    def run_a_fetch(*args, **kwargs):
+        state.locks.pop(lock_key)  # A's lock expires mid-run
+        state.locks[lock_key] = "run-b-token"  # and run B takes it
+        return {}
+
+    mocker.patch("app.actions.handlers.get_observations", side_effect=run_a_fetch)
+
+    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert state.locks[lock_key] == "run-b-token"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_fetches_off_the_event_loop(mocker):
+    # The iNat client blocks (and sleeps to rate-limit); on the event loop it would
+    # stop the runner's execution deadline from firing before the run lock expires.
+    import threading
+
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    fetch_threads = []
+    mocker.patch(
+        "app.actions.handlers.get_observations",
+        side_effect=lambda *args, **kwargs: fetch_threads.append(threading.current_thread()) or {},
+    )
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert fetch_threads and fetch_threads[0] is not threading.main_thread()
 
 
 # --- process_attachments: error logging ---
