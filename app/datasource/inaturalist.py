@@ -1,6 +1,7 @@
 """iNaturalist API client for fetching observations."""
 
 import logging
+import re
 from datetime import datetime, timedelta
 from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +13,7 @@ from pyinaturalist import (
     get_controlled_terms,
     get_observations_v2,
     get_projects,
+    get_projects_by_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +32,9 @@ OBSERVATION_FIELDS = [
 # Reference-action project search: one page of nearest projects; the portal's
 # combobox allows free text for anything beyond it (truncated=True signals the cap).
 PROJECTS_PAGE_SIZE = 200
+# Projects-by-ID lookup: iNat answers 422 for more than 10 values per request.
+PROJECTS_BY_ID_BATCH_SIZE = 10
+PROJECT_ID_OR_SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_PROJECT_SEARCH_RADIUS_KM = 500.0
 
 
@@ -85,6 +90,24 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
     return get_projects(
         lat=lat, lng=lng, radius=radius_km, order_by="distance", per_page=PROJECTS_PAGE_SIZE
     )
+
+
+def get_projects_by_ids_or_slugs(values: List[str]) -> List[Dict]:
+    """iNaturalist projects for the given numeric IDs or slugs (public endpoint).
+
+    The endpoint takes at most PROJECTS_BY_ID_BATCH_SIZE values per request and
+    rejects the whole request over one value that isn't an ID or slug (a space
+    gives 422, a "/" 404), so values that can't be either are skipped and the
+    rest are requested in batches. Unknown values are simply absent from the
+    result.
+    """
+    lookups = [v for v in values if PROJECT_ID_OR_SLUG.match(v)]
+    results = []
+    for start in range(0, len(lookups), PROJECTS_BY_ID_BATCH_SIZE):
+        response = get_projects_by_id(lookups[start:start + PROJECTS_BY_ID_BATCH_SIZE])
+        if isinstance(response, dict):
+            results.extend(response.get("results", []))
+    return results
 
 
 class INatRequestError(requests.HTTPError):
