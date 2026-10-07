@@ -1,11 +1,15 @@
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from uuid import uuid4
 
 import httpx
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import Observation
 
+from gundi_client_v2.errors import GundiAPIError
+
+from app import settings
 from app.actions.configurations import (
     PullEventsConfig,
     ListProjectsQuery,
@@ -13,7 +17,7 @@ from app.actions.configurations import (
     ListAnnotationValuesQuery,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
-from app.services.activity_logger import activity_logger, log_action_activity
+from app.services.activity_logger import activity_logger, ephemeral_run, log_action_activity
 from app.services.gundi import (
     send_event_attachments_to_gundi,
     send_events_to_gundi,
@@ -34,6 +38,10 @@ STATE_LAST_RUN_KEY = "last_run"
 STATE_DATETIME_FMT = "%Y-%m-%d %H:%M:%S%z"
 # Per-observation state: when we last synced this observation to Gundi (so we only patch when it changes)
 STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
+# Per-integration run lock: held while a pull runs, expires if a run dies without releasing it.
+# Each run writes its own token, so a run that outlives its lock can't release the next run's.
+STATE_RUN_LOCK_SOURCE_ID = "run_lock"
+RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -51,26 +59,6 @@ def _build_pull_events_state(last_updated: datetime) -> dict:
     """Build the state dict to persist after a pull_events run."""
     return {STATE_LAST_RUN_KEY: last_updated.strftime(STATE_DATETIME_FMT)}
 
-async def handle_transformed_data(transformed_data, integration_id, action_id):
-    try:
-        response = await send_events_to_gundi(
-            events=transformed_data,
-            integration_id=integration_id
-        )
-    except httpx.HTTPError as e:
-        msg = f'Sensors API returned error for integration_id: {integration_id}. Exception: {e}'
-        logger.exception(
-            msg,
-            extra={
-                'needs_attention': True,
-                'integration_id': integration_id,
-                'action_id': action_id
-            }
-        )
-        return [msg]
-    else:
-        return response
-
 def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
     yield list_a[i:i + chunk_size]
@@ -78,6 +66,53 @@ def chunk_list(list_a, chunk_size):
 @action_title("Pull iNaturalist Observations")
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
+    # A redelivered run (transient failures are nacked) can overlap the next scheduled
+    # run for the same integration, so only one pull runs per integration at a time.
+    # Ephemeral runs persist no state, so they skip the lock.
+    integration_id = str(integration.id)
+    if ephemeral_run.get():
+        return await _pull_events(integration, action_config)
+    lock_token = uuid4().hex
+    acquired = await state_manager.set_if_absent(
+        integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
+        value=lock_token,
+    )
+    if not acquired:
+        msg = f"Skipping iNaturalist pull for integration ID: {integration_id}: another run is in progress."
+        logger.info(msg)
+        try:
+            await log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.INFO,
+                title=msg,
+                data={"message": msg}
+            )
+        except Exception as log_error:
+            # Best-effort, like the runner's own skip: a publisher failure must not
+            # turn the skip into an error that PubSub redelivers.
+            logger.warning(f"Could not publish the skip notice for integration ID: {integration_id}: {log_error}")
+        return {'result': {'events_extracted': 0,
+                           'events_updated': 0,
+                           'photos_attached': 0}}
+    try:
+        return await _pull_events(integration, action_config)
+    finally:
+        try:
+            released = await state_manager.delete_state_if_value(
+                integration_id, "pull_events", lock_token, source_id=STATE_RUN_LOCK_SOURCE_ID
+            )
+            if not released:
+                logger.info(
+                    f"Pull lock for integration ID: {integration_id} had already expired or been "
+                    f"taken by another run; left it in place."
+                )
+        except Exception:
+            # The lock expires on its own; don't mask the run's own outcome.
+            logger.exception(f"Error releasing the pull lock for integration ID: {integration_id}.")
+
+
+async def _pull_events(integration: Integration, action_config: PullEventsConfig):
 
     # Log the id only: the Integration carries every action config, including
     # the auth row's api_key.
@@ -251,7 +286,9 @@ async def process_attachments(events, response, all_event_photos, integration):
                 "attention_needed": True
             })
             log_data = {"message": message}
-            if server_response := getattr(e, "response", None):
+            if isinstance(e, GundiAPIError):
+                log_data["server_response_body"] = e.detail
+            elif server_response := getattr(e, "response", None):
                 log_data["server_response_body"] = server_response.text
             await log_action_activity(
                 integration_id=integration.id,

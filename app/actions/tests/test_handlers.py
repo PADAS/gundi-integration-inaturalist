@@ -1,5 +1,6 @@
 """Unit tests for app.actions.handlers."""
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,7 +17,7 @@ from app.actions.handlers import (
     _transform_inat_to_gundi_event,
     action_pull_events,
     chunk_list,
-    handle_transformed_data,
+    process_attachments,
 )
 from app.actions.configurations import PullEventsConfig
 
@@ -239,20 +240,6 @@ async def test_action_pull_events_no_observations_updates_state(mocker):
     assert parsed.tzinfo is not None
 
 
-# --- handle_transformed_data ---
-
-
-@pytest.mark.asyncio
-async def test_handle_transformed_data_success(mocker):
-    mocker.patch("app.actions.handlers.send_events_to_gundi", AsyncMock(return_value=["id-1"]))
-    result = await handle_transformed_data(
-        transformed_data=[{"title": "Test"}],
-        integration_id="int-123",
-        action_id="pull_events",
-    )
-    assert result == ["id-1"]
-
-
 @pytest.mark.asyncio
 async def test_action_pull_events_skips_patch_when_observation_already_in_sync(mocker):
     """When state has inat_updated_at equal to observation.updated_at, we should not patch (avoids updating every run)."""
@@ -307,18 +294,211 @@ async def test_action_pull_events_skips_patch_when_observation_already_in_sync(m
     mock_patch_events.assert_not_called()
 
 
+
+
+# --- action_pull_events: per-integration run lock ---
+
+
+def _lock_test_integration():
+    from uuid import UUID
+
+    integration = MagicMock()
+    integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
+    return integration
+
+
 @pytest.mark.asyncio
-async def test_handle_transformed_data_http_error_returns_message(mocker):
-    import httpx
+async def test_action_pull_events_skips_when_another_run_holds_the_lock(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = False
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mock_get_observations = mocker.patch("app.actions.handlers.get_observations")
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    mock_get_observations.assert_not_called()
+    mock_state.delete_state_if_value.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_skip_survives_an_activity_log_failure(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = False
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mock_get_observations = mocker.patch("app.actions.handlers.get_observations")
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock(side_effect=RuntimeError("publisher down")))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    mock_get_observations.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_releases_the_lock_after_a_run(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    integration = _lock_test_integration()
+
+    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+
+    mock_state.set_if_absent.assert_called_once()
+    assert mock_state.set_if_absent.call_args.kwargs["source_id"] == "run_lock"
+    lock_token = mock_state.set_if_absent.call_args.kwargs["value"]
+    mock_state.delete_state_if_value.assert_called_once_with(
+        str(integration.id), "pull_events", lock_token, source_id="run_lock"
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_releases_the_lock_when_the_run_fails(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", side_effect=RuntimeError("iNat down"))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    integration = _lock_test_integration()
+
+    with pytest.raises(RuntimeError, match="iNat down"):
+        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+
+    lock_token = mock_state.set_if_absent.call_args.kwargs["value"]
+    mock_state.delete_state_if_value.assert_called_once_with(
+        str(integration.id), "pull_events", lock_token, source_id="run_lock"
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_lock_release_failure_does_not_mask_the_result(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mock_state.delete_state_if_value.side_effect = ConnectionError("redis down")
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_ephemeral_run_skips_the_lock(mocker):
+    from app.services.activity_logger import ephemeral_run
+
+    mock_state = AsyncMock()
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    token = ephemeral_run.set(True)
+    try:
+        await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+    finally:
+        ephemeral_run.reset(token)
+
+    mock_state.set_if_absent.assert_not_called()
+    mock_state.delete_state_if_value.assert_not_called()
+
+
+class _InMemoryLockState:
+    """Just the lock calls of IntegrationStateManager, with Redis semantics."""
+
+    def __init__(self):
+        self.locks = {}
+
+    async def get_state(self, *args, **kwargs):
+        return {}
+
+    async def set_state(self, *args, **kwargs):
+        pass
+
+    async def set_if_absent(self, integration_id, action_id, *, ttl_seconds, source_id="no-source", value="1"):
+        key = (integration_id, action_id, source_id)
+        if key in self.locks:
+            return False
+        self.locks[key] = value
+        return True
+
+    async def delete_state(self, integration_id, action_id, source_id="no-source"):
+        self.locks.pop((integration_id, action_id, source_id), None)
+
+    async def delete_state_if_value(self, integration_id, action_id, value, source_id="no-source"):
+        key = (integration_id, action_id, source_id)
+        if self.locks.get(key) != value:
+            return False
+        del self.locks[key]
+        return True
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_expired(mocker, caplog):
+    # Run A outlives its lock; run B takes the expired lock while A is still running.
+    # A's cleanup must leave B's lock in place, or a third run could overlap B.
+    integration = _lock_test_integration()
+    lock_key = (str(integration.id), "pull_events", "run_lock")
+    state = _InMemoryLockState()
+    mocker.patch("app.actions.handlers.state_manager", state)
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    def run_a_fetch(*args, **kwargs):
+        state.locks.pop(lock_key)  # A's lock expires mid-run
+        state.locks[lock_key] = "run-b-token"  # and run B takes it
+        return {}
+
+    mocker.patch("app.actions.handlers.get_observations", side_effect=run_a_fetch)
+
+    with caplog.at_level(logging.INFO, logger="app.actions.handlers"):
+        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert state.locks[lock_key] == "run-b-token"
+    assert "had already expired or been taken by another run" in caplog.text
+
+
+# --- process_attachments: error logging ---
+
+
+@pytest.mark.asyncio
+async def test_process_attachments_logs_gundi_error_detail(mocker):
+    from gundi_client_v2.errors import GundiAPIError
+
+    image_response = MagicMock()
+    image_response.aread = AsyncMock(return_value=b"raw-image-bytes")
+    session = AsyncMock()
+    session.get.return_value = image_response
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=session)
+    client.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("app.actions.handlers.httpx.AsyncClient", return_value=client)
     mocker.patch(
-        "app.actions.handlers.send_events_to_gundi",
-        AsyncMock(side_effect=httpx.HTTPError("Server error")),
+        "app.actions.handlers.send_event_attachments_to_gundi",
+        AsyncMock(side_effect=GundiAPIError(413, "Request too large")),
     )
-    result = await handle_transformed_data(
-        transformed_data=[],
-        integration_id="int-456",
-        action_id="pull_events",
+    mock_log_activity = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    integration = _lock_test_integration()
+
+    processed = await process_attachments(
+        events=[{"event_details": {"inat_id": "999"}}],
+        response=[{"object_id": "gundi-uuid-999"}],
+        all_event_photos={"999": [(42, "https://example.com/photo.jpg")]},
+        integration=integration,
     )
-    assert len(result) == 1
-    assert "int-456" in result[0]
-    assert "Server error" in result[0]
+
+    assert processed == 0
+    log_data = mock_log_activity.call_args.kwargs["data"]
+    assert log_data["server_response_body"] == "Request too large"
