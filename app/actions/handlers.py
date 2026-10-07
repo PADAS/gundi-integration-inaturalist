@@ -94,9 +94,14 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         return await _pull_events(integration, action_config)
     finally:
         try:
-            await state_manager.delete_state_if_value(
+            released = await state_manager.delete_state_if_value(
                 integration_id, "pull_events", lock_token, source_id=STATE_RUN_LOCK_SOURCE_ID
             )
+            if not released:
+                logger.info(
+                    f"Pull lock for integration ID: {integration_id} had already expired or been "
+                    f"taken by another run; left it in place."
+                )
         except Exception:
             # The lock expires on its own; don't mask the run's own outcome.
             logger.exception(f"Error releasing the pull lock for integration ID: {integration_id}.")

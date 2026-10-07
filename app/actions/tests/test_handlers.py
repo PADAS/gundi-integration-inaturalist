@@ -1,5 +1,6 @@
 """Unit tests for app.actions.handlers."""
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -429,7 +430,7 @@ class _InMemoryLockState:
 
 
 @pytest.mark.asyncio
-async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_expired(mocker):
+async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_expired(mocker, caplog):
     # Run A outlives its lock; run B takes the expired lock while A is still running.
     # A's cleanup must leave B's lock in place, or a third run could overlap B.
     integration = _lock_test_integration()
@@ -446,9 +447,11 @@ async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_ex
 
     mocker.patch("app.actions.handlers.get_observations", side_effect=run_a_fetch)
 
-    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+    with caplog.at_level(logging.INFO, logger="app.actions.handlers"):
+        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
 
     assert state.locks[lock_key] == "run-b-token"
+    assert "had already expired or been taken by another run" in caplog.text
 
 
 # --- process_attachments: error logging ---
