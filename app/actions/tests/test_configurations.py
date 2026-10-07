@@ -244,3 +244,19 @@ def test_rejects_config_with_no_project_taxa_or_bounding_box(taxa, bounding_box)
 ])
 def test_accepts_legacy_config_with_any_single_filter(filters):
     PullEventsConfig(days_to_load=3, **filters)
+
+
+@pytest.mark.parametrize("taxa, has_filter", [
+    (["12345"], True),
+    (["12345", "678"], True),
+    ([], False),
+    ([" "], False),
+])
+def test_filter_check_accepts_taxa_as_a_list(taxa, has_filter):
+    # The taxa field may hold a list of IDs instead of a comma-separated string.
+    values = {"projects": [], "taxa": taxa, "bounding_box": None}
+    if has_filter:
+        assert PullEventsConfig.require_some_filter(values) == values
+    else:
+        with pytest.raises(ValueError, match="Choose at least one project"):
+            PullEventsConfig.require_some_filter(values)
