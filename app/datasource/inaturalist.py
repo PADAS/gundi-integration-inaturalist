@@ -2,19 +2,26 @@
 
 import logging
 import re
+import threading
 from datetime import datetime, timedelta
 from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pyinaturalist import (
     Annotation,
+    ClientSession,
     Observation,
     get_controlled_terms,
     get_observations_v2,
     get_projects,
     get_projects_by_id,
+    get_taxa_autocomplete,
 )
+
+from app.services.errors import IntegrationConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,39 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
     return get_projects(
         lat=lat, lng=lng, radius=radius_km, order_by="distance", per_page=PROJECTS_PAGE_SIZE
     )
+
+
+# Typeahead lookups are interactive, so they fail fast instead of using
+# pyinaturalist's default 10s timeout with 5 retries. The session keeps the
+# default rate-limit file, so the daily request budget stays shared with pulls.
+TYPEAHEAD_TIMEOUT_SECONDS = 5
+# The typeahead shares pyinaturalist's per-host rate-limit bucket with pulls.
+# pyinaturalist's default lets a request sleep up to 60 s for a slot; a search
+# is interactive, so it fails fast with BucketFullException instead.
+TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS = 2
+_typeahead = threading.local()
+
+
+def _typeahead_session() -> ClientSession:
+    # Thread-local like pyinaturalist's own session: callers run in worker threads.
+    if not hasattr(_typeahead, "session"):
+        session = ClientSession(max_retries=0, timeout=TYPEAHEAD_TIMEOUT_SECONDS)
+        # pyinaturalist's retry config lists 5xx statuses, and with zero retries
+        # urllib3 turns those into a RetryError that drops the status. Without
+        # them, a 5xx reaches raise_for_status as an HTTPError that keeps it.
+        session.retries = Retry(total=0, raise_on_status=False)
+        session.mount("https://", HTTPAdapter(max_retries=session.retries))
+        session.max_delay = TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS
+        _typeahead.session = session
+    return _typeahead.session
+
+
+def search_taxa(q: str) -> Dict:
+    """iNaturalist taxa matching a typed query (public autocomplete endpoint)."""
+    try:
+        return get_taxa_autocomplete(q=q, session=_typeahead_session())
+    except (requests.Timeout, requests.ConnectionError) as e:
+        raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa search: {e}") from e
 
 
 class INatRequestError(requests.HTTPError):

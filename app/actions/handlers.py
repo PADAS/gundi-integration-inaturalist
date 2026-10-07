@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
@@ -17,6 +18,7 @@ from app.actions.configurations import (
     ListProjectsQuery,
     ListAnnotationTermsQuery,
     ListAnnotationValuesQuery,
+    ListTaxaQuery,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.activity_logger import activity_logger, ephemeral_run, log_action_activity
@@ -31,6 +33,7 @@ from app.datasource.inaturalist import (
     find_existing_projects,
     list_controlled_terms,
     search_projects_near,
+    search_taxa,
 )
 from app.services.state import IntegrationStateManager
 
@@ -174,7 +177,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
-        taxa=action_config.taxa,
+        taxa=action_config.taxa_str,
         projects=projects,
         quality_grade=action_config.quality_grade,
         annotations=action_config.annotations_dict,
@@ -532,3 +535,32 @@ async def action_list_annotation_values(integration: Integration, action_config:
         if value.get("id") is not None
     ]
     return ReferenceDataResponse(options=options, cache_ttl_seconds=3600).dict()
+
+
+async def action_list_taxa(integration: Integration, action_config: ListTaxaQuery):
+    """Reference action (typeahead): taxa matching the typed query.
+
+    The taxa vocabulary is far too large for a default page, so an empty query
+    returns no options with truncated=True — the portal's search widget only
+    fetches once the operator has typed, and old widgets get a clean empty list.
+    """
+    query = (action_config.q or "").strip()
+    if not query:
+        return ReferenceDataResponse(options=[], truncated=True).dict()
+    # search_taxa blocks (requests, plus a rate limiter that sleeps), so keep it
+    # off the event loop: the portal calls this on every keystroke.
+    response = await asyncio.to_thread(search_taxa, query)
+    results = response.get("results", [])
+    options = []
+    for taxon in results:
+        if taxon.get("id") is None:
+            continue
+        scientific = taxon.get("name") or str(taxon["id"])
+        common = taxon.get("preferred_common_name")
+        options.append(ReferenceOption(
+            value=str(taxon["id"]),
+            label=f"{common} ({scientific})" if common else scientific,
+            description=taxon.get("rank"),
+        ))
+    truncated = response.get("total_results", len(results)) > len(results)
+    return ReferenceDataResponse(options=options, truncated=truncated).dict()

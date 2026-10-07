@@ -290,3 +290,81 @@ async def test_reference_action_missing_required_param_is_422(
     assert result == "validation-error-response"
     import pydantic
     assert isinstance(handle_error.call_args.args[0], pydantic.ValidationError)
+
+
+TAXA_RESPONSE = {
+    "total_results": 40,
+    "results": [
+        {"id": 41955, "name": "Panthera pardus", "preferred_common_name": "Leopard", "rank": "species"},
+        {"id": 41963, "name": "Panthera", "rank": "genus"},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_list_taxa_labels_and_truncation(mocker, inaturalist_integration_v2):
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    search = mocker.patch.object(handlers, "search_taxa", return_value=TAXA_RESPONSE)
+
+    result = await handlers.action_list_taxa(
+        inaturalist_integration_v2, ListTaxaQuery(q="leopard")
+    )
+
+    search.assert_called_once_with("leopard")
+    assert [(o["value"], o["label"], o["description"]) for o in result["options"]] == [
+        ("41955", "Leopard (Panthera pardus)", "species"),
+        ("41963", "Panthera", "genus"),
+    ]
+    assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("q", [None, "", "   "])
+async def test_list_taxa_empty_query_returns_no_default_page(mocker, inaturalist_integration_v2, q):
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    search = mocker.patch.object(handlers, "search_taxa")
+
+    result = await handlers.action_list_taxa(inaturalist_integration_v2, ListTaxaQuery(q=q))
+
+    search.assert_not_called()
+    assert result["options"] == []
+    assert result["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_taxa_searches_off_the_event_loop(mocker, inaturalist_integration_v2):
+    """search_taxa is blocking (requests + a sleeping rate limiter); running it on
+    the loop would stall every other request on the instance per keystroke."""
+    import threading
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    loop_thread = threading.current_thread()
+    seen = []
+    mocker.patch.object(
+        handlers, "search_taxa",
+        side_effect=lambda q: seen.append(threading.current_thread()) or TAXA_RESPONSE,
+    )
+
+    await handlers.action_list_taxa(inaturalist_integration_v2, ListTaxaQuery(q="leopard"))
+
+    assert seen and seen[0] is not loop_thread
+
+
+def test_list_taxa_errors_are_reported_with_their_cause():
+    """The two ways a taxa search fails reach the portal as a clear verdict:
+    an iNat 5xx keeps its status, an unreachable iNat reads as connectivity."""
+    import requests
+    from app.services.errors import IntegrationConnectionError, classify_error
+
+    response = requests.Response()
+    response.status_code = 503
+    server_error = requests.HTTPError("503 Server Error: Service Unavailable", response=response)
+    unreachable = IntegrationConnectionError("iNaturalist did not respond to the taxa search: read timed out")
+
+    assert classify_error(server_error)[::3] == ("bad_response", 503)
+    assert classify_error(unreachable)[::3] == ("connectivity", None)

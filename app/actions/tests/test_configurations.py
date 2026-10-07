@@ -108,7 +108,7 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
     _collect_gundi_references(PullEventsConfig.ui_schema(), found)
 
     assert {ref["action"] for _, ref in found} == {
-        "list_projects", "list_annotation_terms", "list_annotation_values",
+        "list_projects", "list_annotation_terms", "list_annotation_values", "list_taxa",
     }
     for node, ref in found:
         assert ref["target"] == "self"
@@ -117,6 +117,14 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         query_fields = set(reference_actions[ref["action"]].__fields__)
         assert set(ref.get("params", {})) <= query_fields
         assert "ui:widget" not in node
+        if "search" in ref:
+            assert ref["search"]["param"] in query_fields
+            assert ref["search"]["param"] not in ref.get("params", {})
+            # The search param must be optional: widgets that predate search
+            # fetch without it and must get an empty list, not a 422.
+            assert not reference_actions[ref["action"]].__fields__[ref["search"]["param"]].required
+            min_chars = ref["search"]["min_chars"]
+            assert type(min_chars) is int and min_chars >= 1
 
 
 def test_gundi_reference_annotations_sit_on_the_right_nodes():
@@ -141,6 +149,54 @@ def test_ui_schema_override_preserves_existing_ui_options():
     assert ui["days_to_load"] == {"ui:widget": "range"}
 
 
+def test_taxa_accepts_legacy_comma_string():
+    config = PullEventsConfig(days_to_load=3, taxa="12345, 67890,  ,99")
+    assert config.taxa == ["12345", "67890", "99"]
+    assert config.taxa_str == "12345,67890,99"
+
+
+def test_taxa_accepts_list_and_coerces_ints():
+    config = PullEventsConfig(days_to_load=3, taxa=[12345, "67890"])
+    assert config.taxa == ["12345", "67890"]
+    assert config.taxa_str == "12345,67890"
+
+
+def test_taxa_drops_duplicates_and_splits_list_items():
+    config = PullEventsConfig(days_to_load=3, taxa=["1, 2", "1", 2, "3"])
+    assert config.taxa == ["1", "2", "3"]
+
+
+@pytest.mark.parametrize("raw", [["leopard"], "Panthera pardus", [True], [{"a": 1}], 1.5])
+def test_taxa_rejects_values_that_are_not_ids(raw):
+    """A typed name would be sent as taxon_id and fail every scheduled pull."""
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(days_to_load=3, taxa=raw)
+
+
+@pytest.mark.parametrize("raw", [None, "", "   ", []])
+def test_taxa_empty_inputs_mean_no_filter(raw):
+    # A project keeps the config valid under the "some filter" rule (#38);
+    # this test is about empty taxa meaning no taxa filter.
+    config = PullEventsConfig(days_to_load=3, projects=["123"], taxa=raw)
+    assert config.taxa is None
+    assert config.taxa_str is None
+
+
+def test_taxa_schema_is_string_array():
+    schema = PullEventsConfig.schema()
+    prop = schema["properties"]["taxa"]
+    assert prop["type"] == "array"
+    assert prop["items"]["type"] == "string"
+
+
+def test_taxa_gundi_reference_is_a_search_annotation():
+    ui = PullEventsConfig.ui_schema()
+    taxa_ref = ui["taxa"]["items"]["gundi:reference"]
+    assert taxa_ref["action"] == "list_taxa"
+    assert taxa_ref["params"] == {}
+    assert taxa_ref["search"] == {"param": "q", "min_chars": 2}
+
+
 def test_bounding_box_requests_the_bbox_widget():
     ui = PullEventsConfig.ui_schema()
     assert ui["bounding_box"] == {"ui:widget": "bbox"}
@@ -160,25 +216,42 @@ def test_schema_requires_taxa_and_bounding_box_only_without_projects():
     assert schema["else"] == {"required": ["days_to_load"]}
 
 
-@pytest.mark.parametrize("field,value,accepted", [
-    ("taxa", "12345", True),
-    ("taxa", " 1, 2 ", True),
-    ("taxa", "", False),
-    ("taxa", "   ", False),
-    ("taxa", ", ,", False),
-    ("bounding_box", "[1, 1, 0, 0]", True),
-    ("bounding_box", "", False),
-    ("bounding_box", "  ", False),
+@pytest.mark.parametrize("value,accepted", [
+    ("[1, 1, 0, 0]", True),
+    ("", False),
+    ("  ", False),
 ])
-def test_schema_requires_real_taxa_and_bounding_box_without_projects(field, value, accepted):
-    """`required` only checks the key is present; the branch's patterns stop blank
-    values, which would otherwise mean a pull with no filter at all."""
+def test_schema_requires_real_bounding_box_without_projects(value, accepted):
+    """`required` only checks the key is present; the branch's pattern stops a
+    blank box, which would otherwise mean a pull with no area filter."""
     import re
 
-    rule = PullEventsConfig.schema()["then"]["properties"][field]
+    rule = PullEventsConfig.schema()["then"]["properties"]["bounding_box"]
     assert rule["type"] == "string"
     # JSON-schema patterns are unanchored, like re.search.
     assert bool(re.search(rule["pattern"], value)) is accepted
+
+
+def test_schema_requires_nonempty_taxa_without_projects():
+    """Without a project, an empty taxa list must count as missing."""
+    rule = PullEventsConfig.schema()["then"]["properties"]["taxa"]
+    assert rule == {"type": "array", "minItems": 1}
+
+
+@pytest.mark.parametrize("value,accepted", [
+    ("12345", True),
+    ("", False),
+    (" 1", False),
+    ("leopard", False),
+    ("1,2", False),
+])
+def test_schema_taxa_items_must_be_numeric_ids(value, accepted):
+    """The typeahead allows free text; the portal must reject typed names,
+    which iNat would refuse on every scheduled pull."""
+    import re
+
+    pattern = PullEventsConfig.schema()["properties"]["taxa"]["items"]["pattern"]
+    assert bool(re.search(pattern, value)) is accepted
 
 
 def test_config_without_projects_or_taxa_still_parses():

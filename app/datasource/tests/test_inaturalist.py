@@ -428,6 +428,55 @@ def test_search_projects_near_passes_circle_params(mocker):
     )
 
 
+def test_search_taxa_passes_query(mocker):
+    from app.datasource import inaturalist
+
+    get_taxa_autocomplete = mocker.patch.object(
+        inaturalist, "get_taxa_autocomplete", return_value={"total_results": 0, "results": []}
+    )
+    inaturalist.search_taxa("leo")
+    get_taxa_autocomplete.assert_called_once_with(q="leo", session=mocker.ANY)
+
+
+def test_search_taxa_fails_fast():
+    """Typeahead is interactive: no retries and a short timeout, rather than
+    pyinaturalist's default 10s timeout x 5 retries."""
+    from app.datasource import inaturalist
+
+    session = inaturalist._typeahead_session()
+    assert session.timeout == inaturalist.TYPEAHEAD_TIMEOUT_SECONDS
+    assert session.retries.total == 0
+    # Fail fast on the shared rate limit instead of sleeping up to 60 s for a slot.
+    assert session.max_delay == inaturalist.TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS == 2
+    assert inaturalist._typeahead_session() is session
+
+
+def test_search_taxa_keeps_the_status_of_a_server_error():
+    """A 5xx must reach raise_for_status as an HTTPError with its status, not as
+    a RetryError, so the runner reports it as "HTTP 503" from iNaturalist."""
+    from app.datasource import inaturalist
+
+    session = inaturalist._typeahead_session()
+    assert session.retries.total == 0
+    assert not session.retries.status_forcelist
+    assert session.retries.raise_on_status is False
+    assert session.get_adapter("https://api.inaturalist.org").max_retries is session.retries
+
+
+@pytest.mark.parametrize("error", [
+    requests.ReadTimeout("read timed out"),
+    requests.ConnectionError("connection refused"),
+])
+def test_search_taxa_reports_an_unreachable_inaturalist(mocker, error):
+    from app.datasource import inaturalist
+    from app.services.errors import IntegrationConnectionError
+
+    mocker.patch.object(inaturalist, "get_taxa_autocomplete", side_effect=error)
+
+    with pytest.raises(IntegrationConnectionError, match="iNaturalist did not respond to the taxa search"):
+        inaturalist.search_taxa("leo")
+
+
 # --- find_existing_projects ---
 
 
