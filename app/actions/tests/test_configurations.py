@@ -175,7 +175,10 @@ def test_taxa_rejects_values_that_are_not_ids(raw):
 
 @pytest.mark.parametrize("raw", [None, "", "   ", []])
 def test_taxa_empty_inputs_mean_no_filter(raw):
-    config = PullEventsConfig(days_to_load=3, taxa=raw)
+    # A project keeps the config valid under the "some filter" rule (#38);
+    # this test is about empty taxa meaning no taxa filter.
+    config = PullEventsConfig(days_to_load=3, projects=["123"], taxa=raw)
+    assert config.taxa is None
     assert config.taxa_str is None
 
 
