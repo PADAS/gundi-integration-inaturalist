@@ -8,6 +8,15 @@ from .retry_policies import REDIS_RETRY
 
 logger = logging.getLogger(__name__)
 
+# Delete a key only while it still holds the caller's value. One server-side
+# step: a client-side GET followed by DEL could delete a value written in between.
+_DELETE_IF_VALUE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
 
 def _skip_on_ephemeral_run(op: str, integration_id: str, action_id: str) -> bool:
     """Ephemeral runs get a fresh synthetic integration id and no TTL on state
@@ -49,7 +58,8 @@ class IntegrationStateManager:
                 )
 
     async def set_if_absent(
-        self, integration_id: str, action_id: str, *, ttl_seconds: int, source_id: str = "no-source"
+        self, integration_id: str, action_id: str, *, ttl_seconds: int, source_id: str = "no-source",
+        value: str = "1",
     ) -> bool:
         """Atomically set a key only if it does not already exist, with a TTL.
 
@@ -58,7 +68,9 @@ class IntegrationStateManager:
         for rate-limiting/throttling repeated events: the first caller in each
         window gets True, the rest get False until the key expires. On the
         ephemeral path nothing is written and the answer is False, so a
-        throttling caller treats the window as already taken.
+        throttling caller treats the window as already taken. Pass a unique
+        `value` to use the key as a lock, and release it with
+        `delete_state_if_value`.
         """
         if _skip_on_ephemeral_run("set_if_absent", integration_id, action_id):
             return False
@@ -66,7 +78,7 @@ class IntegrationStateManager:
             with attempt:
                 was_set = await self.db_client.set(
                     f"integration_state.{integration_id}.{action_id}.{source_id}",
-                    "1",
+                    value,
                     ex=ttl_seconds,
                     nx=True,
                 )
@@ -80,6 +92,21 @@ class IntegrationStateManager:
                 await self.db_client.delete(
                     f"integration_state.{integration_id}.{action_id}.{source_id}"
                 )
+
+    async def delete_state_if_value(
+        self, integration_id: str, action_id: str, value: str, source_id: str = "no-source"
+    ) -> bool:
+        """Delete the key only if it still holds `value`. Returns True if it was
+        deleted. A lock holder whose lock expired and was taken by another
+        caller leaves the new holder's lock in place."""
+        if _skip_on_ephemeral_run("delete_state_if_value", integration_id, action_id):
+            return False
+        async for attempt in stamina.retry_context(**REDIS_RETRY):
+            with attempt:
+                deleted = await self.db_client.eval(
+                    _DELETE_IF_VALUE_SCRIPT, 1, f"integration_state.{integration_id}.{action_id}.{source_id}", value
+                )
+        return bool(deleted)
 
     def __str__(self):
         return f"IntegrationStateManager(host={self.db_client.host}, port={self.db_client.port}, db={self.db_client.db})"
