@@ -98,6 +98,10 @@ def search_projects_near(lat: float, lng: float, radius_km: float) -> Dict:
 # pyinaturalist's default 10s timeout with 5 retries. The session keeps the
 # default rate-limit file, so the daily request budget stays shared with pulls.
 TYPEAHEAD_TIMEOUT_SECONDS = 5
+# The typeahead shares pyinaturalist's per-host rate-limit bucket with pulls.
+# pyinaturalist's default lets a request sleep up to 60 s for a slot; a search
+# is interactive, so it fails fast with BucketFullException instead.
+TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS = 2
 _typeahead = threading.local()
 
 
@@ -110,6 +114,7 @@ def _typeahead_session() -> ClientSession:
         # them, a 5xx reaches raise_for_status as an HTTPError that keeps it.
         session.retries = Retry(total=0, raise_on_status=False)
         session.mount("https://", HTTPAdapter(max_retries=session.retries))
+        session.max_delay = TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS
         _typeahead.session = session
     return _typeahead.session
 

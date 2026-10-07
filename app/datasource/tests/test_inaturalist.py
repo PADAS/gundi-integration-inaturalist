@@ -445,6 +445,8 @@ def test_search_taxa_fails_fast():
     session = inaturalist._typeahead_session()
     assert session.timeout == inaturalist.TYPEAHEAD_TIMEOUT_SECONDS
     assert session.retries.total == 0
+    # Fail fast on the shared rate limit instead of sleeping up to 60 s for a slot.
+    assert session.max_delay == inaturalist.TYPEAHEAD_MAX_RATE_LIMIT_WAIT_SECONDS == 2
     assert inaturalist._typeahead_session() is session
 
 
