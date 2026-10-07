@@ -80,13 +80,18 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     if not acquired:
         msg = f"Skipping iNaturalist pull for integration ID: {integration_id}: another run is in progress."
         logger.info(msg)
-        await log_action_activity(
-            integration_id=integration.id,
-            action_id="pull_events",
-            level=LogLevel.INFO,
-            title=msg,
-            data={"message": msg}
-        )
+        try:
+            await log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.INFO,
+                title=msg,
+                data={"message": msg}
+            )
+        except Exception as log_error:
+            # Best-effort, like the runner's own skip: a publisher failure must not
+            # turn the skip into an error that PubSub redelivers.
+            logger.warning(f"Could not publish the skip notice for integration ID: {integration_id}: {log_error}")
         return {'result': {'events_extracted': 0,
                            'events_updated': 0,
                            'photos_attached': 0}}

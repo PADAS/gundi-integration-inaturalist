@@ -323,6 +323,21 @@ async def test_action_pull_events_skips_when_another_run_holds_the_lock(mocker):
 
 
 @pytest.mark.asyncio
+async def test_action_pull_events_skip_survives_an_activity_log_failure(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = False
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mock_get_observations = mocker.patch("app.actions.handlers.get_observations")
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock(side_effect=RuntimeError("publisher down")))
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    mock_get_observations.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_action_pull_events_releases_the_lock_after_a_run(mocker):
     mock_state = AsyncMock()
     mock_state.set_if_absent.return_value = True
