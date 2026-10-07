@@ -353,3 +353,18 @@ async def test_list_taxa_searches_off_the_event_loop(mocker, inaturalist_integra
     await handlers.action_list_taxa(inaturalist_integration_v2, ListTaxaQuery(q="leopard"))
 
     assert seen and seen[0] is not loop_thread
+
+
+def test_list_taxa_errors_are_reported_with_their_cause():
+    """The two ways a taxa search fails reach the portal as a clear verdict:
+    an iNat 5xx keeps its status, an unreachable iNat reads as connectivity."""
+    import requests
+    from app.services.errors import IntegrationConnectionError, classify_error
+
+    response = requests.Response()
+    response.status_code = 503
+    server_error = requests.HTTPError("503 Server Error: Service Unavailable", response=response)
+    unreachable = IntegrationConnectionError("iNaturalist did not respond to the taxa search: read timed out")
+
+    assert classify_error(server_error)[::3] == ("bad_response", 503)
+    assert classify_error(unreachable)[::3] == ("connectivity", None)

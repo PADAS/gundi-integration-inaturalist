@@ -7,6 +7,8 @@ from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pyinaturalist import (
     Annotation,
     ClientSession,
@@ -16,6 +18,8 @@ from pyinaturalist import (
     get_projects,
     get_taxa_autocomplete,
 )
+
+from app.services.errors import IntegrationConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -100,13 +104,22 @@ _typeahead = threading.local()
 def _typeahead_session() -> ClientSession:
     # Thread-local like pyinaturalist's own session: callers run in worker threads.
     if not hasattr(_typeahead, "session"):
-        _typeahead.session = ClientSession(max_retries=0, timeout=TYPEAHEAD_TIMEOUT_SECONDS)
+        session = ClientSession(max_retries=0, timeout=TYPEAHEAD_TIMEOUT_SECONDS)
+        # pyinaturalist's retry config lists 5xx statuses, and with zero retries
+        # urllib3 turns those into a RetryError that drops the status. Without
+        # them, a 5xx reaches raise_for_status as an HTTPError that keeps it.
+        session.retries = Retry(total=0, raise_on_status=False)
+        session.mount("https://", HTTPAdapter(max_retries=session.retries))
+        _typeahead.session = session
     return _typeahead.session
 
 
 def search_taxa(q: str) -> Dict:
     """iNaturalist taxa matching a typed query (public autocomplete endpoint)."""
-    return get_taxa_autocomplete(q=q, session=_typeahead_session())
+    try:
+        return get_taxa_autocomplete(q=q, session=_typeahead_session())
+    except (requests.Timeout, requests.ConnectionError) as e:
+        raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa search: {e}") from e
 
 
 class INatRequestError(requests.HTTPError):
