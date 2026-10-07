@@ -228,7 +228,11 @@ event_schemas = {
 
 async def process_config_event(event_data: dict, attributes: dict = None):
     try:
-        logger.info(f"Received Configuration Event. data: {event_data}, attributes: {attributes}.")
+        # Only identifiers: the payload can carry action config data such as API keys.
+        logger.info(
+            f"Received Configuration Event '{(attributes or {}).get('event_type')}' "
+            f"(event_id: {event_data.get('event_id')})."
+        )
         event = SystemEventBaseModel.parse_obj(event_data)
         schema_version = event.schema_version
         if schema_version != "v1":
