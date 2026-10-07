@@ -12,6 +12,7 @@ from app.datasource.inaturalist import (
     get_observations,
     _call_inat,
     _match_annotations_to_config,
+    find_existing_projects,
 )
 
 
@@ -474,3 +475,43 @@ def test_search_taxa_reports_an_unreachable_inaturalist(mocker, error):
 
     with pytest.raises(IntegrationConnectionError, match="iNaturalist did not respond to the taxa search"):
         inaturalist.search_taxa("leo")
+
+
+# --- find_existing_projects ---
+
+
+def test_find_existing_projects_matches_ids_and_slugs_and_keeps_order(mocker):
+    get_by_id = mocker.patch(
+        "app.datasource.inaturalist.get_projects_by_id",
+        return_value={"results": [
+            {"id": 123, "slug": "real-project"},
+            {"id": 456, "slug": "other-project"},
+        ]},
+    )
+
+    existing = find_existing_projects(["Real-Project", "gone-project", "456"])
+
+    assert existing == ["Real-Project", "456"]
+    get_by_id.assert_called_once_with(["Real-Project", "gone-project", "456"])
+
+
+def test_find_existing_projects_batches_and_never_sends_malformed_values(mocker):
+    get_by_id = mocker.patch(
+        "app.datasource.inaturalist.get_projects_by_id",
+        side_effect=lambda values: {"results": [{"id": int(v)} for v in values]},
+    )
+    values = [str(i) for i in range(1, 24)] + ["has space", "a/b"]
+
+    existing = find_existing_projects(values)
+
+    batches = [call.args[0] for call in get_by_id.call_args_list]
+    assert [len(b) for b in batches] == [10, 10, 3]
+    assert "has space" not in sum(batches, []) and "a/b" not in sum(batches, [])
+    assert existing == [str(i) for i in range(1, 24)]
+
+
+def test_find_existing_projects_with_nothing_to_look_up(mocker):
+    get_by_id = mocker.patch("app.datasource.inaturalist.get_projects_by_id")
+
+    assert find_existing_projects(["has space"]) == []
+    get_by_id.assert_not_called()

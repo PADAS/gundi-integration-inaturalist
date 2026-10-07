@@ -116,6 +116,42 @@ async def test_set_if_absent(mocker, mock_redis, integration_v2):
 
 
 @pytest.mark.asyncio
+async def test_set_if_absent_writes_the_given_value(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+    mock_redis.Redis.return_value.set.return_value = async_return("OK")
+
+    await state_manager.set_if_absent(
+        integration_id=integration_id, action_id="pull_events", source_id="run_lock",
+        ttl_seconds=600, value="token-a",
+    )
+
+    mock_redis.Redis.return_value.set.assert_called_once_with(
+        f"integration_state.{integration_id}.pull_events.run_lock", "token-a", ex=600, nx=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_state_if_value(mocker, mock_redis, integration_v2):
+    from app.services.state import _DELETE_IF_VALUE_SCRIPT
+    mocker.patch("app.services.state.redis", mock_redis)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+    key = f"integration_state.{integration_id}.pull_events.run_lock"
+
+    # The script returns DEL's count when the key still holds the value, else 0.
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    deleted = await state_manager.delete_state_if_value(integration_id, "pull_events", "token-a", source_id="run_lock")
+    assert deleted is True
+    mock_redis.Redis.return_value.eval.assert_called_once_with(_DELETE_IF_VALUE_SCRIPT, 1, key, "token-a")
+
+    mock_redis.Redis.return_value.eval.return_value = async_return(0)
+    deleted = await state_manager.delete_state_if_value(integration_id, "pull_events", "token-a", source_id="run_lock")
+    assert deleted is False
+
+
+@pytest.mark.asyncio
 async def test_set_source_state(mocker, mock_redis, integration_v2, mock_integration_state):
     mocker.patch("app.services.state.redis", mock_redis)
     state_manager = IntegrationStateManager()
@@ -292,3 +328,19 @@ async def test_state_redis_retry_backoff_does_not_block_the_event_loop(mocker, m
 
     assert state == {}
     assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_state_if_value_noops_on_ephemeral_run(mocker, mock_redis):
+    from app.services.activity_logger import ephemeral_run
+    mocker.patch("app.services.state.redis", mock_redis)
+    state_manager = IntegrationStateManager()
+
+    token = ephemeral_run.set(True)
+    try:
+        deleted = await state_manager.delete_state_if_value("synthetic-uuid", "pull_events", "token-a")
+    finally:
+        ephemeral_run.reset(token)
+
+    assert deleted is False
+    mock_redis.Redis.return_value.eval.assert_not_called()

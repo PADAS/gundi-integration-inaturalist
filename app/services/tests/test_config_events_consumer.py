@@ -1,3 +1,6 @@
+import base64
+import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -716,3 +719,26 @@ async def test_action_config_created_that_loses_its_write_stops_when_the_winner_
     assert mock_config_manager.replace_cached_entry.await_count == 1
     assert mock_config_manager._fetch_integration_from_gundi.await_count == 1, "no second fetch over a fresh tombstone"
     assert not mock_config_manager.install_action_configuration_if_missing.called
+
+
+@pytest.mark.asyncio
+async def test_config_event_secrets_are_not_logged(
+        mocker, caplog, mock_gundi_client_v2, mock_publish_event, mock_action_handlers, mock_config_manager,
+        pubsub_message_request_headers, action_config_created_event_as_pubsub_message
+):
+    mocker.patch("app.services.config_events_consumer.config_manager", mock_config_manager)
+    message = action_config_created_event_as_pubsub_message
+    event = json.loads(base64.b64decode(message["message"]["data"]))
+    event["payload"]["data"]["api_key"] = "super-secret-inat-key"
+    message["message"]["data"] = base64.b64encode(json.dumps(event).encode()).decode()
+
+    with caplog.at_level(logging.DEBUG):
+        response = api_client.post(
+            "/config-events/",
+            headers=pubsub_message_request_headers,
+            json=message,
+        )
+
+    assert response.status_code == 200
+    assert "Received Configuration Event 'ActionConfigCreated'" in caplog.text
+    assert "super-secret-inat-key" not in caplog.text

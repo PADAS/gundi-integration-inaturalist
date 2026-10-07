@@ -2,11 +2,17 @@ import asyncio
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import Dict, List
+from uuid import uuid4
 
 import httpx
+import requests
+from pyrate_limiter import BucketFullException
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import Observation
 
+from gundi_client_v2.errors import GundiAPIError
+
+from app import settings
 from app.actions.configurations import (
     PullEventsConfig,
     ListProjectsQuery,
@@ -15,7 +21,7 @@ from app.actions.configurations import (
     ListTaxaQuery,
 )
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
-from app.services.activity_logger import activity_logger, log_action_activity
+from app.services.activity_logger import activity_logger, ephemeral_run, log_action_activity
 from app.services.gundi import (
     send_event_attachments_to_gundi,
     send_events_to_gundi,
@@ -24,6 +30,7 @@ from app.services.gundi import (
 from app.datasource.inaturalist import (
     get_observations,
     bbox_to_search_circle,
+    find_existing_projects,
     list_controlled_terms,
     search_projects_near,
     search_taxa,
@@ -37,6 +44,10 @@ STATE_LAST_RUN_KEY = "last_run"
 STATE_DATETIME_FMT = "%Y-%m-%d %H:%M:%S%z"
 # Per-observation state: when we last synced this observation to Gundi (so we only patch when it changes)
 STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
+# Per-integration run lock: held while a pull runs, expires if a run dies without releasing it.
+# Each run writes its own token, so a run that outlives its lock can't release the next run's.
+STATE_RUN_LOCK_SOURCE_ID = "run_lock"
+RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -54,25 +65,41 @@ def _build_pull_events_state(last_updated: datetime) -> dict:
     """Build the state dict to persist after a pull_events run."""
     return {STATE_LAST_RUN_KEY: last_updated.strftime(STATE_DATETIME_FMT)}
 
-async def handle_transformed_data(transformed_data, integration_id, action_id):
+async def _drop_unknown_projects(integration: Integration, projects: List[str]) -> List[str]:
+    """The saved projects that exist on iNaturalist, warning about the rest.
+
+    iNat rejects an observations query whose projects are all unknown (422), so
+    unknown projects are left out of the query. If the lookup itself fails, the
+    projects are used as saved.
+    """
     try:
-        response = await send_events_to_gundi(
-            events=transformed_data,
-            integration_id=integration_id
-        )
-    except httpx.HTTPError as e:
-        msg = f'Sensors API returned error for integration_id: {integration_id}. Exception: {e}'
-        logger.exception(
-            msg,
-            extra={
-                'needs_attention': True,
-                'integration_id': integration_id,
-                'action_id': action_id
-            }
-        )
-        return [msg]
-    else:
-        return response
+        existing = find_existing_projects(projects)
+    except (requests.RequestException, BucketFullException) as e:
+        # BucketFullException is pyinaturalist's rate-limit error, not a RequestException.
+        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e}")
+        return projects
+    unknown = [p for p in projects if p not in existing]
+    if unknown:
+        if existing:
+            msg = (f"These saved projects don't exist on iNaturalist and were left out of the pull: "
+                   f"{', '.join(unknown)}.")
+        else:
+            msg = (f"None of the saved projects exist on iNaturalist ({', '.join(unknown)}), "
+                   f"so the pull was skipped. Update the projects in the configuration.")
+        logger.warning(f"{msg} Integration ID: {integration.id}.")
+        try:
+            await log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.WARNING,
+                title=msg,
+                data={"unknown_projects": unknown},
+            )
+        except Exception as log_error:
+            # Best-effort: the warning is already in the logs.
+            logger.warning(f"Could not publish the unknown-projects warning for integration ID: {integration.id}: {log_error}")
+    return existing
+
 
 def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
@@ -81,18 +108,77 @@ def chunk_list(list_a, chunk_size):
 @action_title("Pull iNaturalist Observations")
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
+    # A redelivered run (transient failures are nacked) can overlap the next scheduled
+    # run for the same integration, so only one pull runs per integration at a time.
+    # Ephemeral runs persist no state, so they skip the lock.
+    integration_id = str(integration.id)
+    if ephemeral_run.get():
+        return await _pull_events(integration, action_config)
+    lock_token = uuid4().hex
+    acquired = await state_manager.set_if_absent(
+        integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
+        value=lock_token,
+    )
+    if not acquired:
+        msg = f"Skipping iNaturalist pull for integration ID: {integration_id}: another run is in progress."
+        logger.info(msg)
+        try:
+            await log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.INFO,
+                title=msg,
+                data={"message": msg}
+            )
+        except Exception as log_error:
+            # Best-effort, like the runner's own skip: a publisher failure must not
+            # turn the skip into an error that PubSub redelivers.
+            logger.warning(f"Could not publish the skip notice for integration ID: {integration_id}: {log_error}")
+        return {'result': {'events_extracted': 0,
+                           'events_updated': 0,
+                           'photos_attached': 0}}
+    try:
+        return await _pull_events(integration, action_config)
+    finally:
+        try:
+            released = await state_manager.delete_state_if_value(
+                integration_id, "pull_events", lock_token, source_id=STATE_RUN_LOCK_SOURCE_ID
+            )
+            if not released:
+                logger.info(
+                    f"Pull lock for integration ID: {integration_id} had already expired or been "
+                    f"taken by another run; left it in place."
+                )
+        except Exception:
+            # The lock expires on its own; don't mask the run's own outcome.
+            logger.exception(f"Error releasing the pull lock for integration ID: {integration_id}.")
 
-    logger.info(f"Executing 'pull_events' action with integration {integration} and action_config {action_config}...")
+
+async def _pull_events(integration: Integration, action_config: PullEventsConfig):
+
+    # Log the id only: the Integration carries every action config, including
+    # the auth row's api_key.
+    logger.info(f"Executing 'pull_events' action with integration {integration.id} and action_config {action_config}...")
 
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
+
+    projects = action_config.projects
+    if projects:
+        projects = await _drop_unknown_projects(integration, projects)
+        if not projects:
+            # Pulling without the projects would widen the query to the whole
+            # bounding box (or the world), so skip until the config is fixed.
+            return {'result': {'events_extracted': 0,
+                               'events_updated': 0,
+                               'photos_attached': 0}}
 
     # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
     observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
         taxa=action_config.taxa_str,
-        projects=action_config.projects,
+        projects=projects,
         quality_grade=action_config.quality_grade,
         annotations=action_config.annotations_dict,
     )
@@ -242,7 +328,8 @@ async def process_attachments(events, response, all_event_photos, integration):
         except Exception as e:
             request = {
                 "event_id": gundi_id,
-                "attachments": attachments,
+                # Filenames only: the tuples also hold the raw photo bytes.
+                "attachments": [filename for filename, _ in attachments],
                 "integration_id": str(integration.id)
             }
             message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"
@@ -251,7 +338,9 @@ async def process_attachments(events, response, all_event_photos, integration):
                 "attention_needed": True
             })
             log_data = {"message": message}
-            if server_response := getattr(e, "response", None):
+            if isinstance(e, GundiAPIError):
+                log_data["server_response_body"] = e.detail
+            elif server_response := getattr(e, "response", None):
                 log_data["server_response_body"] = server_response.text
             await log_action_activity(
                 integration_id=integration.id,

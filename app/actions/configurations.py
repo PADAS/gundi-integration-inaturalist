@@ -237,6 +237,22 @@ class PullEventsConfig(PullActionConfiguration):
     def validate_bounding_box(cls, v):
         return parse_bounding_box(v)
 
+    @pydantic.root_validator(skip_on_failure=True)
+    def require_some_filter(cls, values):
+        # Backend half of the portal's filter rule, for configs saved outside the
+        # portal form. Only a config with no project, no taxa and no bounding box
+        # is rejected: it would pull every observation worldwide. Legacy configs
+        # with taxa only or a bounding box only keep loading.
+        # taxa may arrive as a comma-separated string or as a list of IDs.
+        taxa = values.get("taxa")
+        taxa_items = taxa.split(",") if isinstance(taxa, str) else (taxa or [])
+        has_taxa = any(str(t).strip() for t in taxa_items)
+        if not values.get("projects") and not has_taxa and not values.get("bounding_box"):
+            raise ValueError(
+                "Choose at least one project, or enter taxa IDs together with a bounding box."
+            )
+        return values
+
     @property
     def taxa_str(self) -> Optional[str]:
         """The comma-joined string shape the datasource consumes."""
