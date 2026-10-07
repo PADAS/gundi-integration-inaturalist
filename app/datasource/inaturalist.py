@@ -1,6 +1,7 @@
 """iNaturalist API client for fetching observations."""
 
 import logging
+import re
 from datetime import datetime, timedelta
 from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +13,7 @@ from pyinaturalist import (
     get_controlled_terms,
     get_observations_v2,
     get_projects,
+    get_projects_by_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,12 @@ OBSERVATION_FIELDS = [
 # combobox allows free text for anything beyond it (truncated=True signals the cap).
 PROJECTS_PAGE_SIZE = 200
 MAX_PROJECT_SEARCH_RADIUS_KM = 500.0
+
+# The by-ID project endpoint takes at most this many IDs or slugs per request.
+PROJECTS_BY_ID_BATCH_SIZE = 10
+# A value that could be a project ID or slug. The endpoint rejects the whole
+# request over one value that is neither (a space gives 422, a "/" 404).
+PROJECT_ID_OR_SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _match_annotations_to_config(annotations: List[Annotation], config: Dict) -> bool:
@@ -114,6 +122,22 @@ def _error_detail(response) -> Optional[str]:
     if text.startswith("<"):  # HTML error page from iNat or a proxy; nothing quotable
         return None
     return text[:500] or None
+
+
+def find_existing_projects(values: List[str]) -> List[str]:
+    """The saved project values (numeric IDs or slugs) that exist on iNaturalist,
+    in their original order and spelling. Values that can't be an ID or slug
+    are treated as unknown without being sent."""
+    lookups = [v for v in values if PROJECT_ID_OR_SLUG.match(v)]
+    found = set()
+    for start in range(0, len(lookups), PROJECTS_BY_ID_BATCH_SIZE):
+        response = get_projects_by_id(lookups[start:start + PROJECTS_BY_ID_BATCH_SIZE])
+        for project in response.get("results", []):
+            if project.get("id") is not None:
+                found.add(str(project["id"]))
+            if project.get("slug"):
+                found.add(project["slug"].lower())
+    return [v for v in values if v in found or v.lower() in found]
 
 
 def _call_inat(**params) -> Dict:

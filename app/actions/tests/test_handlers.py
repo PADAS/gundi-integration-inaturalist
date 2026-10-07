@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from gundi_core.schemas.v2 import LogLevel
 
 from app.conftest import async_return
 from app.actions.handlers import (
@@ -321,3 +322,80 @@ async def test_handle_transformed_data_http_error_returns_message(mocker):
     assert len(result) == 1
     assert "int-456" in result[0]
     assert "Server error" in result[0]
+
+
+# --- action_pull_events: saved projects that don't exist on iNaturalist ---
+
+
+def _unknown_projects_test_setup(mocker, existing):
+    from uuid import UUID
+
+    mock_state = AsyncMock()
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    get_observations = mocker.patch("app.actions.handlers.get_observations", return_value={})
+    find = mocker.patch("app.actions.handlers.find_existing_projects", side_effect=existing)
+    activity = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    integration = MagicMock()
+    integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
+    return integration, get_observations, find, activity
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_leaves_unknown_projects_out_of_the_query(mocker):
+    integration, get_observations, _, activity = _unknown_projects_test_setup(
+        mocker, existing=lambda values: ["real-project"]
+    )
+    config = PullEventsConfig(days_to_load=3, projects=["gone-project", "real-project"])
+
+    await action_pull_events(integration, config)
+
+    assert get_observations.call_args.kwargs["projects"] == ["real-project"]
+    warning = activity.call_args_list[0].kwargs
+    assert warning["level"] == LogLevel.WARNING
+    assert "gone-project" in warning["title"]
+    assert warning["data"] == {"unknown_projects": ["gone-project"]}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_skips_when_no_saved_project_exists(mocker):
+    integration, get_observations, _, activity = _unknown_projects_test_setup(
+        mocker, existing=lambda values: []
+    )
+    config = PullEventsConfig(days_to_load=3, projects=["gone-project"], bounding_box="[1, 1, 0, 0]")
+
+    result = await action_pull_events(integration, config)
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    get_observations.assert_not_called()
+    warning = activity.call_args.kwargs
+    assert warning["level"] == LogLevel.WARNING
+    assert "pull was skipped" in warning["title"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_uses_saved_projects_when_the_lookup_fails(mocker):
+    import requests
+
+    integration, get_observations, _, activity = _unknown_projects_test_setup(
+        mocker, existing=requests.ConnectionError("iNat down")
+    )
+    config = PullEventsConfig(days_to_load=3, projects=["some-project"])
+
+    await action_pull_events(integration, config)
+
+    assert get_observations.call_args.kwargs["projects"] == ["some-project"]
+    assert not any("unknown_projects" in (c.kwargs.get("data") or {}) for c in activity.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_does_not_look_up_projects_when_none_are_saved(mocker):
+    integration, get_observations, find, _ = _unknown_projects_test_setup(
+        mocker, existing=lambda values: values
+    )
+
+    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+
+    find.assert_not_called()
+    get_observations.assert_called_once()

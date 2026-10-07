@@ -3,6 +3,7 @@ import logging
 from typing import Dict, List
 
 import httpx
+import requests
 from gundi_core.schemas.v2 import Integration, LogLevel
 from pyinaturalist import Observation
 
@@ -22,6 +23,7 @@ from app.services.gundi import (
 from app.datasource.inaturalist import (
     get_observations,
     bbox_to_search_circle,
+    find_existing_projects,
     list_controlled_terms,
     search_projects_near,
 )
@@ -71,6 +73,41 @@ async def handle_transformed_data(transformed_data, integration_id, action_id):
     else:
         return response
 
+async def _drop_unknown_projects(integration: Integration, projects: List[str]) -> List[str]:
+    """The saved projects that exist on iNaturalist, warning about the rest.
+
+    iNat rejects an observations query whose projects are all unknown (422), so
+    unknown projects are left out of the query. If the lookup itself fails, the
+    projects are used as saved.
+    """
+    try:
+        existing = find_existing_projects(projects)
+    except requests.RequestException as e:
+        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e}")
+        return projects
+    unknown = [p for p in projects if p not in existing]
+    if unknown:
+        if existing:
+            msg = (f"These saved projects don't exist on iNaturalist and were left out of the pull: "
+                   f"{', '.join(unknown)}.")
+        else:
+            msg = (f"None of the saved projects exist on iNaturalist ({', '.join(unknown)}), "
+                   f"so the pull was skipped. Update the projects in the configuration.")
+        logger.warning(f"{msg} Integration ID: {integration.id}.")
+        try:
+            await log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.WARNING,
+                title=msg,
+                data={"unknown_projects": unknown},
+            )
+        except Exception as log_error:
+            # Best-effort: the warning is already in the logs.
+            logger.warning(f"Could not publish the unknown-projects warning for integration ID: {integration.id}: {log_error}")
+    return existing
+
+
 def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
     yield list_a[i:i + chunk_size]
@@ -84,12 +121,22 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
 
+    projects = action_config.projects
+    if projects:
+        projects = await _drop_unknown_projects(integration, projects)
+        if not projects:
+            # Pulling without the projects would widen the query to the whole
+            # bounding box (or the world), so skip until the config is fixed.
+            return {'result': {'events_extracted': 0,
+                               'events_updated': 0,
+                               'photos_attached': 0}}
+
     # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
     observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
         taxa=action_config.taxa,
-        projects=action_config.projects,
+        projects=projects,
         quality_grade=action_config.quality_grade,
         annotations=action_config.annotations_dict,
     )
