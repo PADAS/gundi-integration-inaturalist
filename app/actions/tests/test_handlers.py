@@ -158,6 +158,7 @@ def test_transform_inat_to_gundi_event_minimal():
     ob = _make_observation()
     config = PullEventsConfig(
         days_to_load=3,
+        taxa="1",
         event_type="inat_observation",
         event_prefix="iNat: ",
     )
@@ -183,7 +184,7 @@ def test_transform_inat_to_gundi_event_with_user_location_taxon():
             "ancestor_ids": [1, 2, 3],
         },
     )
-    config = PullEventsConfig(days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
     event = _transform_inat_to_gundi_event(ob, config)
     assert event["event_details"]["user_id"] == 99
     assert event["event_details"]["user_name"] == "Jane"
@@ -200,7 +201,7 @@ def test_transform_inat_to_gundi_event_title_fallback_to_species_guess():
         species_guess="Unknown Bird",
         taxon={"id": 1, "rank": "species", "name": "Spp", "preferred_common_name": None},
     )
-    config = PullEventsConfig(days_to_load=3, event_prefix="")
+    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="")
     event = _transform_inat_to_gundi_event(ob, config)
     assert event["title"] == "Unknown Bird"
 
@@ -221,7 +222,7 @@ async def test_action_pull_events_no_observations_updates_state(mocker):
 
     integration = MagicMock()
     integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
-    config = PullEventsConfig(days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
 
     result = await action_pull_events(integration, config)
 
@@ -284,7 +285,7 @@ async def test_action_pull_events_skips_patch_when_observation_already_in_sync(m
 
     integration = MagicMock()
     integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
-    config = PullEventsConfig(days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
 
     result = await action_pull_events(integration, config)
 

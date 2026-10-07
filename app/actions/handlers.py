@@ -114,7 +114,9 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
 
 async def _pull_events(integration: Integration, action_config: PullEventsConfig):
 
-    logger.info(f"Executing 'pull_events' action with integration {integration} and action_config {action_config}...")
+    # Log the id only: the Integration carries every action config, including
+    # the auth row's api_key.
+    logger.info(f"Executing 'pull_events' action with integration {integration.id} and action_config {action_config}...")
 
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
@@ -274,7 +276,8 @@ async def process_attachments(events, response, all_event_photos, integration):
         except Exception as e:
             request = {
                 "event_id": gundi_id,
-                "attachments": attachments,
+                # Filenames only: the tuples also hold the raw photo bytes.
+                "attachments": [filename for filename, _ in attachments],
                 "integration_id": str(integration.id)
             }
             message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"

@@ -112,56 +112,56 @@ def test_taxa_validator_passes_string_through():
 
 
 def test_taxa_validator_handles_empty_list():
-    config = PullEventsConfig(taxa=[], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa=[], bounding_box="[1, 1, 0, 0]", days_to_load=3, event_prefix="iNat: ")
     assert config.taxa == ""
 
 
 def test_taxa_validator_handles_none():
-    config = PullEventsConfig(taxa=None, days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa=None, bounding_box="[1, 1, 0, 0]", days_to_load=3, event_prefix="iNat: ")
     assert config.taxa is None
 
 
 def test_quality_grade_validator_accepts_valid_values():
-    config = PullEventsConfig(quality_grade=["casual", "needs_id", "research"], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=["casual", "needs_id", "research"], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["casual", "needs_id", "research"]
 
 
 def test_quality_grade_validator_normalizes_case_spaces_and_whitespace():
-    config = PullEventsConfig(quality_grade=["needs id", "Research", " casual "], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=["needs id", "Research", " casual "], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["needs_id", "research", "casual"]
 
 
 def test_quality_grade_validator_coerces_scalar_string_to_list():
-    config = PullEventsConfig(quality_grade="research", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade="research", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_coerces_comma_separated_string():
-    config = PullEventsConfig(quality_grade="research, needs id", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade="research, needs id", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research", "needs_id"]
 
 
 def test_quality_grade_validator_filters_empty_entries():
-    config = PullEventsConfig(quality_grade=["research", ""], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=["research", ""], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_rejects_invalid_values():
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(quality_grade=["reasearch"], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", quality_grade=["reasearch"], days_to_load=3, event_prefix="iNat: ")
     assert "reasearch" in str(exc_info.value)
     assert "casual" in str(exc_info.value)
 
 
 def test_quality_grade_validator_allows_none():
-    config = PullEventsConfig(quality_grade=None, days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=None, days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade is None
 
 
 @pytest.mark.parametrize("bad_scalar", [0, False, 5, 0.0])
 def test_quality_grade_validator_rejects_mistyped_scalars_with_clear_message(bad_scalar):
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(quality_grade=bad_scalar, days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", quality_grade=bad_scalar, days_to_load=3, event_prefix="iNat: ")
     message = str(exc_info.value)
     assert "must be one of" in message
     assert "not a valid list" not in message
@@ -170,32 +170,32 @@ def test_quality_grade_validator_rejects_mistyped_scalars_with_clear_message(bad
 
 def test_quality_grade_validator_rejects_falsy_non_string_entries():
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
     assert "0" in str(exc_info.value)
 
 
 def test_quality_grade_validator_rejects_boolean_entries():
     with pytest.raises(pydantic.ValidationError):
-        PullEventsConfig(quality_grade=[False], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", quality_grade=[False], days_to_load=3, event_prefix="iNat: ")
 
 
 def test_quality_grade_validator_drops_none_entries():
-    config = PullEventsConfig(quality_grade=["research", None], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=["research", None], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_coerces_empty_string_to_empty_list():
-    config = PullEventsConfig(quality_grade="", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade="", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 
 def test_quality_grade_validator_coerces_whitespace_string_to_empty_list():
-    config = PullEventsConfig(quality_grade="  ", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade="  ", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 
 def test_quality_grade_validator_allows_empty_list():
-    config = PullEventsConfig(quality_grade=[], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", quality_grade=[], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 
@@ -230,3 +230,79 @@ def test_actions_register_with_inaturalist_titles():
     assert titles["list_projects"] == "List Nearby iNaturalist Projects"
     assert titles["list_annotation_terms"] == "List iNaturalist Annotation Terms"
     assert titles["list_annotation_values"] == "List iNaturalist Annotation Values"
+
+
+SECRET_API_KEY = "inat-secret-api-key-do-not-log"
+
+
+@pytest.mark.asyncio
+async def test_pull_events_does_not_log_integration_secrets(
+        mocker, caplog, mock_gundi_client_v2, mock_state_manager, inaturalist_integration_v2,
+        mock_get_gundi_api_key, mock_gundi_sensors_client_class, mock_config_manager,
+        mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class
+):
+    """The Integration carries every action config, including the auth row's
+    api_key, so it must never be formatted into a log line."""
+    import logging
+    from gundi_core.schemas.v2 import IntegrationActionConfiguration, IntegrationActionSummary
+    from app.actions.handlers import action_pull_events
+
+    auth_config = IntegrationActionConfiguration(
+        id="11111111-1111-1111-1111-111111111111",
+        integration=inaturalist_integration_v2.id,
+        action=IntegrationActionSummary(
+            id="22222222-2222-2222-2222-222222222222", type="auth", name="Auth", value="auth",
+        ),
+        data={"api_key": SECRET_API_KEY},
+    )
+    integration = inaturalist_integration_v2.copy(
+        update={"configurations": [*inaturalist_integration_v2.configurations, auth_config]}
+    )
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mock_state_manager.get_state.return_value = async_return({})
+    mocker.patch("app.actions.handlers.state_manager", mock_state_manager)
+    mocker.patch("app.services.gundi.GundiClient", mock_gundi_client_v2_class)
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
+    action_config = PullEventsConfig.parse_obj(inaturalist_integration_v2.configurations[0].data)
+
+    with caplog.at_level(logging.DEBUG):
+        await action_pull_events(integration, action_config)
+
+    assert str(integration.id) in caplog.text
+    assert SECRET_API_KEY not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_attachment_errors_do_not_log_photo_bytes(mocker, caplog, inaturalist_integration_v2):
+    import logging
+    from app.actions import handlers
+
+    photo_bytes = b"\xff\xd8\xff-raw-jpeg-bytes"
+    image_response = MagicMock()
+    image_response.raise_for_status.return_value = None
+    image_response.aread = mocker.AsyncMock(return_value=photo_bytes)
+    client = MagicMock()
+    client.get = mocker.AsyncMock(return_value=image_response)
+    client.__aenter__ = mocker.AsyncMock(return_value=client)
+    client.__aexit__ = mocker.AsyncMock(return_value=False)
+    mocker.patch.object(handlers.httpx, "AsyncClient", return_value=client)
+    mocker.patch.object(
+        handlers, "send_event_attachments_to_gundi", side_effect=RuntimeError("upload failed")
+    )
+    log_activity = mocker.patch.object(handlers, "log_action_activity", mocker.AsyncMock())
+
+    events = [{"event_details": {"inat_id": 7}}]
+    response = [{"object_id": "gundi-1"}]
+    photos = {7: [(101, "https://static.inaturalist.org/photos/101/large.jpg")]}
+
+    with caplog.at_level(logging.DEBUG):
+        processed = await handlers.process_attachments(events, response, photos, inaturalist_integration_v2)
+
+    assert processed == 0
+    assert "101.jpg" in caplog.text
+    assert repr(photo_bytes) not in caplog.text
+    activity = log_activity.call_args.kwargs
+    assert repr(photo_bytes) not in activity["title"]
+    assert repr(photo_bytes) not in str(activity["data"])
