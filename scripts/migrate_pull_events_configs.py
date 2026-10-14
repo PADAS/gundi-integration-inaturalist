@@ -49,9 +49,11 @@ def normalize(data: dict) -> Optional[dict]:
             continue
         value = getattr(parsed, name)
         if value is None:
-            # Absent and null mean the same to the runner, but the schema types
-            # these fields as arrays, so null would fail validation.
-            del new[name]
+            # No filter. Store an empty list: it is valid for the array schema,
+            # so an already-empty list is left unchanged. Deleting the key instead
+            # breaks the schema's "taxa required when no project" rule, and null
+            # or a blank string fails the array type.
+            new[name] = []
         elif name == "annotations":
             new[name] = [row.dict() for row in value]
         else:
