@@ -20,8 +20,11 @@ BASE = "https://api.test"
         {"days_to_load": 3, "projects": ["1"], "annotations": [{"term": "22", "values": ["24"]}],
          "quality_grade": ["research", "needs_id"]},
     ),
-    # Empty legacy values are dropped rather than written as null.
-    ({"days_to_load": 3, "projects": ["1"], "taxa": "", "annotations": ""}, {"days_to_load": 3, "projects": ["1"]}),
+    # Blank or null legacy values become empty lists, never a deleted key or null.
+    (
+        {"days_to_load": 3, "projects": ["1"], "taxa": "", "annotations": None, "quality_grade": " "},
+        {"days_to_load": 3, "projects": ["1"], "taxa": [], "annotations": [], "quality_grade": []},
+    ),
 ])
 def test_normalize_rewrites_legacy_shapes_and_nothing_else(data, expected):
     assert normalize(data) == expected
@@ -30,6 +33,17 @@ def test_normalize_rewrites_legacy_shapes_and_nothing_else(data, expected):
 def test_normalize_leaves_current_configs_alone():
     data = {"days_to_load": 3, "taxa": ["1"], "bounding_box": "[1, 1, 0, 0]",
             "annotations": [{"term": "22", "values": ["24"]}], "quality_grade": ["research"]}
+    assert normalize(data) is None
+
+
+@pytest.mark.parametrize("data", [
+    # The shapes the portal saves for an empty field. Deleting taxa here made the
+    # Gundi API reject the PATCH ("'taxa' is a required property") when no
+    # project was set, and re-runs kept planning the same no-op change.
+    {"days_to_load": 3, "projects": ["1"], "taxa": [], "annotations": [], "quality_grade": []},
+    {"days_to_load": 3, "projects": [], "taxa": [], "bounding_box": "[1, 1, 0, 0]"},
+])
+def test_normalize_leaves_empty_lists_alone(data):
     assert normalize(data) is None
 
 
