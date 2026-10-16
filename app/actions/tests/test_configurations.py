@@ -91,6 +91,12 @@ def _collect_gundi_references(node, found):
             _collect_gundi_references(value, found)
 
 
+# Reference actions this config asks a destination's runner for, with the params
+# their query models take: gundi-integration-earthranger's ListEventTypesQuery
+# takes none (app/actions/configurations.py). Update both together.
+DESTINATION_REFERENCE_ACTIONS = {"list_event_types": set()}
+
+
 def test_gundi_reference_annotations_match_registered_reference_actions():
     """Drift guard: every gundi:reference annotation must name a real reference
     action whose query model has the declared params, and must never set
@@ -109,14 +115,22 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
 
     assert {ref["action"] for _, ref in found} == {
         "list_projects", "list_annotation_terms", "list_annotation_values", "list_taxa",
+        "list_event_types",
     }
     for node, ref in found:
-        assert ref["target"] == "self"
         assert ref["allow_free_text"] is True
+        assert "ui:widget" not in node
+        if ref["target"] == "destination":
+            # Answered by the destination's runner, not this one; its query
+            # model isn't importable here, so check against the mirror above.
+            assert ref["action"] in DESTINATION_REFERENCE_ACTIONS
+            assert set(ref.get("params", {})) <= DESTINATION_REFERENCE_ACTIONS[ref["action"]]
+            assert "search" not in ref and "resolve" not in ref
+            continue
+        assert ref["target"] == "self"
         assert ref["action"] in reference_actions
         query_fields = set(reference_actions[ref["action"]].__fields__)
         assert set(ref.get("params", {})) <= query_fields
-        assert "ui:widget" not in node
         if "search" in ref:
             assert ref["search"]["param"] in query_fields
             assert ref["search"]["param"] not in ref.get("params", {})
@@ -141,6 +155,21 @@ def test_gundi_reference_annotations_sit_on_the_right_nodes():
     values_ref = ui["annotations"]["items"]["values"]["items"]["gundi:reference"]
     assert values_ref["action"] == "list_annotation_values"
     assert values_ref["params"] == {"term": {"$data": "../term"}}
+
+
+def test_event_type_lists_the_destination_earthranger_event_types():
+    """Events go to the destination EarthRanger site, so the picker asks that
+    site (target "destination"), with free text for v1 types and "any"."""
+    ui = PullEventsConfig.ui_schema()
+    ref = ui["event_type"]["gundi:reference"]
+    assert ref == {
+        "action": "list_event_types",
+        "target": "destination",
+        "params": {},
+        "allow_free_text": True,
+    }
+    assert set(ref["params"]) <= DESTINATION_REFERENCE_ACTIONS[ref["action"]]
+    assert "ui:widget" not in ui["event_type"]
 
 
 def test_ui_schema_override_preserves_existing_ui_options():
