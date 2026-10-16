@@ -6,15 +6,22 @@ from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableAc
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
-def _reference(action: str, params: Optional[dict] = None, search: Optional[dict] = None) -> dict:
+def _reference(
+    action: str,
+    params: Optional[dict] = None,
+    search: Optional[dict] = None,
+    target: str = "self",
+) -> dict:
     """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
     docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
     Deliberately does NOT set ui:widget — portals without reference support
-    must keep rendering plain text fields. All iNat lookups target "self":
-    this integration's own runner answers every query."""
+    must keep rendering plain text fields. iNat lookups target "self" (this
+    runner answers them); EarthRanger vocabulary targets "destination", which
+    the portal fans out to the connection's destinations (gundi-portal
+    docs/superpowers/specs/2026-10-08-reference-destination-target-design.md)."""
     annotation = {
         "action": action,
-        "target": "self",
+        "target": target,
         "params": params or {},
         "allow_free_text": True,
     }
@@ -72,7 +79,7 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
 class PullEventsConfig(PullActionConfiguration):
 
     event_type: Optional[str] = pydantic.Field("inat_observation", title="Event type",
-        description="The event type to use in the returned event data.")
+        description="The EarthRanger event type for the events. Pick one from the destination EarthRanger site, or type its value.")
 
     event_prefix: str = pydantic.Field("iNat: ", title="Event prefix",
         description = "A string to prefix to the observed species to set a title when creating the event.  Default: 'iNat: '")
@@ -158,6 +165,13 @@ class PullEventsConfig(PullActionConfiguration):
                 "list_annotation_values", params={"term": {"$data": "../term"}},
             )}},
         }}
+        # Events land in the destination EarthRanger site, so its event types
+        # are the vocabulary. The EarthRanger runner's list_event_types answers;
+        # free text stays allowed for v1 types (that action lists v2 only), the
+        # "any" workaround, and connections with no EarthRanger destination yet.
+        base["event_type"] = {**base.get("event_type", {}), "gundi:reference": _reference(
+            "list_event_types", target="destination",
+        )}
         base["taxa"] = {"items": {"gundi:reference": _reference(
             "list_taxa", search={"param": "q", "min_chars": 2},
         )}}
