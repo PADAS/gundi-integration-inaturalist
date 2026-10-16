@@ -101,6 +101,23 @@ async def _drop_unknown_projects(integration: Integration, projects: List[str]) 
     return existing
 
 
+async def _skip_unbounded_pull(integration: Integration):
+    """Record that a pull with no project and no bounding box was refused."""
+    msg = ("The pull was skipped: the configuration has no project and no bounding box, "
+           "so it would load observations worldwide. Choose a project or draw a bounding box.")
+    logger.error(f"{msg} Integration ID: {integration.id}.")
+    try:
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_events",
+            level=LogLevel.ERROR,
+            title=msg,
+        )
+    except Exception as log_error:
+        # Best-effort: the error is already in the logs.
+        logger.warning(f"Could not publish the unbounded-pull error for integration ID: {integration.id}: {log_error}")
+
+
 def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
     yield list_a[i:i + chunk_size]
@@ -162,6 +179,14 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
+
+    if not action_config.projects and not action_config.bounding_box:
+        # The config validator already rejects this; this guards configs that
+        # bypass it, since the query would pull every observation worldwide.
+        await _skip_unbounded_pull(integration)
+        return {'result': {'events_extracted': 0,
+                           'events_updated': 0,
+                           'photos_attached': 0}}
 
     projects = action_config.projects
     if projects:

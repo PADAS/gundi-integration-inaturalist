@@ -1,7 +1,8 @@
 import datetime
 import pydantic
 import pytest
-from unittest.mock import MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call
+from gundi_core.schemas.v2 import LogLevel
 from app.conftest import async_return
 from app.actions.configurations import PullEventsConfig
 from app.datasource.inaturalist import get_observations, TAXA_BATCH_SIZE
@@ -40,7 +41,7 @@ async def test_execute_pull_observations_action(
 
 
 @pytest.mark.asyncio
-async def test_execute_pull_observations_action_without_bounding_box(
+async def test_execute_pull_observations_action_skips_unbounded_config(
         mocker, mock_gundi_client_v2, mock_state_manager, inaturalist_integration_v2_without_bounding_box,
         mock_get_gundi_api_key, mock_gundi_sensors_client_class, mock_config_manager,
         mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class
@@ -58,16 +59,19 @@ async def test_execute_pull_observations_action_without_bounding_box(
     mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
     mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
 
+    mocker.patch("app.services.action_runner.state_manager.set_if_absent", AsyncMock(return_value=True))
+
+    # Taxa without a project or a bounding box would pull worldwide: the runner
+    # skips it before querying iNat and records a warning in the activity log.
     response = await execute_action(
         integration_id=str(inaturalist_integration_v2_without_bounding_box.id),
         action_id="pull_events"
     )
-    assert "result" in response
-    assert response["result"].get("events_extracted") == 2
-    assert response["result"].get("events_updated") == 0
-    assert response["result"].get("photos_attached") == 5
-    assert mock_get_observations_v2.called
-    assert mock_get_observations_v2.call_count == 2
+    assert response == {"skipped": True, "reason": "invalid_configuration"}
+    assert not mock_get_observations_v2.called
+    activity = mock_publish_event.call_args.kwargs["event"].payload
+    assert activity.level == LogLevel.WARNING
+    assert "Choose at least one project" in activity.data["validation_error"]
 
 
 @pytest.mark.asyncio
@@ -102,13 +106,13 @@ async def test_execute_pull_observations_action_with_taxa_string(
 
 
 def test_taxa_validator_keeps_list():
-    config = PullEventsConfig(taxa=["123", "456", "789"], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa=["123", "456", "789"], bounding_box="[1, 1, 0, 0]", days_to_load=3, event_prefix="iNat: ")
     assert config.taxa == ["123", "456", "789"]
     assert config.taxa_str == "123,456,789"
 
 
 def test_taxa_validator_splits_string():
-    config = PullEventsConfig(taxa="123, 456, 789", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="123, 456, 789", bounding_box="[1, 1, 0, 0]", days_to_load=3, event_prefix="iNat: ")
     assert config.taxa == ["123", "456", "789"]
     assert config.taxa_str == "123,456,789"
 
@@ -125,46 +129,46 @@ def test_taxa_validator_handles_none():
 
 
 def test_quality_grade_validator_accepts_valid_values():
-    config = PullEventsConfig(taxa="1", quality_grade=["casual", "needs_id", "research"], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["casual", "needs_id", "research"], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["casual", "needs_id", "research"]
 
 
 def test_quality_grade_validator_normalizes_case_spaces_and_whitespace():
-    config = PullEventsConfig(taxa="1", quality_grade=["needs id", "Research", " casual "], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["needs id", "Research", " casual "], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["needs_id", "research", "casual"]
 
 
 def test_quality_grade_validator_coerces_scalar_string_to_list():
-    config = PullEventsConfig(taxa="1", quality_grade="research", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade="research", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_coerces_comma_separated_string():
-    config = PullEventsConfig(taxa="1", quality_grade="research, needs id", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade="research, needs id", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research", "needs_id"]
 
 
 def test_quality_grade_validator_filters_empty_entries():
-    config = PullEventsConfig(taxa="1", quality_grade=["research", ""], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["research", ""], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_rejects_invalid_values():
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(taxa="1", quality_grade=["reasearch"], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["reasearch"], days_to_load=3, event_prefix="iNat: ")
     assert "reasearch" in str(exc_info.value)
     assert "casual" in str(exc_info.value)
 
 
 def test_quality_grade_validator_allows_none():
-    config = PullEventsConfig(taxa="1", quality_grade=None, days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=None, days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade is None
 
 
 @pytest.mark.parametrize("bad_scalar", [0, False, 5, 0.0])
 def test_quality_grade_validator_rejects_mistyped_scalars_with_clear_message(bad_scalar):
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(taxa="1", quality_grade=bad_scalar, days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=bad_scalar, days_to_load=3, event_prefix="iNat: ")
     message = str(exc_info.value)
     assert "must be one of" in message
     assert "not a valid list" not in message
@@ -173,32 +177,32 @@ def test_quality_grade_validator_rejects_mistyped_scalars_with_clear_message(bad
 
 def test_quality_grade_validator_rejects_falsy_non_string_entries():
     with pytest.raises(pydantic.ValidationError) as exc_info:
-        PullEventsConfig(taxa="1", quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=[0], days_to_load=3, event_prefix="iNat: ")
     assert "0" in str(exc_info.value)
 
 
 def test_quality_grade_validator_rejects_boolean_entries():
     with pytest.raises(pydantic.ValidationError):
-        PullEventsConfig(taxa="1", quality_grade=[False], days_to_load=3, event_prefix="iNat: ")
+        PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=[False], days_to_load=3, event_prefix="iNat: ")
 
 
 def test_quality_grade_validator_drops_none_entries():
-    config = PullEventsConfig(taxa="1", quality_grade=["research", None], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["research", None], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == ["research"]
 
 
 def test_quality_grade_validator_coerces_empty_string_to_empty_list():
-    config = PullEventsConfig(taxa="1", quality_grade="", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade="", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 
 def test_quality_grade_validator_coerces_whitespace_string_to_empty_list():
-    config = PullEventsConfig(taxa="1", quality_grade="  ", days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade="  ", days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 
 def test_quality_grade_validator_allows_empty_list():
-    config = PullEventsConfig(taxa="1", quality_grade=[], days_to_load=3, event_prefix="iNat: ")
+    config = PullEventsConfig(taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=[], days_to_load=3, event_prefix="iNat: ")
     assert config.quality_grade == []
 
 

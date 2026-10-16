@@ -22,7 +22,7 @@ def test_quality_grade_enum_matches_pyinaturalist():
 
 
 def test_quality_grade_still_normalizes_legacy_variants():
-    config = PullEventsConfig(days_to_load=3, taxa="1", quality_grade=["Needs ID", "research"])
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", quality_grade=["Needs ID", "research"])
     assert config.quality_grade == ["needs_id", "research"]
 
 
@@ -32,7 +32,7 @@ def test_quality_grade_invalid_value_raises():
 
 
 def test_annotations_accepts_legacy_json_string():
-    config = PullEventsConfig(days_to_load=3, taxa="1", annotations='{"22": ["24", "25"], "1": ["2"]}')
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", annotations='{"22": ["24", "25"], "1": ["2"]}')
     assert [(f.term, f.values) for f in config.annotations] == [
         ("22", ["24", "25"]), ("1", ["2"]),
     ]
@@ -40,13 +40,13 @@ def test_annotations_accepts_legacy_json_string():
 
 
 def test_annotations_accepts_legacy_dict_with_int_keys():
-    config = PullEventsConfig(days_to_load=3, taxa="1", annotations={22: [24, 25]})
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", annotations={22: [24, 25]})
     assert config.annotations_dict == {"22": ["24", "25"]}
 
 
 def test_annotations_accepts_structured_rows():
     config = PullEventsConfig(
-        days_to_load=3, taxa="1", annotations=[{"term": "22", "values": ["24"]}]
+        days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", annotations=[{"term": "22", "values": ["24"]}]
     )
     assert config.annotations_dict == {"22": ["24"]}
 
@@ -54,7 +54,7 @@ def test_annotations_accepts_structured_rows():
 def test_annotations_duplicate_term_rows_merge_values():
     config = PullEventsConfig(
         days_to_load=3,
-        taxa="1",
+        taxa="1", bounding_box="[1, 1, 0, 0]",
         annotations=[
             {"term": "22", "values": ["24"]},
             {"term": "22", "values": ["25", "24"]},
@@ -65,13 +65,13 @@ def test_annotations_duplicate_term_rows_merge_values():
 
 @pytest.mark.parametrize("raw", [None, "", "   ", "{}"])
 def test_annotations_empty_inputs_mean_no_filter(raw):
-    config = PullEventsConfig(days_to_load=3, taxa="1", annotations=raw)
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", annotations=raw)
     assert config.annotations_dict is None
 
 
 def test_annotations_invalid_json_raises():
     with pytest.raises(pydantic.ValidationError):
-        PullEventsConfig(days_to_load=3, taxa="1", annotations="{not json")
+        PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", annotations="{not json")
 
 
 def test_annotations_schema_is_structured_rows():
@@ -150,19 +150,19 @@ def test_ui_schema_override_preserves_existing_ui_options():
 
 
 def test_taxa_accepts_legacy_comma_string():
-    config = PullEventsConfig(days_to_load=3, taxa="12345, 67890,  ,99")
+    config = PullEventsConfig(days_to_load=3, taxa="12345, 67890,  ,99", bounding_box="[1, 1, 0, 0]")
     assert config.taxa == ["12345", "67890", "99"]
     assert config.taxa_str == "12345,67890,99"
 
 
 def test_taxa_accepts_list_and_coerces_ints():
-    config = PullEventsConfig(days_to_load=3, taxa=[12345, "67890"])
+    config = PullEventsConfig(days_to_load=3, taxa=[12345, "67890"], bounding_box="[1, 1, 0, 0]")
     assert config.taxa == ["12345", "67890"]
     assert config.taxa_str == "12345,67890"
 
 
 def test_taxa_drops_duplicates_and_splits_list_items():
-    config = PullEventsConfig(days_to_load=3, taxa=["1, 2", "1", 2, "3"])
+    config = PullEventsConfig(days_to_load=3, taxa=["1, 2", "1", 2, "3"], bounding_box="[1, 1, 0, 0]")
     assert config.taxa == ["1", "2", "3"]
 
 
@@ -341,24 +341,15 @@ def test_rejects_config_with_no_project_taxa_or_bounding_box(taxa, bounding_box)
 
 @pytest.mark.parametrize("filters", [
     {"projects": ["123"]},
-    {"taxa": "12345"},
     {"bounding_box": "[1, 1, 0, 0]"},
+    {"taxa": "12345", "bounding_box": "[1, 1, 0, 0]"},
 ])
-def test_accepts_legacy_config_with_any_single_filter(filters):
+def test_accepts_config_bounded_by_project_or_area(filters):
     PullEventsConfig(days_to_load=3, **filters)
 
 
-@pytest.mark.parametrize("taxa, has_filter", [
-    (["12345"], True),
-    (["12345", "678"], True),
-    ([], False),
-    ([" "], False),
-])
-def test_filter_check_accepts_taxa_as_a_list(taxa, has_filter):
-    # The taxa field may hold a list of IDs instead of a comma-separated string.
-    values = {"projects": [], "taxa": taxa, "bounding_box": None}
-    if has_filter:
-        assert PullEventsConfig.require_some_filter(values) == values
-    else:
-        with pytest.raises(ValueError, match="Choose at least one project"):
-            PullEventsConfig.require_some_filter(values)
+@pytest.mark.parametrize("taxa", ["12345", ["12345", "678"]])
+def test_rejects_taxa_without_project_or_bounding_box(taxa):
+    """Taxa alone don't bound the area, so the pull would be worldwide."""
+    with pytest.raises(pydantic.ValidationError, match="Choose at least one project"):
+        PullEventsConfig(days_to_load=3, taxa=taxa)

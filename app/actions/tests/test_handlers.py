@@ -159,7 +159,7 @@ def test_transform_inat_to_gundi_event_minimal():
     ob = _make_observation()
     config = PullEventsConfig(
         days_to_load=3,
-        taxa="1",
+        taxa="1", bounding_box="[1, 1, 0, 0]",
         event_type="inat_observation",
         event_prefix="iNat: ",
     )
@@ -185,7 +185,7 @@ def test_transform_inat_to_gundi_event_with_user_location_taxon():
             "ancestor_ids": [1, 2, 3],
         },
     )
-    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", event_prefix="iNat: ")
     event = _transform_inat_to_gundi_event(ob, config)
     assert event["event_details"]["user_id"] == 99
     assert event["event_details"]["user_name"] == "Jane"
@@ -202,7 +202,7 @@ def test_transform_inat_to_gundi_event_title_fallback_to_species_guess():
         species_guess="Unknown Bird",
         taxon={"id": 1, "rank": "species", "name": "Spp", "preferred_common_name": None},
     )
-    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="")
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", event_prefix="")
     event = _transform_inat_to_gundi_event(ob, config)
     assert event["title"] == "Unknown Bird"
 
@@ -223,7 +223,7 @@ async def test_action_pull_events_no_observations_updates_state(mocker):
 
     integration = MagicMock()
     integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
-    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", event_prefix="iNat: ")
 
     result = await action_pull_events(integration, config)
 
@@ -286,7 +286,7 @@ async def test_action_pull_events_skips_patch_when_observation_already_in_sync(m
 
     integration = MagicMock()
     integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
-    config = PullEventsConfig(days_to_load=3, taxa="1", event_prefix="iNat: ")
+    config = PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]", event_prefix="iNat: ")
 
     result = await action_pull_events(integration, config)
 
@@ -317,7 +317,7 @@ async def test_action_pull_events_skips_when_another_run_holds_the_lock(mocker):
     mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
-    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
     mock_get_observations.assert_not_called()
@@ -333,7 +333,7 @@ async def test_action_pull_events_skip_survives_an_activity_log_failure(mocker):
     mocker.patch("app.actions.handlers.log_action_activity", AsyncMock(side_effect=RuntimeError("publisher down")))
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
-    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
     mock_get_observations.assert_not_called()
@@ -350,7 +350,7 @@ async def test_action_pull_events_releases_the_lock_after_a_run(mocker):
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
     integration = _lock_test_integration()
 
-    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     mock_state.set_if_absent.assert_called_once()
     assert mock_state.set_if_absent.call_args.kwargs["source_id"] == "run_lock"
@@ -371,7 +371,7 @@ async def test_action_pull_events_releases_the_lock_when_the_run_fails(mocker):
     integration = _lock_test_integration()
 
     with pytest.raises(RuntimeError, match="iNat down"):
-        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     lock_token = mock_state.set_if_absent.call_args.kwargs["value"]
     mock_state.delete_state_if_value.assert_called_once_with(
@@ -390,7 +390,7 @@ async def test_action_pull_events_lock_release_failure_does_not_mask_the_result(
     mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
 
-    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+    result = await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     assert result["result"]["events_extracted"] == 0
 
@@ -408,7 +408,7 @@ async def test_action_pull_events_ephemeral_run_skips_the_lock(mocker):
 
     token = ephemeral_run.set(True)
     try:
-        await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1"))
+        await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
     finally:
         ephemeral_run.reset(token)
 
@@ -465,7 +465,7 @@ async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_ex
     mocker.patch("app.actions.handlers.get_observations", side_effect=run_a_fetch)
 
     with caplog.at_level(logging.INFO, logger="app.actions.handlers"):
-        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+        await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     assert state.locks[lock_key] == "run-b-token"
     assert "had already expired or been taken by another run" in caplog.text
@@ -591,7 +591,7 @@ async def test_action_pull_events_does_not_look_up_projects_when_none_are_saved(
         mocker, existing=lambda values: values
     )
 
-    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1"))
+    await action_pull_events(integration, PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     find.assert_not_called()
     get_observations.assert_called_once()
@@ -609,3 +609,23 @@ async def test_action_pull_events_drops_blank_saved_projects(mocker):
 
     find.assert_called_once_with(["123"])
     assert get_observations.call_args.kwargs["projects"] == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_refuses_an_unbounded_config(mocker):
+    # construct() skips validation, like a config built outside the runner.
+    integration, get_observations, find, activity = _unknown_projects_test_setup(
+        mocker, existing=lambda values: values
+    )
+    config = PullEventsConfig.construct(
+        days_to_load=3, projects=None, bounding_box=None, taxa=["1"]
+    )
+
+    result = await action_pull_events(integration, config)
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    get_observations.assert_not_called()
+    find.assert_not_called()
+    error = activity.call_args.kwargs
+    assert error["level"] == LogLevel.ERROR
+    assert "no project and no bounding box" in error["title"]
