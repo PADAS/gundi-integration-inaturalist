@@ -34,6 +34,7 @@ from app.datasource.inaturalist import (
     list_controlled_terms,
     search_projects_near,
     search_taxa,
+    get_taxa_by_ids,
 )
 from app.services.state import IntegrationStateManager
 
@@ -562,13 +563,33 @@ async def action_list_annotation_values(integration: Integration, action_config:
     return ReferenceDataResponse(options=options, cache_ttl_seconds=3600).dict()
 
 
+def _taxon_option(taxon: dict) -> ReferenceOption:
+    scientific = taxon.get("name") or str(taxon["id"])
+    common = taxon.get("preferred_common_name")
+    return ReferenceOption(
+        value=str(taxon["id"]),
+        label=f"{common} ({scientific})" if common else scientific,
+        description=taxon.get("rank"),
+    )
+
+
 async def action_list_taxa(integration: Integration, action_config: ListTaxaQuery):
     """Reference action (typeahead): taxa matching the typed query.
 
     The taxa vocabulary is far too large for a default page, so an empty query
     returns no options with truncated=True — the portal's search widget only
     fetches once the operator has typed, and old widgets get a clean empty list.
+
+    With `ids` (the annotation's resolve param) it returns those taxa instead,
+    in the order asked, so the portal can label saved values. IDs iNat doesn't
+    know are left out; the portal keeps showing them as raw values.
     """
+    if action_config.ids:
+        # Blocking like search_taxa below, so it runs off the event loop too.
+        taxa = await asyncio.to_thread(get_taxa_by_ids, action_config.ids)
+        by_id = {str(t["id"]): t for t in taxa if t.get("id") is not None}
+        options = [_taxon_option(by_id[i]) for i in action_config.ids if i in by_id]
+        return ReferenceDataResponse(options=options, truncated=False).dict()
     query = (action_config.q or "").strip()
     if not query:
         return ReferenceDataResponse(options=[], truncated=True).dict()
@@ -576,16 +597,6 @@ async def action_list_taxa(integration: Integration, action_config: ListTaxaQuer
     # off the event loop: the portal calls this on every keystroke.
     response = await asyncio.to_thread(search_taxa, query)
     results = response.get("results", [])
-    options = []
-    for taxon in results:
-        if taxon.get("id") is None:
-            continue
-        scientific = taxon.get("name") or str(taxon["id"])
-        common = taxon.get("preferred_common_name")
-        options.append(ReferenceOption(
-            value=str(taxon["id"]),
-            label=f"{common} ({scientific})" if common else scientific,
-            description=taxon.get("rank"),
-        ))
+    options = [_taxon_option(taxon) for taxon in results if taxon.get("id") is not None]
     truncated = response.get("total_results", len(results)) > len(results)
     return ReferenceDataResponse(options=options, truncated=truncated).dict()

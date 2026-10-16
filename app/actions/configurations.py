@@ -10,6 +10,7 @@ def _reference(
     action: str,
     params: Optional[dict] = None,
     search: Optional[dict] = None,
+    resolve: Optional[dict] = None,
     target: Literal["self", "destination"] = "self",
 ) -> dict:
     """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
@@ -27,6 +28,8 @@ def _reference(
     }
     if search:
         annotation["search"] = search
+    if resolve:
+        annotation["resolve"] = resolve
     return annotation
 
 
@@ -173,7 +176,7 @@ class PullEventsConfig(PullActionConfiguration):
             "list_event_types", target="destination",
         )}
         base["taxa"] = {"items": {"gundi:reference": _reference(
-            "list_taxa", search={"param": "q", "min_chars": 2},
+            "list_taxa", search={"param": "q", "min_chars": 2}, resolve={"param": "ids"},
         )}}
         return base
 
@@ -376,3 +379,19 @@ class ListTaxaQuery(ReferenceActionConfiguration):
     response, never a 422.
     """
     q: Optional[str] = pydantic.Field(None, title="Search text")
+    ids: Optional[List[str]] = pydantic.Field(
+        None,
+        title="Taxon IDs",
+        description="Saved values to label (the resolve contract): returns these taxa instead of searching.",
+    )
+
+    @pydantic.validator("ids", pre=True)
+    def coerce_ids(cls, v):
+        # Accept a list or a comma-separated string; drop blanks and duplicates.
+        if v is None:
+            return None
+        items = v.split(",") if isinstance(v, str) else v
+        if not isinstance(items, (list, tuple, set)):
+            items = [items]
+        cleaned = {str(i).strip(): None for i in items if i is not None and str(i).strip()}
+        return list(cleaned) or None

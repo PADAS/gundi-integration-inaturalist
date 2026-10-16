@@ -368,3 +368,40 @@ def test_list_taxa_errors_are_reported_with_their_cause():
 
     assert classify_error(server_error)[::3] == ("bad_response", 503)
     assert classify_error(unreachable)[::3] == ("connectivity", None)
+
+
+@pytest.mark.asyncio
+async def test_list_taxa_resolves_saved_ids_in_order(mocker, inaturalist_integration_v2):
+    """The resolve contract: given saved IDs, label them instead of searching."""
+    from app.actions import handlers
+    from app.actions.configurations import ListTaxaQuery
+
+    search = mocker.patch.object(handlers, "search_taxa")
+    lookup = mocker.patch.object(
+        handlers, "get_taxa_by_ids", return_value=list(reversed(TAXA_RESPONSE["results"]))
+    )
+
+    result = await handlers.action_list_taxa(
+        inaturalist_integration_v2, ListTaxaQuery(q="ignored", ids=["41955", "999", "41963"])
+    )
+
+    search.assert_not_called()
+    lookup.assert_called_once_with(["41955", "999", "41963"])
+    # Asked order, unknown ID left out (the portal shows it as the raw value).
+    assert [(o["value"], o["label"]) for o in result["options"]] == [
+        ("41955", "Leopard (Panthera pardus)"),
+        ("41963", "Panthera"),
+    ]
+    assert result["truncated"] is False
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("41955, 41963,", ["41955", "41963"]),
+    (["41955", " ", None, "41955", 7], ["41955", "7"]),
+    ([], None),
+    ("", None),
+])
+def test_list_taxa_query_coerces_ids(raw, expected):
+    from app.actions.configurations import ListTaxaQuery
+
+    assert ListTaxaQuery(ids=raw).ids == expected
