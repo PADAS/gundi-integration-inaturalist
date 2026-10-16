@@ -122,8 +122,10 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
         assert "ui:widget" not in node
         if ref["target"] == "destination":
             # Answered by the destination's runner, not this one; its query
-            # model isn't importable here (see the EarthRanger-target test).
+            # model isn't importable here, so check against the mirror above.
             assert ref["action"] in DESTINATION_REFERENCE_ACTIONS
+            assert set(ref.get("params", {})) <= DESTINATION_REFERENCE_ACTIONS[ref["action"]]
+            assert "search" not in ref and "resolve" not in ref
             continue
         assert ref["target"] == "self"
         assert ref["action"] in reference_actions

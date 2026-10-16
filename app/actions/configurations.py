@@ -10,7 +10,7 @@ def _reference(
     action: str,
     params: Optional[dict] = None,
     search: Optional[dict] = None,
-    target: str = "self",
+    target: Literal["self", "destination"] = "self",
 ) -> dict:
     """Build a gundi:reference ui_schema annotation (spec: gundi-integration-cmore
     docs/superpowers/specs/2026-07-31-reference-data-config-ui-design.md §2).
@@ -79,7 +79,7 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
 class PullEventsConfig(PullActionConfiguration):
 
     event_type: Optional[str] = pydantic.Field("inat_observation", title="Event type",
-        description="The EarthRanger event type for the events. Pick one from the destination EarthRanger site, or type its value.")
+        description="The event type for the events. Pick one of the destination EarthRanger site's event types, or type one.")
 
     event_prefix: str = pydantic.Field("iNat: ", title="Event prefix",
         description = "A string to prefix to the observed species to set a title when creating the event.  Default: 'iNat: '")
