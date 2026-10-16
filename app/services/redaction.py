@@ -12,8 +12,12 @@ Two signals mark a value as secret, and either one is enough:
   ``_``) contains one of ``SENSITIVE_KEY_FRAGMENTS``. Deliberately broad:
   ``token_url`` is redacted too, and that over-redaction is the safe side.
 - Its field declaration. The connector's config model marks the field as
-  ``SecretStr``/``SecretBytes``, ``format="password"``, or a ``password`` UI
-  widget. That catches secrets with innocent names such as ``client_id``.
+  ``SecretStr``/``SecretBytes``, ``format="password"``, a ``password`` UI
+  widget, or ``writeOnly=True``. That catches secrets with innocent names
+  such as ``client_id``. ``writeOnly`` (the JSON Schema keyword for a value
+  that is submitted but never read back) is the one that leaves the portal
+  form unchanged: use it for a secret that is not a password input, such as
+  a JSON document of device keys or a pasted certificate.
   The model is walked alongside the data, so a declaration on a nested
   model (direct, ``Optional``, in a ``List`` or a ``Dict`` value) counts
   too, and a field is matched by its name or its alias: the portal saves a
@@ -25,8 +29,21 @@ Two signals mark a value as secret, and either one is enough:
 
 Unset secrets (``None`` or ``""``) stay as they are: "nothing configured" is
 what an operator debugging a failed auth needs to see, and discloses nothing.
+
+A failure event also carries the failed HTTP request and response
+(``request_url``, ``request_data``, ``server_response_body``). A connector's
+password-grant token POST that the provider rejects puts the password in
+``request_data``, a key in the URL query, and a token in the response:
+``redact_body`` and ``redact_url`` mask those by the same key rules. The
+error text and traceback may quote that URL too (httpx's
+``raise_for_status()`` message names it, query string included):
+``redact_text`` masks the query of every URL quoted in free text, and any
+bare ``key=value`` pair outside one.
 """
+import json
+import re
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import pydantic
 from pydantic.fields import ModelField, SHAPE_SINGLETON
@@ -119,12 +136,13 @@ def secret_field_names(config_model: Models) -> FrozenSet[str]:
     """The keys under which a connector's config model stores a secret.
 
     Each secret field contributes its name and its alias (the portal saves
-    under the alias). Reads three declarations: a ``SecretStr``/``SecretBytes``
+    under the alias). Reads four declarations: a ``SecretStr``/``SecretBytes``
     annotation (directly, in a container or in a union), ``Field(...,
     format="password")`` (the JSON-schema hint the portal renders as a
-    password input), and ``FieldWithUIOptions(ui_options=UIOptions(widget=
-    "password"))``. Root level only; ``redact_secrets`` follows nested models
-    itself. Empty for anything that is not a model.
+    password input), ``FieldWithUIOptions(ui_options=UIOptions(widget=
+    "password"))``, and ``Field(..., writeOnly=True)`` (a secret the portal
+    renders as an ordinary input). Root level only; ``redact_secrets``
+    follows nested models itself. Empty for anything that is not a model.
     """
     return frozenset(
         key for key, fields in _fields_by_key(_as_models(config_model)).items()
@@ -177,7 +195,8 @@ def _is_secret_field(field: ModelField) -> bool:
     if isinstance(field.type_, type) and issubclass(field.type_, _SECRET_TYPES):
         return True
     field_info = field.field_info
-    if (getattr(field_info, "extra", None) or {}).get("format") == "password":
+    extra = getattr(field_info, "extra", None) or {}
+    if extra.get("format") == "password" or extra.get("writeOnly") is True:
         return True
     ui_options = getattr(field_info, "ui_options", None)
     if getattr(ui_options, "widget", None) == "password":
@@ -219,3 +238,180 @@ def _redact_configuration_row(row: Any, config_models: Mapping[str, Type[pydanti
     if isinstance(row.get("data"), dict):
         redacted["data"] = redact_secrets(row["data"], model=config_models.get(action_value) if action_value else None)
     return redacted
+
+
+# A form-encoded body: field names are the characters a form encoder emits
+# (word characters, [] for array fields, % for an encoded byte, + for a
+# space), so XML or any other text that happens to hold an "=" without
+# whitespace does not pass for one and reach the per-field masking with a
+# secret's value folded into a "field name".
+_FORM_FIELD = r"[A-Za-z0-9_.\-\[\]%+]+"
+_FORM_BODY = re.compile(rf"^{_FORM_FIELD}=[^&\s]*(?:&{_FORM_FIELD}=[^&\s]*)*$")
+
+
+def redact_body(body: Any) -> str:
+    """The text of an HTTP request or response body with secrets masked.
+
+    Bytes are decoded as UTF-8 (undecodable bytes replaced). A JSON object
+    or array, or a dict/list given directly, is walked by ``redact_secrets``
+    and re-serialized when something was masked. A form-encoded body
+    (``grant_type=password&...``) is masked per field and re-encoded.
+    A body shaped like a JSON object or array that does not parse (truncated,
+    say) cannot be walked either and its keys may hide behind escapes, so it
+    is replaced whole. Anything else cannot be walked by key, so if it so
+    much as names a secret-looking key (a SOAP login with a ``<password>``
+    element, say), percent-encoded or JSON-escaped included, the whole body
+    is replaced; otherwise it is returned as is. Over-redaction of a
+    plain-text error that merely mentions "token" is the accepted cost.
+    """
+    if body is None:
+        return ""
+    if isinstance(body, (dict, list)):
+        return json.dumps(redact_secrets(body))
+    if isinstance(body, (bytes, bytearray)):
+        text = bytes(body).decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+    if not text.strip():
+        return text
+    parsed, has_duplicate_keys = _parse_json(text)
+    if isinstance(parsed, (dict, list)):
+        redacted = redact_secrets(parsed)
+        # Re-serialized only when something was masked, so an innocent body
+        # is attached exactly as it went over the wire. Unless an object
+        # repeated a key: parsing kept the last value only, so the text may
+        # hold a secret the walk never saw, and the sanitized object is
+        # attached instead.
+        return text if redacted == parsed and not has_duplicate_keys else json.dumps(redacted)
+    if _FORM_BODY.match(text):
+        return _redact_query(text)
+    if text.lstrip()[:1] in ("{", "[") or _names_a_secret(text):
+        return REDACTED
+    return text
+
+
+_JSON_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _names_a_secret(text: str) -> bool:
+    """Whether free text contains a secret-looking key under any of the
+    spellings a body may use: as is, percent-encoded (``%70assword``) or
+    JSON-escaped (``pass\\u0077ord``)."""
+    unescaped = _JSON_UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    return any(_is_sensitive_key(t) for t in (text, unquote(text), unescaped, unquote(unescaped)))
+
+
+def _parse_json(text: str) -> Tuple[Any, bool]:
+    """``(parsed, has_duplicate_keys)``, or ``(None, False)`` when ``text`` is
+    not JSON. Objects are built as ``json.loads`` builds them (the last of a
+    repeated key wins), and whether any object at any depth repeated a key
+    is reported alongside."""
+    duplicates = False
+
+    def build_object(pairs):
+        nonlocal duplicates
+        obj = dict(pairs)
+        if len(obj) != len(pairs):
+            duplicates = True
+        return obj
+
+    try:
+        return json.loads(text, object_pairs_hook=build_object), duplicates
+    except ValueError:
+        return None, False
+
+
+def redact_url(url: str) -> str:
+    """``url`` with its userinfo and secret-looking query parameters masked;
+    returned as given when it carries neither. The userinfo
+    (``https://user:password@host/``, or a bare token before the ``@``) is
+    masked whole rather than by part: a username alone is often the API key
+    (HTTP basic auth with an empty password), and the mask still shows that
+    credentials were there. A URL that cannot be parsed
+    (``https://[broken]?token=abc`` raises in ``urlsplit``) is replaced
+    whole: redaction runs inside the runner's error handling, where raising
+    would lose the failure event and the response."""
+    url = str(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return REDACTED
+    # An unencoded "@" is legal in the authority only as the userinfo
+    # delimiter, so everything before the last one is userinfo.
+    userinfo, at, host = parts.netloc.rpartition("@")
+    netloc = f"{REDACTED}@{host}" if at else parts.netloc
+    query = _redact_query(parts.query) if parts.query else parts.query
+    if netloc == parts.netloc and query == parts.query:
+        return url
+    return urlunsplit(parts._replace(netloc=netloc, query=query))
+
+
+def _redact_query(query: str) -> str:
+    """``query`` with secret-looking parameters masked, by the decoded
+    parameter name (``api%5Fkey`` is ``api_key``), and re-encoded; returned
+    as given when nothing in it is secret."""
+    pairs = parse_qsl(query, keep_blank_values=True)
+    redacted = [(key, REDACTED if _is_sensitive_key(key) and value else value) for key, value in pairs]
+    return query if redacted == pairs else urlencode(redacted, safe="*")
+
+
+# Free text is scanned for two shapes, in one pass so that a pair inside a
+# URL is handled as part of that URL and never again on its own:
+#   - a URL, optionally quoted (httpx's raise_for_status() message quotes it
+#     in single quotes). It runs to the next whitespace, "<", ">" or double
+#     quote, apostrophes included, since those are legal in a query value.
+#     When the URL was quoted, one matching closing quote is taken back off
+#     the end; whatever else trails a sensitive value is masked along with
+#     it rather than guessed at.
+#   - a bare key=value pair. The value runs to the next whitespace, a
+#     quoted run ("hunter two", whitespace and all) counting as one piece,
+#     so a URL or a quoted string is the whole value. A sensitive key (its
+#     name decoded first: %74oken is token) has the whole value masked. An
+#     innocent key's value is scanned again on its own, so "url=https://
+#     x?token=t" still has its query masked and a pair quoted inside a
+#     value is still found.
+# A key starts only where a run of key characters starts. A start inside the
+# run could only find the "=" the run's start already found (the key is
+# greedy), and retrying from every position of a long run with no "=" (a JWT,
+# a hex blob) took quadratic time inside the async error handling.
+_URL_OR_PAIR = re.compile(
+    r"""(?P<quote>['"])?(?P<url>https?://[^\s<>"]+)"""
+    r"""|(?<![A-Za-z0-9_.\-\[\]%])(?P<key>[A-Za-z0-9_.\-\[\]%]+)=(?P<value>(?:"[^"]*"|'[^']*'|[^\s])+)"""
+)
+
+
+def redact_text(text: Optional[str]) -> str:
+    """``text`` with the secret-looking query parameters of every URL in it
+    masked, and every bare secret-looking ``key=value`` pair too, by the
+    same key rules as the structured fields.
+
+    For free text that cannot be walked by key: str(exc) and the traceback
+    attached to a failure event. An httpx ``HTTPStatusError`` from
+    ``raise_for_status()`` names the full request URL, query string
+    included, and the traceback repeats it (and any chained cause's). The
+    URL's query is parsed exactly as ``redact_url`` parses the structured
+    ``request_url``, so the two can never disagree on what is secret.
+    """
+    return _redact_text(text, depth=0) if text else (text or "")
+
+
+# How deep an innocent value is rescanned ("x=y=z=..."): past this the value
+# is masked whole rather than let a pathological string recurse without end,
+# since this runs inside the runner's error handling.
+_RESCAN_DEPTH = 8
+
+
+def _redact_text(text: str, depth: int) -> str:
+    def mask(match):
+        url = match.group("url")
+        if url is not None:
+            quote = match.group("quote") or ""
+            closing = quote if quote and url.endswith(quote) else ""
+            url = url[:len(url) - len(closing)]
+            return f"{quote}{redact_url(url)}{closing}"
+        key, value = match.group("key"), match.group("value")
+        if _is_sensitive_key(unquote(key)) or depth >= _RESCAN_DEPTH:
+            return f"{key}={REDACTED}"
+        return f"{key}={_redact_text(value, depth + 1)}"
+
+    return _URL_OR_PAIR.sub(mask, text)
