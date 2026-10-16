@@ -187,19 +187,20 @@ class PullEventsConfig(PullActionConfiguration):
         # A blank row left in the portal form arrives as None or "". Drop blanks
         # (and duplicates) rather than failing the whole config; a list left
         # empty becomes None so the filter rule still demands a bounding box.
+        # Like taxa, list items are split too: "123,456" pasted into one row is
+        # two projects (IDs and slugs never contain commas).
         if v is None:
             return None
-        items = v.split(",") if isinstance(v, str) else v
-        if not isinstance(items, (list, tuple, set)):
-            items = [items]
+        items = v if isinstance(v, (list, tuple, set)) else [v]
         cleaned = {}
         for item in items:
             if item is None:
                 continue
             if isinstance(item, bool) or not isinstance(item, (str, int)):
                 raise ValueError(f"Project IDs must be strings or integers, got {item!r}.")
-            if str(item).strip():
-                cleaned[str(item).strip()] = None
+            for part in str(item).split(","):
+                if part.strip():
+                    cleaned[part.strip()] = None
         return list(cleaned) or None
 
     # Temporary validator to cope with a limitation in Gundi Portal.

@@ -177,9 +177,6 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     # the auth row's api_key.
     logger.info(f"Executing 'pull_events' action with integration {integration.id} and action_config {action_config}...")
 
-    state = await state_manager.get_state(integration.id, "pull_events")
-    load_since = _get_load_since(state, action_config.days_to_load)
-
     if not action_config.projects and not action_config.bounding_box:
         # The config validator already rejects this; this guards configs that
         # bypass it, since the query would pull every observation worldwide.
@@ -187,6 +184,9 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         return {'result': {'events_extracted': 0,
                            'events_updated': 0,
                            'photos_attached': 0}}
+
+    state = await state_manager.get_state(integration.id, "pull_events")
+    load_since = _get_load_since(state, action_config.days_to_load)
 
     projects = action_config.projects
     if projects:

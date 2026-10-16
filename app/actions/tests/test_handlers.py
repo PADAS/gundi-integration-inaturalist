@@ -626,6 +626,9 @@ async def test_action_pull_events_refuses_an_unbounded_config(mocker):
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
     get_observations.assert_not_called()
     find.assert_not_called()
+    # Refused before any state is read.
+    from app.actions import handlers
+    handlers.state_manager.get_state.assert_not_called()
     error = activity.call_args.kwargs
     assert error["level"] == LogLevel.ERROR
     assert "no project and no bounding box" in error["title"]

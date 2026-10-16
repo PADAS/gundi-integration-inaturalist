@@ -268,6 +268,7 @@ def test_config_without_projects_or_taxa_still_parses():
     (["123", ""], ["123"]),
     ([None, " 123 ", "\t"], ["123"]),
     (["123", "abc", "123"], ["123", "abc"]),
+    (["123,456", "abc"], ["123", "456", "abc"]),
     ([123], ["123"]),
     ("123, abc,", ["123", "abc"]),
 ])
@@ -280,7 +281,7 @@ def test_blank_project_ids_are_dropped(projects, expected):
 @pytest.mark.parametrize("projects", [[""], ["  "], [None], [" \t"], ""])
 def test_only_blank_project_ids_mean_no_projects(projects):
     """Blank entries are dropped before the filter rule, so a config whose only
-    projects are blank still needs a bounding box (or taxa)."""
+    projects are blank still needs a bounding box."""
     with pytest.raises(pydantic.ValidationError, match="Choose at least one project"):
         PullEventsConfig(days_to_load=3, projects=projects)
     config = PullEventsConfig(days_to_load=3, projects=projects, bounding_box="[1, 1, 0, 0]")
