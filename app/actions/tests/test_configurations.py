@@ -125,6 +125,14 @@ def test_gundi_reference_annotations_match_registered_reference_actions():
             assert not reference_actions[ref["action"]].__fields__[ref["search"]["param"]].required
             min_chars = ref["search"]["min_chars"]
             assert type(min_chars) is int and min_chars >= 1
+        if "resolve" in ref:
+            # The resolve param labels saved values: optional, like search, and
+            # distinct from every other param the widget sends.
+            param = ref["resolve"]["param"]
+            assert param in query_fields
+            assert param not in ref.get("params", {})
+            assert param != ref.get("search", {}).get("param")
+            assert not reference_actions[ref["action"]].__fields__[param].required
 
 
 def test_gundi_reference_annotations_sit_on_the_right_nodes():
@@ -195,6 +203,7 @@ def test_taxa_gundi_reference_is_a_search_annotation():
     assert taxa_ref["action"] == "list_taxa"
     assert taxa_ref["params"] == {}
     assert taxa_ref["search"] == {"param": "q", "min_chars": 2}
+    assert taxa_ref["resolve"] == {"param": "ids"}
 
 
 def test_bounding_box_requests_the_bbox_widget():
