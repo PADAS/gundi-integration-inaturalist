@@ -186,7 +186,7 @@ def inaturalist_integration_v2_with_taxa_string():
     'projects': [],
     'event_type': 'inat_observation',
     'annotations': '',
-    'bounding_box': '',
+    'bounding_box': '[1, 1, 0, 0]',
     'days_to_load': 5,
     'event_prefix': 'iNat: ',
     'quality_grade': [],

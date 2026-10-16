@@ -91,12 +91,12 @@ class PullEventsConfig(PullActionConfiguration):
         description="Required when no project is selected. Draw a box on the map or enter its coordinates.")
 
     projects: Optional[List[pydantic.constr(strip_whitespace=True, min_length=1, regex=r"^\s*\S")]] = pydantic.Field(title = "Project IDs",
-        description="List of project IDs to pull from iNaturalist. Leave empty to filter by taxa and area instead.")
+        description="List of project IDs to pull from iNaturalist. Leave empty to filter by area instead.")
     
     taxa: Optional[List[pydantic.constr(regex=r"^\d+$")]] = pydantic.Field(
         None,
         title="Taxa IDs",
-        description="iNaturalist taxa IDs for which to load observations. Required when no project is selected.",
+        description="iNaturalist taxa IDs for which to load observations. Leave empty to load all taxa in the selected projects or bounding box.",
     )
     
     quality_grade: Optional[List[Literal["casual", "needs_id", "research"]]] = pydantic.Field(
@@ -182,6 +182,27 @@ class PullEventsConfig(PullActionConfiguration):
                     cleaned[part.strip()] = None
         return list(cleaned) or None
 
+    @pydantic.validator("projects", pre=True, always=True)
+    def drop_blank_projects(cls, v):
+        # A blank row left in the portal form arrives as None or "". Drop blanks
+        # (and duplicates) rather than failing the whole config; a list left
+        # empty becomes None so the filter rule still demands a bounding box.
+        # Like taxa, list items are split too: "123,456" pasted into one row is
+        # two projects (IDs and slugs never contain commas).
+        if v is None:
+            return None
+        items = v if isinstance(v, (list, tuple, set)) else [v]
+        cleaned = {}
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, bool) or not isinstance(item, (str, int)):
+                raise ValueError(f"Project IDs must be strings or integers, got {item!r}.")
+            for part in str(item).split(","):
+                if part.strip():
+                    cleaned[part.strip()] = None
+        return list(cleaned) or None
+
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
     def validate_region_code(cls, v, values):
@@ -240,16 +261,12 @@ class PullEventsConfig(PullActionConfiguration):
     @pydantic.root_validator(skip_on_failure=True)
     def require_some_filter(cls, values):
         # Backend half of the portal's filter rule, for configs saved outside the
-        # portal form. Only a config with no project, no taxa and no bounding box
-        # is rejected: it would pull every observation worldwide. Legacy configs
-        # with taxa only or a bounding box only keep loading.
-        # taxa may arrive as a comma-separated string or as a list of IDs.
-        taxa = values.get("taxa")
-        taxa_items = taxa.split(",") if isinstance(taxa, str) else (taxa or [])
-        has_taxa = any(str(t).strip() for t in taxa_items)
-        if not values.get("projects") and not has_taxa and not values.get("bounding_box"):
+        # portal form. A config with no project and no bounding box is rejected:
+        # it would pull worldwide (taxa alone don't bound the area). Scheduled
+        # runs of such a config are skipped with an activity-log warning.
+        if not values.get("projects") and not values.get("bounding_box"):
             raise ValueError(
-                "Choose at least one project, or enter taxa IDs together with a bounding box."
+                "Choose at least one project, or a bounding box."
             )
         return values
 
@@ -279,7 +296,7 @@ class PullEventsConfig(PullActionConfiguration):
     class Config:
         schema_extra = {
             # Shown by the portal as a note under the section heading.
-            "description": "Brings iNaturalist observations in as events. Choose at least one project, or enter taxa IDs together with a bounding box.",
+            "description": "Brings iNaturalist observations in as events. Choose at least one project, or a bounding box. Taxa IDs are optional and narrow the pull.",
             "examples": [
                 {
                     "": 47.5218082,
@@ -290,7 +307,8 @@ class PullEventsConfig(PullActionConfiguration):
             ],
             "required": ["days_to_load"],
             # Portal-enforced filter rule: a project is enough on its own; without
-            # one, taxa AND a bounding box are both required. Both branches repeat
+            # one, a bounding box is required. Taxa are optional either way (an
+            # empty list means all taxa). Both branches repeat
             # the base required list because legacy portal screens replace it with
             # the branch's list instead of merging, and only apply if/then/else
             # when both branches are present.
@@ -299,14 +317,11 @@ class PullEventsConfig(PullActionConfiguration):
                     "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
                 }
             },
-            # `required` only checks the key is there, so minItems and the pattern
-            # make an empty taxa list or a blank box count as missing: both mean
-            # "no filter". They sit in this branch only, since saved configs with
-            # a project can carry an empty taxa list.
+            # `required` only checks the key is there, so the pattern makes a
+            # blank box count as missing: it means "no area filter".
             "then": {
-                "required": ["days_to_load", "taxa", "bounding_box"],
+                "required": ["days_to_load", "bounding_box"],
                 "properties": {
-                    "taxa": {"type": "array", "minItems": 1},
                     "bounding_box": {"type": "string", "pattern": r"\S"},
                 },
             },
