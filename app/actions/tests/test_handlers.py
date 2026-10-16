@@ -595,3 +595,17 @@ async def test_action_pull_events_does_not_look_up_projects_when_none_are_saved(
 
     find.assert_not_called()
     get_observations.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_drops_blank_saved_projects(mocker):
+    # A config saved with a blank portal row still pulls with its real projects.
+    integration, get_observations, find, _ = _unknown_projects_test_setup(
+        mocker, existing=lambda values: values
+    )
+    config = PullEventsConfig.parse_obj({"days_to_load": 3, "projects": [" 123 ", None, ""]})
+
+    await action_pull_events(integration, config)
+
+    find.assert_called_once_with(["123"])
+    assert get_observations.call_args.kwargs["projects"] == ["123"]

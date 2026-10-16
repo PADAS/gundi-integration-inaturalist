@@ -202,9 +202,10 @@ def test_bounding_box_requests_the_bbox_widget():
     assert ui["bounding_box"] == {"ui:widget": "bbox"}
 
 
-def test_schema_requires_taxa_and_bounding_box_only_without_projects():
+def test_schema_requires_bounding_box_only_without_projects():
     """The portal enforces this rule from the registered schema: a project is
-    enough on its own; without one, taxa and a bounding box are both required."""
+    enough on its own; without one, a bounding box is required. Taxa are
+    always optional (empty means all taxa)."""
     schema = PullEventsConfig.schema()
     assert schema["required"] == ["days_to_load"]
     assert schema["if"] == {
@@ -212,7 +213,7 @@ def test_schema_requires_taxa_and_bounding_box_only_without_projects():
             "projects": {"anyOf": [{"type": "null"}, {"type": "array", "maxItems": 0}]}
         }
     }
-    assert schema["then"]["required"] == ["days_to_load", "taxa", "bounding_box"]
+    assert schema["then"]["required"] == ["days_to_load", "bounding_box"]
     assert schema["else"] == {"required": ["days_to_load"]}
 
 
@@ -232,10 +233,12 @@ def test_schema_requires_real_bounding_box_without_projects(value, accepted):
     assert bool(re.search(rule["pattern"], value)) is accepted
 
 
-def test_schema_requires_nonempty_taxa_without_projects():
-    """Without a project, an empty taxa list must count as missing."""
-    rule = PullEventsConfig.schema()["then"]["properties"]["taxa"]
-    assert rule == {"type": "array", "minItems": 1}
+def test_schema_allows_empty_taxa_without_projects():
+    """A bounding box alone is enough; an empty taxa list means all taxa. A
+    minItems rule here also made the portal seed a blank taxa row."""
+    schema = PullEventsConfig.schema()
+    assert "taxa" not in schema["then"].get("properties", {})
+    assert "minItems" not in schema["properties"]["taxa"]
 
 
 @pytest.mark.parametrize("value,accepted", [
@@ -261,10 +264,31 @@ def test_config_without_projects_or_taxa_still_parses():
     assert config.projects is None and config.taxa is None
 
 
-@pytest.mark.parametrize("projects", [[""], ["  "], ["123", ""], [" \t"]])
-def test_blank_project_ids_are_rejected(projects):
-    """A blank entry would count as a project in the schema rule yet be dropped
-    by pyinaturalist, leaving a query with no project, taxa or area filter."""
+@pytest.mark.parametrize("projects, expected", [
+    (["123", ""], ["123"]),
+    ([None, " 123 ", "\t"], ["123"]),
+    (["123", "abc", "123"], ["123", "abc"]),
+    ([123], ["123"]),
+    ("123, abc,", ["123", "abc"]),
+])
+def test_blank_project_ids_are_dropped(projects, expected):
+    """A blank row left in the portal form must not fail the whole config."""
+    config = PullEventsConfig(days_to_load=3, projects=projects)
+    assert config.projects == expected
+
+
+@pytest.mark.parametrize("projects", [[""], ["  "], [None], [" \t"], ""])
+def test_only_blank_project_ids_mean_no_projects(projects):
+    """Blank entries are dropped before the filter rule, so a config whose only
+    projects are blank still needs a bounding box (or taxa)."""
+    with pytest.raises(pydantic.ValidationError, match="Choose at least one project"):
+        PullEventsConfig(days_to_load=3, projects=projects)
+    config = PullEventsConfig(days_to_load=3, projects=projects, bounding_box="[1, 1, 0, 0]")
+    assert config.projects is None
+
+
+@pytest.mark.parametrize("projects", [[True], [{"id": 1}], [1.5]])
+def test_project_ids_reject_non_id_values(projects):
     with pytest.raises(pydantic.ValidationError):
         PullEventsConfig(days_to_load=3, projects=projects)
 
@@ -283,17 +307,17 @@ def test_project_ids_are_trimmed():
     assert config.projects == ["123"]
 
 
-def test_schema_explains_project_or_taxa_with_bounding_box_rule():
+def test_schema_explains_project_or_bounding_box_rule():
     """The portal shows the root description under the section heading and each
     field description under its field; conditional requirements get no star."""
     schema = PullEventsConfig.schema()
     assert schema["description"] == (
         "Brings iNaturalist observations in as events. "
-        "Choose at least one project, or enter taxa IDs together with a bounding box."
+        "Choose at least one project, or a bounding box. Taxa IDs are optional and narrow the pull."
     )
     props = schema["properties"]
-    assert "Leave empty to filter by taxa and area instead." in props["projects"]["description"]
-    assert "Required when no project is selected." in props["taxa"]["description"]
+    assert "Leave empty to filter by area instead." in props["projects"]["description"]
+    assert "Leave empty to load all taxa" in props["taxa"]["description"]
     assert props["bounding_box"]["description"] == (
         "Required when no project is selected. "
         "Draw a box on the map or enter its coordinates."
