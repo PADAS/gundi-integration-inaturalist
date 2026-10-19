@@ -392,3 +392,12 @@ def test_rejects_taxa_without_project_or_bounding_box(taxa):
     """Taxa alone don't bound the area, so the pull would be worldwide."""
     with pytest.raises(pydantic.ValidationError, match="Choose at least one project"):
         PullEventsConfig(days_to_load=3, taxa=taxa)
+
+
+def test_annotations_ask_for_one_row_per_filter():
+    """Portals that know the row layout render each filter as [term] [values]
+    [delete] under one header line; older portals ignore the option and stack."""
+    ui = PullEventsConfig.ui_schema()
+    assert ui["annotations"]["ui:options"] == {"layout": "row"}
+    # The row layout is opt-in on the array only; the items keep their references.
+    assert "gundi:reference" in ui["annotations"]["items"]["term"]

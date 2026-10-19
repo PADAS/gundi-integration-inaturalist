@@ -162,7 +162,9 @@ class PullEventsConfig(PullActionConfiguration):
         base["projects"] = {"items": {"gundi:reference": _reference(
             "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
         )}}
-        base["annotations"] = {"items": {
+        # One row per filter ([term] [values] [delete]) in portals with the row
+        # layout; older portals ignore the option and stack the fields.
+        base["annotations"] = {"ui:options": {"layout": "row"}, "items": {
             "term": {"gundi:reference": _reference("list_annotation_terms")},
             "values": {"items": {"gundi:reference": _reference(
                 "list_annotation_values", params={"term": {"$data": "../term"}},
