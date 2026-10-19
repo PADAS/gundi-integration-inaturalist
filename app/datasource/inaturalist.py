@@ -18,8 +18,8 @@ from pyinaturalist import (
     get_observations_v2,
     get_projects,
     get_projects_by_id,
+    get_taxa,
     get_taxa_autocomplete,
-    get_taxa_by_id,
 )
 
 from app.services.errors import IntegrationConnectionError
@@ -136,8 +136,10 @@ def search_taxa(q: str) -> Dict:
         raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa search: {e}") from e
 
 
-# iNat's taxa-by-ID endpoint returns at most 30 records per request.
-TAXA_BY_ID_BATCH_SIZE = 30
+# Saved taxa are looked up through the taxa search (`id` filter), which takes
+# up to 500 IDs per request; the by-ID endpoint takes 30, so a config with
+# hundreds of taxa ran past the typeahead's rate-limit bucket (5 per 5 s).
+TAXA_BY_ID_BATCH_SIZE = 500
 
 
 def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
@@ -149,14 +151,15 @@ def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
     for start in range(0, len(numeric), TAXA_BY_ID_BATCH_SIZE):
         batch = numeric[start:start + TAXA_BY_ID_BATCH_SIZE]
         try:
-            response = get_taxa_by_id(batch, session=_typeahead_session())
+            # is_active="any": a saved taxon may have been inactivated since (a
+            # taxonomy change); the search hides those by default, the by-ID
+            # endpoint didn't.
+            response = get_taxa(
+                id=batch, is_active="any", per_page=TAXA_BY_ID_BATCH_SIZE,
+                session=_typeahead_session(),
+            )
         except (requests.Timeout, requests.ConnectionError) as e:
             raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa lookup: {e}") from e
-        except requests.HTTPError as e:
-            # A lookup where no ID exists answers 404; that's "none found".
-            if e.response is not None and e.response.status_code == 404:
-                continue
-            raise
         taxa.extend(response.get("results", []))
     return taxa
 
