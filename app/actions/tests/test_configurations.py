@@ -154,7 +154,10 @@ def test_gundi_reference_annotations_sit_on_the_right_nodes():
 
     projects_ref = ui["projects"]["items"]["gundi:reference"]
     assert projects_ref["action"] == "list_projects"
-    assert projects_ref["params"] == {"bounding_box": {"$data": "../bounding_box"}}
+    # Optional: a project-only config has no box, and its saved projects still
+    # need labels (resolve), so a blank box mustn't block the widget's fetches.
+    assert projects_ref["params"] == {"bounding_box": {"$data": "../bounding_box", "optional": True}}
+    assert projects_ref["resolve"] == {"param": "ids"}
 
     term_ref = ui["annotations"]["items"]["term"]["gundi:reference"]
     assert term_ref["action"] == "list_annotation_terms"

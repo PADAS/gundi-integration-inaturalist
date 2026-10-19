@@ -264,17 +264,73 @@ def test_list_projects_query_rejects_bad_bounding_box():
 
 
 @pytest.mark.asyncio
+async def test_list_projects_without_a_bounding_box_lists_nothing(mocker, inaturalist_integration_v2):
+    """The bounding_box param is optional (a project-only config has none):
+    the portal still fetches, gets an empty list, and hints at the box."""
+    from app.actions import handlers
+    from app.actions.configurations import ListProjectsQuery
+
+    search = mocker.patch.object(handlers, "search_projects_near")
+
+    result = await handlers.action_list_projects(inaturalist_integration_v2, ListProjectsQuery())
+
+    search.assert_not_called()
+    assert result["options"] == [] and result["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_projects_resolves_saved_values_in_order(mocker, inaturalist_integration_v2):
+    """The resolve contract: label saved IDs and slugs, with or without a box."""
+    from app.actions import handlers
+    from app.actions.configurations import ListProjectsQuery
+
+    search = mocker.patch.object(handlers, "search_projects_near")
+    lookup = mocker.patch.object(handlers, "get_projects_by_values", return_value={
+        "456": {"id": 456, "title": "WA Invasives"},
+        "Puget-Sound": {"id": 100, "slug": "puget-sound", "title": "Puget Sound Seabirds"},
+        "789": {"id": 789},
+    })
+
+    result = await handlers.action_list_projects(
+        inaturalist_integration_v2,
+        ListProjectsQuery(
+            bounding_box="[47.7, -122.2, 47.4, -122.5]", ids=["Puget-Sound", "999", "456", "789"],
+        ),
+    )
+
+    search.assert_not_called()
+    lookup.assert_called_once_with(["Puget-Sound", "999", "456", "789"])
+    # Asked order and spelling (a slug stays a slug: it's the saved value),
+    # unknown values left out (the portal shows them raw).
+    assert [(o["value"], o["label"]) for o in result["options"]] == [
+        ("Puget-Sound", "Puget Sound Seabirds"), ("456", "WA Invasives"), ("789", "789"),
+    ]
+    assert result["truncated"] is False
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("100, puget-sound,", ["100", "puget-sound"]),
+    (["100", " ", None, "100", 7], ["100", "7"]),
+    ([], None),
+])
+def test_list_projects_query_coerces_ids(raw, expected):
+    from app.actions.configurations import ListProjectsQuery
+
+    assert ListProjectsQuery(ids=raw).ids == expected
+
+
+@pytest.mark.asyncio
 async def test_reference_action_missing_required_param_is_422(
     mocker, inaturalist_integration_v2, mock_publish_event
 ):
     """A reference query with a required param and no overrides must fail
     pydantic validation (422 path), not 404 and not execute."""
-    from app.actions.configurations import ListProjectsQuery
-    from app.actions.handlers import action_list_projects
+    from app.actions.configurations import ListAnnotationValuesQuery
+    from app.actions.handlers import action_list_annotation_values
 
     action_runner = _patch_runner(
         mocker,
-        {"list_projects": (action_list_projects, ListProjectsQuery, None)},
+        {"list_annotation_values": (action_list_annotation_values, ListAnnotationValuesQuery, None)},
         inaturalist_integration_v2,
     )
     mocker.patch.object(action_runner, "publish_event", mock_publish_event)
@@ -284,7 +340,7 @@ async def test_reference_action_missing_required_param_is_422(
 
     result = await action_runner.execute_action(
         integration_id=str(inaturalist_integration_v2.id),
-        action_id="list_projects",
+        action_id="list_annotation_values",
     )
 
     assert result == "validation-error-response"
