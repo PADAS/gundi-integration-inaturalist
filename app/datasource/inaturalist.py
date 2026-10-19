@@ -19,6 +19,7 @@ from pyinaturalist import (
     get_projects,
     get_projects_by_id,
     get_taxa_autocomplete,
+    get_taxa_by_id,
 )
 
 from app.services.errors import IntegrationConnectionError
@@ -133,6 +134,31 @@ def search_taxa(q: str) -> Dict:
         return get_taxa_autocomplete(q=q, session=_typeahead_session())
     except (requests.Timeout, requests.ConnectionError) as e:
         raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa search: {e}") from e
+
+
+# iNat's taxa-by-ID endpoint returns at most 30 records per request.
+TAXA_BY_ID_BATCH_SIZE = 30
+
+
+def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
+    """Taxa records for saved taxon IDs (public endpoint), so the portal can label
+    saved values. IDs iNat doesn't know are simply absent; values that can't be
+    a taxon ID (free text) are not sent."""
+    numeric = [int(i) for i in ids if i.isdigit()]
+    taxa = []
+    for start in range(0, len(numeric), TAXA_BY_ID_BATCH_SIZE):
+        batch = numeric[start:start + TAXA_BY_ID_BATCH_SIZE]
+        try:
+            response = get_taxa_by_id(batch, session=_typeahead_session())
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa lookup: {e}") from e
+        except requests.HTTPError as e:
+            # A lookup where no ID exists answers 404; that's "none found".
+            if e.response is not None and e.response.status_code == 404:
+                continue
+            raise
+        taxa.extend(response.get("results", []))
+    return taxa
 
 
 class INatRequestError(requests.HTTPError):
