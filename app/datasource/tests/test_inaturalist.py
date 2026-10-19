@@ -520,39 +520,45 @@ def test_find_existing_projects_with_nothing_to_look_up(mocker):
 # --- get_taxa_by_ids ---
 
 
+def _echo_taxa(id, **params):
+    return {"results": [{"id": i} for i in id]}
+
+
 def test_get_taxa_by_ids_batches_numeric_ids_only(mocker):
     from app.datasource import inaturalist
 
-    get_taxa_by_id = mocker.patch.object(
-        inaturalist, "get_taxa_by_id",
-        side_effect=lambda ids, session: {"results": [{"id": i} for i in ids]},
-    )
+    get_taxa = mocker.patch.object(inaturalist, "get_taxa", side_effect=_echo_taxa)
     ids = [str(i) for i in range(1, inaturalist.TAXA_BY_ID_BATCH_SIZE + 3)] + ["leopard"]
 
     taxa = inaturalist.get_taxa_by_ids(ids)
 
     assert [t["id"] for t in taxa] == list(range(1, inaturalist.TAXA_BY_ID_BATCH_SIZE + 3))
-    assert [len(c.args[0]) for c in get_taxa_by_id.call_args_list] == [inaturalist.TAXA_BY_ID_BATCH_SIZE, 2]
-    assert all(c.kwargs["session"] is inaturalist._typeahead_session() for c in get_taxa_by_id.call_args_list)
+    assert [len(c.kwargs["id"]) for c in get_taxa.call_args_list] == [inaturalist.TAXA_BY_ID_BATCH_SIZE, 2]
+    for call in get_taxa.call_args_list:
+        assert call.kwargs["session"] is inaturalist._typeahead_session()
+        # Saved taxa can be inactive since; the search hides those by default.
+        assert call.kwargs["is_active"] == "any"
+        assert call.kwargs["per_page"] == inaturalist.TAXA_BY_ID_BATCH_SIZE
 
 
-def test_get_taxa_by_ids_treats_404_as_none_found(mocker):
+def test_get_taxa_by_ids_labels_hundreds_of_ids_within_the_rate_limit(mocker):
+    """A config with hundreds of saved taxa: 30 IDs per request took one request
+    per 30, and the 6th found the 5-per-5s bucket full (BucketFullException)."""
     from app.datasource import inaturalist
 
-    response = requests.Response()
-    response.status_code = 404
-    mocker.patch.object(
-        inaturalist, "get_taxa_by_id", side_effect=requests.HTTPError("404", response=response)
-    )
+    get_taxa = mocker.patch.object(inaturalist, "get_taxa", side_effect=_echo_taxa)
 
-    assert inaturalist.get_taxa_by_ids(["123"]) == []
+    taxa = inaturalist.get_taxa_by_ids([str(i) for i in range(1, 301)])
+
+    assert len(taxa) == 300
+    assert get_taxa.call_count == 1
 
 
 def test_get_taxa_by_ids_reports_an_unreachable_inaturalist(mocker):
     from app.datasource import inaturalist
     from app.services.errors import IntegrationConnectionError
 
-    mocker.patch.object(inaturalist, "get_taxa_by_id", side_effect=requests.ReadTimeout("read timed out"))
+    mocker.patch.object(inaturalist, "get_taxa", side_effect=requests.ReadTimeout("read timed out"))
 
     with pytest.raises(IntegrationConnectionError, match="taxa lookup"):
         inaturalist.get_taxa_by_ids(["123"])
@@ -561,6 +567,6 @@ def test_get_taxa_by_ids_reports_an_unreachable_inaturalist(mocker):
 def test_get_taxa_by_ids_sends_nothing_without_numeric_ids(mocker):
     from app.datasource import inaturalist
 
-    get_taxa_by_id = mocker.patch.object(inaturalist, "get_taxa_by_id")
+    get_taxa = mocker.patch.object(inaturalist, "get_taxa")
     assert inaturalist.get_taxa_by_ids(["leopard"]) == []
-    get_taxa_by_id.assert_not_called()
+    get_taxa.assert_not_called()
