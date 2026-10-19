@@ -33,6 +33,18 @@ def _reference(
     return annotation
 
 
+def _coerce_id_list(cls, v):
+    """Resolve-param coercion: accept a list or a comma-separated string; drop
+    blanks and duplicates."""
+    if v is None:
+        return None
+    items = v.split(",") if isinstance(v, str) else v
+    if not isinstance(items, (list, tuple, set)):
+        items = [items]
+    cleaned = {str(i).strip(): None for i in items if i is not None and str(i).strip()}
+    return list(cleaned) or None
+
+
 def parse_bounding_box(v):
     """Parse and validate a JSON-encoded '[ne_lat, ne_lng, sw_lat, sw_lng]' string."""
     if not v:
@@ -160,7 +172,9 @@ class PullEventsConfig(PullActionConfiguration):
         # value stays the JSON string '[ne_lat, ne_lng, sw_lat, sw_lng]'.
         base["bounding_box"] = {**base.get("bounding_box", {}), "ui:widget": "bbox"}
         base["projects"] = {"items": {"gundi:reference": _reference(
-            "list_projects", params={"bounding_box": {"$data": "../bounding_box"}},
+            "list_projects",
+            params={"bounding_box": {"$data": "../bounding_box", "optional": True}},
+            resolve={"param": "ids"},
         )}}
         base["annotations"] = {"items": {
             "term": {"gundi:reference": _reference("list_annotation_terms")},
@@ -347,19 +361,28 @@ class PullEventsConfig(PullActionConfiguration):
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):
-    """Reference query: iNaturalist projects near the configured bounding box."""
-    bounding_box: str = pydantic.Field(
-        ...,
+    """Reference query: iNaturalist projects near the configured bounding box.
+
+    bounding_box is optional: a project-only config has none, and its saved
+    projects still need labels through ids (the resolve contract). Without a
+    box there is nothing to search near, so the list is empty.
+    """
+    bounding_box: Optional[str] = pydantic.Field(
+        None,
         title="Bounding box",
         description="Same JSON format as the pull_events bounding_box: [ne_lat, ne_lng, sw_lat, sw_lng].",
+    )
+    ids: Optional[List[str]] = pydantic.Field(
+        None,
+        title="Project IDs or slugs",
+        description="Saved values to label (the resolve contract): returns these projects instead of searching.",
     )
 
     @pydantic.validator("bounding_box")
     def validate_bounding_box(cls, v):
-        parsed = parse_bounding_box(v)
-        if parsed is None:
-            raise ValueError("bounding_box is required to search for nearby projects.")
-        return parsed
+        return parse_bounding_box(v)
+
+    _coerce_ids = pydantic.validator("ids", pre=True, allow_reuse=True)(_coerce_id_list)
 
 
 class ListAnnotationTermsQuery(ReferenceActionConfiguration):
@@ -385,13 +408,4 @@ class ListTaxaQuery(ReferenceActionConfiguration):
         description="Saved values to label (the resolve contract): returns these taxa instead of searching.",
     )
 
-    @pydantic.validator("ids", pre=True)
-    def coerce_ids(cls, v):
-        # Accept a list or a comma-separated string; drop blanks and duplicates.
-        if v is None:
-            return None
-        items = v.split(",") if isinstance(v, str) else v
-        if not isinstance(items, (list, tuple, set)):
-            items = [items]
-        cleaned = {str(i).strip(): None for i in items if i is not None and str(i).strip()}
-        return list(cleaned) or None
+    _coerce_ids = pydantic.validator("ids", pre=True, allow_reuse=True)(_coerce_id_list)

@@ -44,6 +44,8 @@ MAX_PROJECT_SEARCH_RADIUS_KM = 500.0
 
 # The by-ID project endpoint takes at most this many IDs or slugs per request.
 PROJECTS_BY_ID_BATCH_SIZE = 10
+# The project search's id filter takes far more numeric IDs per request.
+PROJECTS_SEARCH_BATCH_SIZE = 200
 # A value that could be a project ID or slug. The endpoint rejects the whole
 # request over one value that is neither (a space gives 422, a "/" 404).
 PROJECT_ID_OR_SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -193,20 +195,46 @@ def _error_detail(response) -> Optional[str]:
     return text[:500] or None
 
 
+def _projects_by_value(values: List[str], **session) -> Dict[str, Dict]:
+    """Project records for saved values (numeric IDs or slugs), keyed by the
+    saved spelling. Values that can't be an ID or slug are not sent."""
+    lookups = [v for v in values if PROJECT_ID_OR_SLUG.match(v)]
+    ids = [v for v in lookups if v.isdigit()]
+    slugs = [v for v in lookups if not v.isdigit()]
+    projects = []
+    # The project search's id filter takes many IDs per request; slugs only go
+    # through the by-ID endpoint (the search ignores a slug filter).
+    for start in range(0, len(ids), PROJECTS_SEARCH_BATCH_SIZE):
+        batch = ids[start:start + PROJECTS_SEARCH_BATCH_SIZE]
+        projects.extend(get_projects(id=batch, per_page=len(batch), **session).get("results", []))
+    for start in range(0, len(slugs), PROJECTS_BY_ID_BATCH_SIZE):
+        batch = slugs[start:start + PROJECTS_BY_ID_BATCH_SIZE]
+        projects.extend(get_projects_by_id(batch, **session).get("results", []))
+    by_key = {}
+    for project in projects:
+        if project.get("id") is not None:
+            by_key[str(project["id"])] = project
+        if project.get("slug"):
+            by_key[project["slug"].lower()] = project
+    return {v: by_key.get(v) or by_key[v.lower()] for v in values if v in by_key or v.lower() in by_key}
+
+
 def find_existing_projects(values: List[str]) -> List[str]:
     """The saved project values (numeric IDs or slugs) that exist on iNaturalist,
     in their original order and spelling. Values that can't be an ID or slug
     are treated as unknown without being sent."""
-    lookups = [v for v in values if PROJECT_ID_OR_SLUG.match(v)]
-    found = set()
-    for start in range(0, len(lookups), PROJECTS_BY_ID_BATCH_SIZE):
-        response = get_projects_by_id(lookups[start:start + PROJECTS_BY_ID_BATCH_SIZE])
-        for project in response.get("results", []):
-            if project.get("id") is not None:
-                found.add(str(project["id"]))
-            if project.get("slug"):
-                found.add(project["slug"].lower())
-    return [v for v in values if v in found or v.lower() in found]
+    found = _projects_by_value(values)
+    return [v for v in values if v in found]
+
+
+def get_projects_by_values(values: List[str]) -> Dict[str, Dict]:
+    """Project records for saved values, keyed by the saved spelling, so the
+    portal can label them (the resolve contract). Interactive, so it uses the
+    fail-fast typeahead session; values iNat doesn't know are absent."""
+    try:
+        return _projects_by_value(values, session=_typeahead_session())
+    except (requests.Timeout, requests.ConnectionError) as e:
+        raise IntegrationConnectionError(f"iNaturalist did not respond to the project lookup: {e}") from e
 
 
 def _call_inat(**params) -> Dict:

@@ -31,6 +31,7 @@ from app.datasource.inaturalist import (
     get_observations,
     bbox_to_search_circle,
     find_existing_projects,
+    get_projects_by_values,
     list_controlled_terms,
     search_projects_near,
     search_taxa,
@@ -522,7 +523,22 @@ async def action_list_projects(integration: Integration, action_config: ListProj
 
     Uses the public project-search endpoint (no auth), nearest-first, one page —
     the portal's combobox keeps free text for anything beyond the cap.
+
+    With `ids` (the annotation's resolve param) it returns those projects
+    instead, in the order and spelling asked (a saved slug stays the option's
+    value), so the portal can label saved values the nearest-first page misses.
     """
+    if action_config.ids:
+        # Blocking (requests, plus a rate limiter that sleeps): off the event loop.
+        found = await asyncio.to_thread(get_projects_by_values, action_config.ids)
+        options = [
+            ReferenceOption(value=value, label=found[value].get("title") or value)
+            for value in action_config.ids
+            if value in found
+        ]
+        return ReferenceDataResponse(options=options, truncated=False).dict()
+    if action_config.bounding_box is None:
+        return ReferenceDataResponse(options=[], truncated=False).dict()
     lat, lng, radius_km = bbox_to_search_circle(action_config.bounding_box)
     response = search_projects_near(lat, lng, radius_km)
     results = response.get("results", [])

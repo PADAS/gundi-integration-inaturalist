@@ -480,41 +480,108 @@ def test_search_taxa_reports_an_unreachable_inaturalist(mocker, error):
 # --- find_existing_projects ---
 
 
+def _echo_projects_by_id(values, **kwargs):
+    return {"results": [{"id": 900 + i, "slug": v.lower()} for i, v in enumerate(values)]}
+
+
+def _echo_projects_search(id, **kwargs):
+    return {"results": [{"id": int(i), "slug": f"project-{i}"} for i in id]}
+
+
 def test_find_existing_projects_matches_ids_and_slugs_and_keeps_order(mocker):
     get_by_id = mocker.patch(
         "app.datasource.inaturalist.get_projects_by_id",
-        return_value={"results": [
-            {"id": 123, "slug": "real-project"},
-            {"id": 456, "slug": "other-project"},
-        ]},
+        return_value={"results": [{"id": 123, "slug": "real-project"}]},
+    )
+    search = mocker.patch(
+        "app.datasource.inaturalist.get_projects",
+        return_value={"results": [{"id": 456, "slug": "other-project"}]},
     )
 
-    existing = find_existing_projects(["Real-Project", "gone-project", "456"])
+    existing = find_existing_projects(["Real-Project", "gone-project", "456", "789"])
 
     assert existing == ["Real-Project", "456"]
-    get_by_id.assert_called_once_with(["Real-Project", "gone-project", "456"])
+    get_by_id.assert_called_once_with(["Real-Project", "gone-project"])
+    assert search.call_args.kwargs["id"] == ["456", "789"]
 
 
 def test_find_existing_projects_batches_and_never_sends_malformed_values(mocker):
+    from app.datasource import inaturalist
+
     get_by_id = mocker.patch(
-        "app.datasource.inaturalist.get_projects_by_id",
-        side_effect=lambda values: {"results": [{"id": int(v)} for v in values]},
+        "app.datasource.inaturalist.get_projects_by_id", side_effect=_echo_projects_by_id,
     )
-    values = [str(i) for i in range(1, 24)] + ["has space", "a/b"]
+    search = mocker.patch(
+        "app.datasource.inaturalist.get_projects", side_effect=_echo_projects_search,
+    )
+    ids = [str(i) for i in range(1, inaturalist.PROJECTS_SEARCH_BATCH_SIZE + 3)]
+    slugs = [f"slug-{i}" for i in range(23)]
 
-    existing = find_existing_projects(values)
+    existing = find_existing_projects(ids + slugs + ["has space", "a/b"])
 
-    batches = [call.args[0] for call in get_by_id.call_args_list]
-    assert [len(b) for b in batches] == [10, 10, 3]
-    assert "has space" not in sum(batches, []) and "a/b" not in sum(batches, [])
-    assert existing == [str(i) for i in range(1, 24)]
+    # Numeric IDs go through the search (many per request), slugs through the
+    # by-ID endpoint (10 per request).
+    assert [len(c.kwargs["id"]) for c in search.call_args_list] == [
+        inaturalist.PROJECTS_SEARCH_BATCH_SIZE, 2,
+    ]
+    assert all(c.kwargs["per_page"] == len(c.kwargs["id"]) for c in search.call_args_list)
+    slug_batches = [c.args[0] for c in get_by_id.call_args_list]
+    assert [len(b) for b in slug_batches] == [10, 10, 3]
+    assert "has space" not in sum(slug_batches, []) and "a/b" not in sum(slug_batches, [])
+    assert existing == ids + slugs
 
 
 def test_find_existing_projects_with_nothing_to_look_up(mocker):
     get_by_id = mocker.patch("app.datasource.inaturalist.get_projects_by_id")
+    search = mocker.patch("app.datasource.inaturalist.get_projects")
 
     assert find_existing_projects(["has space"]) == []
     get_by_id.assert_not_called()
+    search.assert_not_called()
+
+
+# --- get_projects_by_values ---
+
+
+def test_get_projects_by_values_keys_records_by_saved_spelling(mocker):
+    from app.datasource import inaturalist
+
+    get_by_id = mocker.patch.object(
+        inaturalist, "get_projects_by_id",
+        return_value={"results": [{"id": 123, "slug": "real-project", "title": "Real"}]},
+    )
+    search = mocker.patch.object(
+        inaturalist, "get_projects",
+        return_value={"results": [{"id": 456, "slug": "other", "title": "Other"}]},
+    )
+
+    found = inaturalist.get_projects_by_values(["Real-Project", "456", "789", "has space"])
+
+    assert {v: p["title"] for v, p in found.items()} == {"Real-Project": "Real", "456": "Other"}
+    # Interactive: both lookups use the fail-fast typeahead session.
+    assert get_by_id.call_args.kwargs["session"] is inaturalist._typeahead_session()
+    assert search.call_args.kwargs["session"] is inaturalist._typeahead_session()
+
+
+def test_get_projects_by_values_labels_hundreds_of_ids_in_one_request(mocker):
+    from app.datasource import inaturalist
+
+    search = mocker.patch.object(inaturalist, "get_projects", side_effect=_echo_projects_search)
+
+    found = inaturalist.get_projects_by_values([str(i) for i in range(1, 151)])
+
+    assert len(found) == 150
+    assert search.call_count == 1
+
+
+def test_get_projects_by_values_reports_an_unreachable_inaturalist(mocker):
+    from app.datasource import inaturalist
+    from app.services.errors import IntegrationConnectionError
+
+    mocker.patch.object(inaturalist, "get_projects", side_effect=requests.ReadTimeout("read timed out"))
+
+    with pytest.raises(IntegrationConnectionError, match="project lookup"):
+        inaturalist.get_projects_by_values(["123"])
 
 
 # --- get_taxa_by_ids ---
