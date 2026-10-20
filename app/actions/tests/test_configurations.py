@@ -404,3 +404,4 @@ def test_annotations_ask_for_one_row_per_filter():
     assert ui["annotations"]["ui:options"] == {"layout": "row"}
     # The row layout is opt-in on the array only; the items keep their references.
     assert "gundi:reference" in ui["annotations"]["items"]["term"]
+

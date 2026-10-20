@@ -5,7 +5,7 @@ import re
 import threading
 from datetime import datetime, timedelta
 from math import asin, ceil, cos, radians, sin, sqrt
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -144,12 +144,27 @@ def search_taxa(q: str) -> Dict:
 TAXA_BY_ID_BATCH_SIZE = 500
 
 
-def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
-    """Taxa records for saved taxon IDs (public endpoint), so the portal can label
-    saved values. IDs iNat doesn't know are simply absent; values that can't be
-    a taxon ID (free text) are not sent."""
-    numeric = [int(i) for i in ids if i.isdigit()]
-    taxa = []
+class INatRequestError(requests.HTTPError):
+    """An iNaturalist API request failed; carries the message iNat returned.
+
+    Subclasses requests.HTTPError so the request/response metadata that
+    action_runner._handle_error reports keeps flowing through.
+    """
+
+
+class INatIncompleteBatchError(INatRequestError):
+    """A by-ID taxa batch whose completeness cannot be established (paged,
+    missing count metadata, or malformed), so IDs absent from it must not be
+    treated as missing."""
+
+
+class TaxaLookup(NamedTuple):
+    found: Dict[int, Dict]  # taxon id -> full upstream record
+    missing: List[int]      # requested ids conclusively absent, in request order
+
+
+def _taxa_batches(numeric: List[int]) -> Iterator[Tuple[List[int], Dict]]:
+    """Yield (batch, response) for each by-ID taxa request."""
     for start in range(0, len(numeric), TAXA_BY_ID_BATCH_SIZE):
         batch = numeric[start:start + TAXA_BY_ID_BATCH_SIZE]
         try:
@@ -162,16 +177,49 @@ def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
             )
         except (requests.Timeout, requests.ConnectionError) as e:
             raise IntegrationConnectionError(f"iNaturalist did not respond to the taxa lookup: {e}") from e
+        yield batch, response
+
+
+def get_taxa_by_ids(ids: List[str]) -> List[Dict]:
+    """Taxa records for saved taxon IDs (public endpoint), so the portal can label
+    saved values. IDs iNat doesn't know are simply absent; values that can't be
+    a taxon ID (free text) are not sent."""
+    numeric = [int(i) for i in ids if i.isdigit()]
+    taxa = []
+    for _, response in _taxa_batches(numeric):
         taxa.extend(response.get("results", []))
     return taxa
 
 
-class INatRequestError(requests.HTTPError):
-    """An iNaturalist API request failed; carries the message iNat returned.
-
-    Subclasses requests.HTTPError so the request/response metadata that
-    action_runner._handle_error reports keeps flowing through.
-    """
+def lookup_taxa_by_ids(numeric_ids: List[int]) -> TaxaLookup:
+    """Like get_taxa_by_ids, but tells IDs iNat confirmed absent from IDs whose
+    status is unknown. A batch counts as complete only when total_results equals
+    the number of results returned and fits in one page; anything else raises
+    INatIncompleteBatchError rather than reporting a partial answer."""
+    found: Dict[int, Dict] = {}
+    missing: List[int] = []
+    for batch, response in _taxa_batches(numeric_ids):
+        results = response.get("results")
+        total = response.get("total_results")
+        if (
+            not isinstance(results, list)
+            or not isinstance(total, int) or isinstance(total, bool)
+            or total != len(results)
+            or total > TAXA_BY_ID_BATCH_SIZE
+        ):
+            raise INatIncompleteBatchError(
+                f"iNaturalist returned an incomplete taxa batch (total_results={total!r}, "
+                f"results={len(results) if isinstance(results, list) else type(results).__name__})"
+            )
+        batch_found: Dict[int, Dict] = {}
+        for taxon in results:
+            taxon_id = taxon.get("id") if isinstance(taxon, dict) else None
+            if not isinstance(taxon_id, int) or isinstance(taxon_id, bool):
+                raise INatIncompleteBatchError("iNaturalist returned a taxon record without an integer id")
+            batch_found[taxon_id] = taxon
+        found.update(batch_found)
+        missing.extend(i for i in batch if i not in batch_found)
+    return TaxaLookup(found, missing)
 
 
 def _error_detail(response) -> Optional[str]:

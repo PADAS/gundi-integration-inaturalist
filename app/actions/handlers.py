@@ -20,6 +20,7 @@ from app.actions.configurations import (
     ListAnnotationValuesQuery,
     ListTaxaQuery,
 )
+from app.actions import taxa_cache
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
 from app.services.activity_logger import activity_logger, ephemeral_run, log_action_activity
 from app.services.gundi import (
@@ -35,7 +36,6 @@ from app.datasource.inaturalist import (
     list_controlled_terms,
     search_projects_near,
     search_taxa,
-    get_taxa_by_ids,
 )
 from app.services.state import IntegrationStateManager
 
@@ -601,9 +601,7 @@ async def action_list_taxa(integration: Integration, action_config: ListTaxaQuer
     know are left out; the portal keeps showing them as raw values.
     """
     if action_config.ids:
-        # Blocking like search_taxa below, so it runs off the event loop too.
-        taxa = await asyncio.to_thread(get_taxa_by_ids, action_config.ids)
-        by_id = {str(t["id"]): t for t in taxa if t.get("id") is not None}
+        by_id = await taxa_cache.resolve_taxa(action_config.ids, taxa_cache.default_cache())
         options = [_taxon_option(by_id[i]) for i in action_config.ids if i in by_id]
         return ReferenceDataResponse(options=options, truncated=False).dict()
     query = (action_config.q or "").strip()

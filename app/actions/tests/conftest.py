@@ -469,3 +469,10 @@ def mock_get_observations_v2_empty_page_response():
         'results': []
     }
 
+
+
+@pytest.fixture(autouse=True)
+def taxa_cache_off(mocker):
+    """Reference-action tests exercise the legacy path unless they build a cache themselves."""
+    from app.actions import taxa_cache
+    mocker.patch.object(taxa_cache, "default_cache", return_value=None)

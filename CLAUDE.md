@@ -121,4 +121,4 @@ When changing state, preserve backward-compat reads of the legacy `"updated_to"`
 
 ## Key env vars (in addition to the standard Gundi template ones)
 
-The integration itself has no iNat-specific env vars — the iNat API key is per-integration config, not per-service env. Standard Gundi template variables (`GUNDI_API_BASE_URL`, `KEYCLOAK_*`, `REDIS_*`, `INTEGRATION_TYPE_SLUG`, `REGISTER_ON_START`) apply; see `.env.example` and `app/settings/base.py`.
+The iNat API key is per-integration config, not per-service env. The only iNat-specific env vars belong to the saved-taxa reference cache in `app/actions/taxa_cache.py`: `REDIS_REFERENCE_CACHE_DB` (default 3, never the state DB), `INAT_TAXA_CACHE_ENABLED` (default true; `false` is the rollback switch), `INAT_TAXA_CACHE_TTL_SECONDS` (86400), `INAT_TAXA_CACHE_MISSING_TTL_SECONDS` (300) and `INAT_TAXA_CACHE_TIMEOUT_SECONDS` (0.5, Redis connect/socket timeout). Standard Gundi template variables (`GUNDI_API_BASE_URL`, `KEYCLOAK_*`, `REDIS_*`, `INTEGRATION_TYPE_SLUG`, `REGISTER_ON_START`) apply; see `.env.example` and `app/settings/base.py`.

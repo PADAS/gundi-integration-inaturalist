@@ -433,8 +433,8 @@ async def test_list_taxa_resolves_saved_ids_in_order(mocker, inaturalist_integra
     from app.actions.configurations import ListTaxaQuery
 
     search = mocker.patch.object(handlers, "search_taxa")
-    lookup = mocker.patch.object(
-        handlers, "get_taxa_by_ids", return_value=list(reversed(TAXA_RESPONSE["results"]))
+    lookup = mocker.patch(
+        "app.actions.taxa_cache.get_taxa_by_ids", return_value=list(reversed(TAXA_RESPONSE["results"]))
     )
 
     result = await handlers.action_list_taxa(
@@ -461,3 +461,49 @@ def test_list_taxa_query_coerces_ids(raw, expected):
     from app.actions.configurations import ListTaxaQuery
 
     assert ListTaxaQuery(ids=raw).ids == expected
+
+
+# Synthesized by-ID records: odd IDs in this range exist, even ones are unknown to iNat.
+SYNTH_TAXON_IDS = range(100001, 101200)
+
+
+def _taxa_by_id_response(id, per_page, **kwargs):
+    """get_taxa stand-in for by-ID lookups: a complete single-page response."""
+    known = {t["id"]: t for t in TAXA_RESPONSE["results"]}
+    results = [
+        known.get(i) or {"id": i, "name": f"t{i}"}
+        for i in id
+        if i in known or (i in SYNTH_TAXON_IDS and i % 2)
+    ]
+    return {"results": results, "total_results": len(results), "page": 1, "per_page": per_page}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ids", [
+    ["41955", "41963"],
+    ["007", "7", "41955", "041955"],
+    ["leopard", " ", "41955"],
+    ["41955", "41955", "41963"],
+    [str(i) for i in SYNTH_TAXON_IDS],  # 1199 IDs: three by-ID batches
+    ["0"],
+    ["99999999999999999999"],
+], ids=["plain", "spellings", "free-text", "duplicates", "1199-ids", "zero", "oversized"])
+async def test_list_taxa_cached_path_matches_bypass(mocker, inaturalist_integration_v2, ids):
+    """The cache must be invisible in the response: bypass, cold and warm agree."""
+    from app.actions import handlers, taxa_cache
+    from app.actions.configurations import ListTaxaQuery
+    from app.actions.tests.memory_cache_backend import MemoryBackend
+
+    get_taxa = mocker.patch("app.datasource.inaturalist.get_taxa", side_effect=_taxa_by_id_response)
+    query = ListTaxaQuery(ids=ids)
+
+    bypass = await handlers.action_list_taxa(inaturalist_integration_v2, query)  # autouse fixture: no cache
+
+    cache = taxa_cache.TaxaCache(MemoryBackend(lambda: 1_000_000.0), 86400, 300)
+    mocker.patch.object(taxa_cache, "default_cache", return_value=cache)
+    cold = await handlers.action_list_taxa(inaturalist_integration_v2, query)
+    get_taxa.reset_mock()
+    warm = await handlers.action_list_taxa(inaturalist_integration_v2, query)
+
+    assert bypass == cold == warm
+    get_taxa.assert_not_called()
