@@ -104,3 +104,61 @@ async def test_get_many_with_no_ids_does_not_touch_backend(cache, backend):
     async def boom(keys): raise AssertionError("should not be called")
     backend.get_many = boom
     assert await cache.get_many([]) == ({}, set(), 0, False)
+
+
+@pytest.mark.asyncio
+async def test_redis_backend_uses_mget_and_a_pipeline_of_set_ex(mocker):
+    from unittest.mock import AsyncMock, MagicMock
+    from app.actions.taxa_cache import RedisBackend
+    client = MagicMock()
+    client.mget = AsyncMock(return_value=[b"a", None])
+    pipe = MagicMock(); pipe.execute = AsyncMock(return_value=[True])
+    client.pipeline.return_value.__aenter__ = AsyncMock(return_value=pipe)
+    client.pipeline.return_value.__aexit__ = AsyncMock(return_value=False)
+    backend = RedisBackend(client)
+    assert await backend.get_many(["k1", "k2"]) == [b"a", None]
+    client.mget.assert_awaited_once_with(["k1", "k2"])
+    await backend.set_many([("k1", b"v", 86400), ("k2", b"m", 300)])
+    client.pipeline.assert_called_once_with(transaction=False)
+    assert [c.kwargs["ex"] for c in pipe.set.call_args_list] == [86400, 300]
+    pipe.execute.assert_awaited_once()
+
+
+def test_build_redis_client_is_bounded_and_on_the_reference_db(mocker):
+    from app.actions import taxa_cache
+    from redis.backoff import NoBackoff
+    Redis = mocker.patch.object(taxa_cache.redis, "Redis")
+    mocker.patch.object(taxa_cache.settings, "REDIS_REFERENCE_CACHE_DB", 3)
+    mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_TIMEOUT_SECONDS", 0.5)
+    taxa_cache.build_redis_client()
+    kw = Redis.call_args.kwargs
+    assert kw["db"] == 3 and kw["socket_timeout"] == 0.5 and kw["socket_connect_timeout"] == 0.5
+    assert kw["retry_on_timeout"] is False
+    assert kw["retry"]._retries == 0 and isinstance(kw["retry"]._backoff, NoBackoff)
+
+
+def test_default_cache_is_none_when_disabled(mocker):
+    from app.actions import taxa_cache
+    mocker.patch.object(taxa_cache, "_default", None)
+    mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_ENABLED", False)
+    assert taxa_cache.default_cache() is None
+
+
+def test_default_cache_is_a_lazily_built_singleton_with_configured_ttls(mocker):
+    from app.actions import taxa_cache
+    mocker.patch.object(taxa_cache, "_default", None)
+    mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_ENABLED", True)
+    mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_TTL_SECONDS", 11)
+    mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_MISSING_TTL_SECONDS", 2)
+    build = mocker.patch.object(taxa_cache, "build_redis_client")
+    first, second = taxa_cache.default_cache(), taxa_cache.default_cache()
+    assert first is second and build.call_count == 1
+    assert (first.found_ttl_seconds, first.missing_ttl_seconds) == (11, 2)
+
+
+def test_settings_defaults():
+    from app import settings
+    assert settings.REDIS_REFERENCE_CACHE_DB == 3
+    assert settings.INAT_TAXA_CACHE_ENABLED is True
+    assert (settings.INAT_TAXA_CACHE_TTL_SECONDS, settings.INAT_TAXA_CACHE_MISSING_TTL_SECONDS) == (86400, 300)
+    assert settings.INAT_TAXA_CACHE_TIMEOUT_SECONDS == 0.5

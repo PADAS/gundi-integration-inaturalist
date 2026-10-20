@@ -17,7 +17,12 @@ import json
 import logging
 from typing import Dict, Iterable, List, NamedTuple, Optional, Protocol, Set, Tuple
 
+import redis.asyncio as redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
+
+from app import settings
 
 logger = logging.getLogger(__name__)
 
@@ -106,3 +111,48 @@ class TaxaCache:
             logger.warning("taxa cache write failed (%s)", type(e).__name__)
             return False
         return True
+
+
+class RedisBackend:
+    def __init__(self, client: redis.Redis):
+        self.client = client
+
+    async def get_many(self, keys: List[str]) -> List[Optional[bytes]]:
+        return await self.client.mget(keys)
+
+    async def set_many(self, entries: List[Tuple[str, bytes, int]]) -> None:
+        async with self.client.pipeline(transaction=False) as pipe:
+            for key, value, ttl in entries:
+                pipe.set(key, value, ex=ttl)
+            await pipe.execute()
+
+
+def build_redis_client() -> redis.Redis:
+    """Dedicated, tightly bounded client: a slow Redis must never stall the config form."""
+    timeout = settings.INAT_TAXA_CACHE_TIMEOUT_SECONDS
+    return redis.Redis(
+        host=settings.REDIS_HOST,
+        port=settings.REDIS_PORT,
+        db=settings.REDIS_REFERENCE_CACHE_DB,
+        socket_connect_timeout=timeout,
+        socket_timeout=timeout,
+        retry_on_timeout=False,
+        retry=Retry(NoBackoff(), 0),
+    )
+
+
+_default: Optional[TaxaCache] = None
+
+
+def default_cache() -> Optional[TaxaCache]:
+    """The shared cache, or None when INAT_TAXA_CACHE_ENABLED is false."""
+    global _default
+    if not settings.INAT_TAXA_CACHE_ENABLED:
+        return None
+    if _default is None:
+        _default = TaxaCache(
+            RedisBackend(build_redis_client()),
+            found_ttl_seconds=settings.INAT_TAXA_CACHE_TTL_SECONDS,
+            missing_ttl_seconds=settings.INAT_TAXA_CACHE_MISSING_TTL_SECONDS,
+        )
+    return _default
