@@ -637,3 +637,58 @@ def test_get_taxa_by_ids_sends_nothing_without_numeric_ids(mocker):
     get_taxa = mocker.patch.object(inaturalist, "get_taxa")
     assert inaturalist.get_taxa_by_ids(["leopard"]) == []
     get_taxa.assert_not_called()
+
+
+def _complete_taxa(id, **params):
+    results = [{"id": i, "name": f"t{i}"} for i in id if i != 999]
+    return {"results": results, "total_results": len(results), "page": 1, "per_page": params["per_page"]}
+
+
+def test_lookup_taxa_by_ids_separates_found_from_confirmed_missing(mocker):
+    from app.datasource import inaturalist
+    mocker.patch.object(inaturalist, "get_taxa", side_effect=_complete_taxa)
+    lookup = inaturalist.lookup_taxa_by_ids([41955, 999, 41963])
+    assert set(lookup.found) == {41955, 41963}
+    assert lookup.found[41955]["name"] == "t41955"
+    assert lookup.missing == [999]
+
+
+def test_lookup_taxa_by_ids_batches_like_get_taxa_by_ids(mocker):
+    from app.datasource import inaturalist
+    get_taxa = mocker.patch.object(inaturalist, "get_taxa", side_effect=_complete_taxa)
+    lookup = inaturalist.lookup_taxa_by_ids(list(range(1, inaturalist.TAXA_BY_ID_BATCH_SIZE + 3)))
+    assert len(lookup.found) == inaturalist.TAXA_BY_ID_BATCH_SIZE + 2
+    assert [len(c.kwargs["id"]) for c in get_taxa.call_args_list] == [inaturalist.TAXA_BY_ID_BATCH_SIZE, 2]
+    for call in get_taxa.call_args_list:
+        assert call.kwargs["is_active"] == "any"
+        assert call.kwargs["session"] is inaturalist._typeahead_session()
+
+
+@pytest.mark.parametrize("response", [
+    {"results": [{"id": 1}], "total_results": 2, "page": 1, "per_page": 500},   # paged: Review Focus 1
+    {"results": [{"id": 1}], "total_results": 501, "page": 1, "per_page": 500},
+    {"results": [{"id": 1}]},                                                   # no count metadata
+    {"results": "nope", "total_results": 1},
+    {"total_results": 0},
+    {"results": [{"name": "no id"}], "total_results": 1},
+])
+def test_lookup_taxa_by_ids_rejects_incomplete_or_malformed_batches(mocker, response):
+    from app.datasource import inaturalist
+    mocker.patch.object(inaturalist, "get_taxa", return_value=response)
+    with pytest.raises(inaturalist.INatIncompleteBatchError):
+        inaturalist.lookup_taxa_by_ids([1, 2])
+
+
+def test_lookup_taxa_by_ids_second_batch_failure_raises_without_partial_result(mocker):
+    from app.datasource import inaturalist
+    from app.services.errors import IntegrationConnectionError
+    mocker.patch.object(inaturalist, "get_taxa", side_effect=[_complete_taxa(id=list(range(1, 501)), per_page=500), requests.ReadTimeout("t")])
+    with pytest.raises(IntegrationConnectionError):
+        inaturalist.lookup_taxa_by_ids(list(range(1, 503)))
+
+
+def test_lookup_taxa_by_ids_empty_input_makes_no_request(mocker):
+    from app.datasource import inaturalist
+    get_taxa = mocker.patch.object(inaturalist, "get_taxa")
+    assert inaturalist.lookup_taxa_by_ids([]) == inaturalist.TaxaLookup({}, [])
+    get_taxa.assert_not_called()
