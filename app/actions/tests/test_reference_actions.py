@@ -433,8 +433,8 @@ async def test_list_taxa_resolves_saved_ids_in_order(mocker, inaturalist_integra
     from app.actions.configurations import ListTaxaQuery
 
     search = mocker.patch.object(handlers, "search_taxa")
-    lookup = mocker.patch.object(
-        handlers, "get_taxa_by_ids", return_value=list(reversed(TAXA_RESPONSE["results"]))
+    lookup = mocker.patch(
+        "app.actions.taxa_cache.get_taxa_by_ids", return_value=list(reversed(TAXA_RESPONSE["results"]))
     )
 
     result = await handlers.action_list_taxa(

@@ -404,3 +404,10 @@ def test_annotations_ask_for_one_row_per_filter():
     assert ui["annotations"]["ui:options"] == {"layout": "row"}
     # The row layout is opt-in on the array only; the items keep their references.
     assert "gundi:reference" in ui["annotations"]["items"]["term"]
+
+
+def test_list_taxa_query_caps_ids_per_request():
+    from app.actions.configurations import ListTaxaQuery, MAX_TAXA_IDS_PER_REQUEST
+    assert len(ListTaxaQuery(ids=[str(i) for i in range(MAX_TAXA_IDS_PER_REQUEST)]).ids) == MAX_TAXA_IDS_PER_REQUEST
+    with pytest.raises(pydantic.ValidationError):
+        ListTaxaQuery(ids=[str(i) for i in range(MAX_TAXA_IDS_PER_REQUEST + 1)])

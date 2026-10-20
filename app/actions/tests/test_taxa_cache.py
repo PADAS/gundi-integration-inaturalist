@@ -1,3 +1,4 @@
+from app.actions.taxa_cache import default_cache as real_default_cache  # the autouse fixture patches the module attribute
 import asyncio, json, pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -141,7 +142,7 @@ def test_default_cache_is_none_when_disabled(mocker):
     from app.actions import taxa_cache
     mocker.patch.object(taxa_cache, "_default", None)
     mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_ENABLED", False)
-    assert taxa_cache.default_cache() is None
+    assert real_default_cache() is None
 
 
 def test_default_cache_is_a_lazily_built_singleton_with_configured_ttls(mocker):
@@ -151,7 +152,7 @@ def test_default_cache_is_a_lazily_built_singleton_with_configured_ttls(mocker):
     mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_TTL_SECONDS", 11)
     mocker.patch.object(taxa_cache.settings, "INAT_TAXA_CACHE_MISSING_TTL_SECONDS", 2)
     build = mocker.patch.object(taxa_cache, "build_redis_client")
-    first, second = taxa_cache.default_cache(), taxa_cache.default_cache()
+    first, second = real_default_cache(), real_default_cache()
     assert first is second and build.call_count == 1
     assert (first.found_ttl_seconds, first.missing_ttl_seconds) == (11, 2)
 
@@ -162,3 +163,126 @@ def test_settings_defaults():
     assert settings.INAT_TAXA_CACHE_ENABLED is True
     assert (settings.INAT_TAXA_CACHE_TTL_SECONDS, settings.INAT_TAXA_CACHE_MISSING_TTL_SECONDS) == (86400, 300)
     assert settings.INAT_TAXA_CACHE_TIMEOUT_SECONDS == 0.5
+
+
+@pytest.fixture
+def upstream(mocker):
+    """lookup_taxa_by_ids stand-in: knows 41955 and 41963, nothing else; counts calls."""
+    from app.actions import taxa_cache
+    from app.datasource.inaturalist import TaxaLookup
+    known = {41955: {"id": 41955, "name": "Panthera pardus", "preferred_common_name": "Leopard", "rank": "species"},
+             41963: {"id": 41963, "name": "Panthera", "rank": "genus"}}
+    def lookup(ids):
+        return TaxaLookup({i: known[i] for i in ids if i in known}, [i for i in ids if i not in known])
+    return mocker.patch.object(taxa_cache, "lookup_taxa_by_ids", side_effect=lookup)
+
+
+@pytest.mark.asyncio
+async def test_repeat_resolve_makes_zero_upstream_calls_across_cache_instances(cache, backend, upstream):   # AC1
+    from app.actions.taxa_cache import TaxaCache, resolve_taxa
+    first = await resolve_taxa(["41955", "999", "41963"], cache)
+    assert list(first) == ["41955", "41963"] and upstream.call_count == 1
+    other = TaxaCache(backend, 86400, 300)
+    assert await resolve_taxa(["41963", "41955", "999"], other) == first
+    assert upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_run_still_reads_and_writes_the_cache(cache, upstream):   # AC1
+    from app.services.activity_logger import ephemeral_run
+    from app.actions.taxa_cache import resolve_taxa
+    token = ephemeral_run.set(True)
+    try:
+        await resolve_taxa(["41955"], cache)
+        await resolve_taxa(["41955"], cache)
+    finally:
+        ephemeral_run.reset(token)
+    assert upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_adding_an_id_fetches_only_that_id(cache, upstream):   # AC2
+    from app.actions.taxa_cache import resolve_taxa
+    await resolve_taxa(["41955"], cache)
+    await resolve_taxa(["41963", "41955"], cache)
+    assert [list(c.args[0]) for c in upstream.call_args_list] == [[41955], [41963]]
+
+
+@pytest.mark.asyncio
+async def test_alternate_spellings_resolve_like_today(cache, upstream):   # Review Focus 5
+    from app.actions.taxa_cache import resolve_taxa
+    by_id = await resolve_taxa(["007", "7", "41955", "041955", "leopard", ""], cache)
+    assert list(by_id) == ["41955"]
+    assert upstream.call_args.args[0] == [7, 41955]
+
+
+@pytest.mark.asyncio
+async def test_nonnumeric_only_input_makes_no_upstream_call(cache, upstream):
+    from app.actions.taxa_cache import resolve_taxa
+    assert await resolve_taxa(["leopard"], cache) == {}
+    upstream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_expiry_and_negative_cache_retry(cache, clock, upstream):   # AC3
+    from app.actions.taxa_cache import resolve_taxa
+    await resolve_taxa(["41955", "999"], cache)
+    clock.advance(301)
+    await resolve_taxa(["41955", "999"], cache)
+    assert upstream.call_args.args[0] == [999]
+    clock.advance(86400)
+    await resolve_taxa(["41955", "999"], cache)
+    assert upstream.call_args.args[0] == [41955, 999]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_type", ["INatIncompleteBatchError", "IntegrationConnectionError"])
+async def test_upstream_failure_propagates_and_caches_nothing(cache, backend, mocker, exc_type):   # AC3, AC4
+    from app.actions import taxa_cache
+    from app.datasource import inaturalist
+    from app.services import errors
+    exc = getattr(inaturalist, exc_type, None) or getattr(errors, exc_type)
+    mocker.patch.object(taxa_cache, "lookup_taxa_by_ids", side_effect=exc("boom"))
+    with pytest.raises(exc):
+        await taxa_cache.resolve_taxa(["41955", "999"], cache)
+    assert backend.store == {}
+
+
+@pytest.mark.asyncio
+async def test_redis_read_failure_falls_back_to_upstream(cache, backend, upstream):   # AC5
+    from app.actions.taxa_cache import resolve_taxa
+    async def boom(keys): raise RedisConnectionError("down")
+    backend.get_many = boom
+    assert list(await resolve_taxa(["41955"], cache)) == ["41955"]
+    assert upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_write_failure_still_returns_the_result(cache, backend, upstream):   # AC5
+    from app.actions.taxa_cache import resolve_taxa
+    async def boom(entries): raise RedisConnectionError("down")
+    backend.set_many = boom
+    assert list(await resolve_taxa(["41955"], cache)) == ["41955"]
+
+
+@pytest.mark.asyncio
+async def test_bypass_uses_the_legacy_lookup_verbatim(mocker, upstream):
+    from app.actions import taxa_cache
+    legacy = mocker.patch.object(taxa_cache, "get_taxa_by_ids", return_value=[{"id": 41955, "name": "Panthera pardus"}])
+    by_id = await taxa_cache.resolve_taxa(["41955", "007", "x"], None)
+    legacy.assert_called_once_with(["41955", "007", "x"])
+    upstream.assert_not_called()
+    assert by_id == {"41955": {"id": 41955, "name": "Panthera pardus"}}
+
+
+@pytest.mark.asyncio
+async def test_resolve_logs_aggregate_counts_not_ids(cache, upstream, caplog):
+    import logging
+    from app.actions.taxa_cache import resolve_taxa
+    with caplog.at_level(logging.INFO, logger="app.actions.taxa_cache"):
+        await resolve_taxa(["41955", "999"], cache)
+        await resolve_taxa(["41955", "999"], cache)
+    lines = [r.getMessage() for r in caplog.records if "taxa resolve" in r.getMessage()]
+    assert "requested=2" in lines[0] and "misses=2" in lines[0] and "upstream_batches=1" in lines[0]
+    assert "hits=1" in lines[1] and "negative_hits=1" in lines[1] and "upstream_batches=0" in lines[1]
+    assert "41955" not in lines[0] and "41955" not in lines[1]

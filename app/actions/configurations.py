@@ -396,6 +396,10 @@ class ListAnnotationValuesQuery(ReferenceActionConfiguration):
     term: str = pydantic.Field(..., title="Term ID")
 
 
+# Bounds cache cardinality per request: four 500-ID iNat calls, inside the typeahead bucket.
+MAX_TAXA_IDS_PER_REQUEST = 2000
+
+
 class ListTaxaQuery(ReferenceActionConfiguration):
     """Reference query: iNaturalist taxa matching a typed search (typeahead).
 
@@ -407,6 +411,7 @@ class ListTaxaQuery(ReferenceActionConfiguration):
     ids: Optional[List[str]] = pydantic.Field(
         None,
         title="Taxon IDs",
+        max_items=MAX_TAXA_IDS_PER_REQUEST,
         description="Saved values to label (the resolve contract): returns these taxa instead of searching.",
     )
 

@@ -15,6 +15,8 @@ failures never raise; reads report ``failed`` and writes return False.
 import asyncio
 import json
 import logging
+import math
+import time
 from typing import Dict, Iterable, List, NamedTuple, Optional, Protocol, Set, Tuple
 
 import redis.asyncio as redis
@@ -23,6 +25,7 @@ from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 
 from app import settings
+from app.datasource.inaturalist import TAXA_BY_ID_BATCH_SIZE, TaxaLookup, get_taxa_by_ids, lookup_taxa_by_ids
 
 logger = logging.getLogger(__name__)
 
@@ -156,3 +159,45 @@ def default_cache() -> Optional[TaxaCache]:
             missing_ttl_seconds=settings.INAT_TAXA_CACHE_MISSING_TTL_SECONDS,
         )
     return _default
+
+
+def _minimal(taxon: Optional[Dict]) -> Optional[Dict]:
+    """Same shape as a cache hit, so a response does not depend on hit or miss."""
+    return None if taxon is None else {f: taxon.get(f) for f in CACHED_TAXON_FIELDS}
+
+
+async def _fetch_uncached(numeric_ids: List[int]) -> TaxaLookup:
+    return await asyncio.to_thread(lookup_taxa_by_ids, numeric_ids)
+
+
+async def resolve_taxa(ids: List[str], cache: Optional[TaxaCache]) -> Dict[str, Dict]:
+    """Resolve saved taxon IDs to taxa, keyed by canonical ``str(int)`` in request order.
+
+    ``cache=None`` is the bypass path: the legacy lookup, unchanged. Otherwise only
+    IDs the cache cannot answer go upstream, and the cache is written only after the
+    whole upstream fetch succeeded. Upstream errors propagate; cache errors never do.
+    """
+    if cache is None:
+        taxa = await asyncio.to_thread(get_taxa_by_ids, ids)
+        return {str(t["id"]): t for t in taxa if t.get("id") is not None}
+    started = time.monotonic()
+    numeric = list(dict.fromkeys(int(i) for i in ids if i.isdigit()))
+    cached = await cache.get_many(numeric)
+    uncached = [i for i in numeric if i not in cached.found and i not in cached.missing]
+    fetched: Dict[int, Dict] = {}
+    if uncached:
+        lookup = await _fetch_uncached(uncached)
+        fetched = lookup.found
+        await cache.put(lookup.found, lookup.missing)
+    result: Dict[str, Dict] = {}
+    for i in numeric:
+        taxon = cached.found.get(i) or _minimal(fetched.get(i))
+        if taxon is not None:
+            result[str(i)] = taxon
+    logger.info(
+        "taxa resolve: requested=%d hits=%d negative_hits=%d misses=%d corrupt=%d cache_failed=%s "
+        "upstream_batches=%d elapsed_ms=%d",
+        len(numeric), len(cached.found), len(cached.missing), len(uncached), cached.corrupt, cached.failed,
+        math.ceil(len(uncached) / TAXA_BY_ID_BATCH_SIZE), int((time.monotonic() - started) * 1000),
+    )
+    return result
