@@ -52,8 +52,8 @@ class CachedTaxa(NamedTuple):
     failed: bool  # backend raised; everything is uncached
 
 
-def _decode(raw: bytes):
-    """Return ("found", record), ("missing", None) or None when undecodable."""
+def _decode(raw: bytes, expected_id: int):
+    """Return ("found", record), ("missing", None) or None when undecodable (a found record must carry expected_id and nullable-string name/preferred_common_name/rank)."""
     try:
         entry = json.loads(raw)
     except (ValueError, TypeError):
@@ -65,8 +65,15 @@ def _decode(raw: bytes):
         return "missing", None
     if kind == "found":
         taxon = entry.get("taxon")
-        if isinstance(taxon, dict) and isinstance(taxon.get("id"), int) and not isinstance(taxon.get("id"), bool):
-            return "found", {f: taxon.get(f) for f in CACHED_TAXON_FIELDS}
+        if not isinstance(taxon, dict):
+            return None
+        taxon_id = taxon.get("id")
+        if not isinstance(taxon_id, int) or isinstance(taxon_id, bool) or taxon_id != expected_id:
+            return None
+        if any(taxon.get(f) is not None and not isinstance(taxon.get(f), str)
+               for f in ("name", "preferred_common_name", "rank")):
+            return None
+        return "found", {f: taxon.get(f) for f in CACHED_TAXON_FIELDS}
     return None
 
 
@@ -90,7 +97,7 @@ class TaxaCache:
         for taxon_id, raw in zip(ids, raws):
             if raw is None:
                 continue
-            decoded = _decode(raw)
+            decoded = _decode(raw, taxon_id)
             if decoded is None:
                 corrupt += 1
             elif decoded[0] == "found":

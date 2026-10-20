@@ -95,6 +95,27 @@ async def test_undecodable_entries_count_as_uncached(cache, backend, raw):   # R
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("taxon", [
+    {"id": 5, "rank": []},
+    {"id": 5, "name": 5},
+    {"id": 5, "preferred_common_name": {}},
+    {"id": 6, "name": "Other", "rank": "species"},   # key/ID mismatch
+])
+async def test_malformed_or_mismatched_found_entries_count_as_uncached(cache, backend, taxon):
+    backend.store["inat:reference:taxa:v1:5"] = (json.dumps({"kind": "found", "taxon": taxon}).encode(), float("inf"))
+    got = await cache.get_many([5])
+    assert got.found == {} and got.missing == set() and got.corrupt == 1
+
+
+@pytest.mark.asyncio
+async def test_found_entry_with_null_string_fields_still_decodes(cache, backend):
+    taxon = {"id": 5, "name": None, "preferred_common_name": None, "rank": None}
+    backend.store["inat:reference:taxa:v1:5"] = (json.dumps({"kind": "found", "taxon": taxon}).encode(), float("inf"))
+    got = await cache.get_many([5])
+    assert got.found[5]["id"] == 5 and got.corrupt == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exc", [RedisConnectionError("down"), asyncio.TimeoutError(), OSError("refused")])
 async def test_backend_read_failure_reports_failed_not_raises(cache, backend, exc, caplog):   # Review Focus 2
     async def boom(keys): raise exc
