@@ -166,8 +166,56 @@ def _minimal(taxon: Optional[Dict]) -> Optional[Dict]:
     return None if taxon is None else {f: taxon.get(f) for f in CACHED_TAXON_FIELDS}
 
 
+# Upstream fetches in flight in this process: taxon id -> taxon record, or None when
+# confirmed missing. Overlapping resolves (two portal tabs, a retry) wait on these
+# instead of re-fetching. Entries are removed as soon as their fetch settles.
+_inflight: Dict[int, "asyncio.Future[Optional[Dict]]"] = {}
+
+
+def _settle(task: "asyncio.Task[TaxaLookup]", futures: Dict[int, "asyncio.Future[Optional[Dict]]"]) -> None:
+    """Done-callback of a shared fetch: resolve every owned future and unregister it."""
+    for taxon_id, fut in futures.items():
+        if _inflight.get(taxon_id) is fut:
+            del _inflight[taxon_id]
+        if task.cancelled():
+            fut.cancel()
+        elif task.exception() is not None:
+            fut.set_exception(task.exception())
+            fut.exception()  # mark retrieved: no "exception was never retrieved" if nobody waited
+        else:
+            fut.set_result(task.result().found.get(taxon_id))
+
+
 async def _fetch_uncached(numeric_ids: List[int]) -> TaxaLookup:
-    return await asyncio.to_thread(lookup_taxa_by_ids, numeric_ids)
+    """Fetch ids upstream, sharing any fetch already in flight for the same ids.
+
+    Callers await shielded work, so cancelling one caller never cancels a fetch
+    other callers are waiting on.
+    """
+    waiting = {i: _inflight[i] for i in numeric_ids if i in _inflight}
+    owned = [i for i in numeric_ids if i not in waiting]
+    found: Dict[int, Dict] = {}
+    missing: List[int] = []
+    task = None
+    if owned:
+        loop = asyncio.get_running_loop()
+        futures = {i: loop.create_future() for i in owned}
+        _inflight.update(futures)
+        task = asyncio.create_task(asyncio.to_thread(lookup_taxa_by_ids, owned))
+        task.add_done_callback(lambda t: _settle(t, futures))
+    if waiting:
+        logger.debug("taxa resolve coalesced: waited=%d owned=%d", len(waiting), len(owned))
+    if task is not None:
+        lookup = await asyncio.shield(task)
+        found.update(lookup.found)
+        missing.extend(lookup.missing)
+    for taxon_id, fut in waiting.items():
+        taxon = await asyncio.shield(fut)
+        if taxon is None:
+            missing.append(taxon_id)
+        else:
+            found[taxon_id] = taxon
+    return TaxaLookup(found, missing)
 
 
 async def resolve_taxa(ids: List[str], cache: Optional[TaxaCache]) -> Dict[str, Dict]:

@@ -286,3 +286,66 @@ async def test_resolve_logs_aggregate_counts_not_ids(cache, upstream, caplog):
     assert "requested=2" in lines[0] and "misses=2" in lines[0] and "upstream_batches=1" in lines[0]
     assert "hits=1" in lines[1] and "negative_hits=1" in lines[1] and "upstream_batches=0" in lines[1]
     assert "41955" not in lines[0] and "41955" not in lines[1]
+
+
+@pytest.fixture
+def gated_upstream(mocker):
+    """lookup_taxa_by_ids that blocks until released, so two resolves overlap."""
+    import threading
+    from app.actions import taxa_cache
+    from app.datasource.inaturalist import TaxaLookup
+    gate, calls = threading.Event(), []
+    def lookup(ids):
+        calls.append(list(ids)); gate.wait(5)
+        return TaxaLookup({i: {"id": i} for i in ids if i != 999}, [i for i in ids if i == 999])
+    mocker.patch.object(taxa_cache, "lookup_taxa_by_ids", side_effect=lookup)
+    return gate, calls
+
+
+@pytest.mark.asyncio
+async def test_overlapping_requests_share_one_upstream_fetch(cache, gated_upstream):   # AC6
+    from app.actions import taxa_cache
+    gate, calls = gated_upstream
+    a = asyncio.create_task(taxa_cache.resolve_taxa(["1", "2", "999"], cache))
+    await asyncio.sleep(0.05)
+    b = asyncio.create_task(taxa_cache.resolve_taxa(["2", "3", "999"], cache))
+    await asyncio.sleep(0.05)
+    gate.set()
+    ra, rb = await asyncio.gather(a, b)
+    assert sorted(sum(calls, [])) == [1, 2, 3, 999]          # each id fetched once
+    assert list(ra) == ["1", "2"] and list(rb) == ["2", "3"]
+    assert taxa_cache._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_waiter_does_not_cancel_the_shared_fetch(cache, gated_upstream):   # AC6
+    from app.actions import taxa_cache
+    gate, calls = gated_upstream
+    a = asyncio.create_task(taxa_cache.resolve_taxa(["1", "2"], cache))
+    await asyncio.sleep(0.05)
+    b = asyncio.create_task(taxa_cache.resolve_taxa(["2"], cache))
+    await asyncio.sleep(0.05)
+    a.cancel()
+    gate.set()
+    assert list(await b) == ["2"]
+    with pytest.raises(asyncio.CancelledError):
+        await a
+    assert taxa_cache._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_shared_fetch_fails_all_waiters_and_clears_inflight(cache, backend, mocker):   # AC6
+    import threading
+    from app.actions import taxa_cache
+    from app.datasource.inaturalist import INatIncompleteBatchError
+    gate = threading.Event()
+    def lookup(ids): gate.wait(5); raise INatIncompleteBatchError("truncated")
+    mocker.patch.object(taxa_cache, "lookup_taxa_by_ids", side_effect=lookup)
+    a = asyncio.create_task(taxa_cache.resolve_taxa(["1"], cache))
+    await asyncio.sleep(0.05)
+    b = asyncio.create_task(taxa_cache.resolve_taxa(["1"], cache))
+    await asyncio.sleep(0.05)
+    gate.set()
+    results = await asyncio.gather(a, b, return_exceptions=True)
+    assert all(isinstance(r, INatIncompleteBatchError) for r in results)
+    assert taxa_cache._inflight == {} and backend.store == {}
