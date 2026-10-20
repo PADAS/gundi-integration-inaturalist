@@ -1,6 +1,6 @@
 # Cache saved-taxa reference lookups in the iNaturalist runner
 
-Status: proposed design; this PR contains documentation only.
+Status: implemented on branch `worktree-feature+taxa-reference-cache`.
 
 ## Intent
 
@@ -19,7 +19,7 @@ The defaults below are design proposals, not previously agreed product requireme
 
 1. Cache the **saved-ID resolve path** (`list_taxa(ids=...)`). Autocomplete query caching is a separate follow-up; this change must not download or prewarm the full taxonomy.
 2. Cache by individual canonical numeric taxon ID, not by an entire configured list. Reopening a configuration is all hits; adding one ID fetches only that missing ID. Reordered or overlapping lists reuse entries.
-3. Store the minimal option data needed by `_taxon_option`/the response, not full upstream records. Use a versioned connector-specific namespace, e.g. `inat:reference:taxa:v1:<id>`, in the configured Redis state database with a dedicated cache adapter. Do not use integration-state key names or synthetic ephemeral integration IDs.
+3. Store the minimal option data needed by `_taxon_option`/the response, not full upstream records. Use a versioned connector-specific namespace, e.g. `inat:reference:taxa:v1:<id>`, in a dedicated Redis database, `REDIS_REFERENCE_CACHE_DB` (default 3; state is 0, configs 1, the token cache 2), never the state DB, with a dedicated cache adapter. Do not use integration-state key names or synthetic ephemeral integration IDs.
 4. Successful found entries expire after **24 hours**; confirmed missing IDs expire after **5 minutes**. Use explicit tagged found/missing records so a missing taxon is distinct from a cache miss. Hits do not renew expiry. No stale-on-error behavior in this first version.
 5. Both TTLs are deployment-configurable positive durations, with the proposed defaults. The precise environment-variable names and adapter module name are left to implementation. Include defaults and operational guidance in documentation.
 
@@ -29,7 +29,7 @@ The defaults below are design proposals, not previously agreed product requireme
 - For cache lookup and upstream fetch only, deduplicate numeric IDs and canonicalize their numeric spelling. Preserve the handler's existing emitted option values, input order and duplicate behavior; do not turn previously unresolved alternate spellings or arbitrary free text into newly resolved values. Never rewrite stored config or reorder the caller's list. Add compatibility tests against the current handler before implementing reconstruction.
 - Multi-read the cache for requested IDs; validate cached schema/version. Corrupt or unknown-format entries are misses, not action failures.
 - Fetch only uncached/expired numeric IDs through the existing batched helper, preserving `is_active="any"`, rate-limit behavior and thread offloading. If every requested numeric ID is cached, make **zero** iNaturalist calls. Nonnumeric-only inputs also make zero upstream calls.
-- Extend the datasource boundary with a plain-argument validated lookup helper that returns records plus the IDs whose absence is conclusively established. It must inspect each batch response before flattening, validate the results shape and pagination/count metadata, and reject malformed or incomplete batches rather than treating them as empty. Keep the existing `get_taxa_by_ids` callable contract for other callers (it may delegate). The exact metadata shape is left to the builder. Do not infer completeness from the existing flattened list alone; that helper currently discards batch metadata.
+- Extend the datasource boundary with a plain-argument validated lookup helper that returns records plus the IDs whose absence is conclusively established. It must inspect each batch response before flattening, validate the results shape and pagination/count metadata, and reject malformed or incomplete batches rather than treating them as empty. Keep the existing `get_taxa_by_ids` callable contract for other callers (it may delegate). A batch is complete only when `total_results == len(results)` and `total_results <= per_page` (500). Counts cannot detect a silent server-side cap below 500, so the 500 cap is verified on stage before relying on negative caching. Do not infer completeness from the existing flattened list alone; that helper currently discards batch metadata.
 - Publish cache entries only after the entire miss fetch succeeds and its response is validated as complete for the requested batch semantics. A malformed/truncated response or transport/rate-limit error must not create negative entries. If completeness cannot be established, do not negative-cache omissions. Do not cache exception payloads.
 - Reassemble the response from fresh cached entries plus newly fetched entries using the same selection/order rules as the current handler. Omit confirmed unknown IDs and retain `truncated=False` for successful resolve responses. Preserve the existing response envelope and option formatting.
 - If some misses cannot be fetched, preserve the current failure behavior rather than returning a partial list that would falsely mark unavailable IDs as nonexistent. Successfully cached IDs remain available for later calls.
@@ -39,13 +39,13 @@ The defaults below are design proposals, not previously agreed product requireme
 
 The cache is public reference data, not integration state. It may be shared across organizations only because the current lookup is unauthenticated and global. No credentials, configuration lists, integration IDs or user identifiers belong in keys or values. If lookup results later vary by API host, locale, filters or credentials, version or extend the namespace before sharing those results.
 
-Use the runner's configured Redis connection settings and bounded connection/read/write timeouts; cache access must not introduce long retries. Reuse/close connections according to the runner's application lifecycle. This must work for both persisted integrations and draft/ephemeral execution without changing ephemeral state-write protections.
+Use the runner's configured Redis connection settings and bounded connection/read/write timeouts; cache access must not introduce long retries. The cache uses a dedicated `redis.asyncio` client with 0.5 s connect/socket timeouts, `retry_on_timeout=False` and zero retries, created lazily at module level with no close hook. This must work for both persisted integrations and draft/ephemeral execution without changing ephemeral state-write protections.
 
-Redis read failure: bypass the cache and use the existing upstream path. Redis write failure: return the successful upstream result. Record a bounded warning/metric; never fail a valid reference response solely because caching is unavailable.
+Redis read failure: bypass the cache and use the existing upstream path, and skip the write for that request. Redis write failure: return the successful upstream result. Record a bounded warning/metric; never fail a valid reference response solely because caching is unavailable.
 
 Coalesce overlapping in-flight misses within a runner process using per-ID futures/tasks; waiters share outcomes without one caller's cancellation cancelling work needed by others. Clean up entries after success, failure or cancellation. Cross-instance distributed locking is explicitly out of scope: simultaneous cold misses on separate instances may duplicate a request, but completed entries are shared. This avoids introducing an unbounded lock wait or making Redis availability mandatory.
 
-TTL bounds storage lifetime but not instantaneous cardinality: do not cache the full taxonomy, avoid per-query/per-list entries, and measure namespace memory and miss volume during rollout. Use Redis eviction/memory controls rather than silently changing the shared Redis deployment in this implementation.
+TTL bounds storage lifetime but not instantaneous cardinality: do not cache the full taxonomy, avoid per-query/per-list entries, and measure namespace memory and miss volume during rollout. Eviction policy is instance-wide and cannot be scoped to this prefix, so cardinality is bounded by TTLs, validated-numeric-only writes and the dedicated DB, and the rollout checks `maxmemory-policy`.
 
 ## Acceptance criteria and tests
 
@@ -56,7 +56,7 @@ TTL bounds storage lifetime but not instantaneous cardinality: do not cache the 
 5. Redis unavailability, malformed cached entries and failed writes leave the upstream fallback usable with bounded cache latency.
 6. Concurrent same-process requests for the same IDs share one upstream miss fetch; overlap, cancellation and failed-fetch cleanup are tested. Different processes can share completed cache entries without claiming distributed single-flight.
 7. Search, empty-query behavior, `ids` precedence, response format and saved configuration remain unchanged.
-8. Tests use mocked iNaturalist/Redis and a controllable clock; no production services. Add focused handler/cache tests and run the existing reference-action and datasource suites. A stage smoke test repeats a saved-ID request through two fresh portal sessions and confirms reduced upstream calls without label/config changes.
+8. Tests use mocked iNaturalist and an in-memory cache backend with an injected clock under `app/actions/tests/`; no fakeredis, no dev-dependency change, no production services. Add focused handler/cache tests and run the existing reference-action and datasource suites. A stage smoke test repeats a saved-ID request through two fresh portal sessions and confirms reduced upstream calls without label/config changes.
 
 ## Rollout and observability
 
@@ -66,4 +66,4 @@ Use a deployment switch to bypass this cache for rollback, restoring the existin
 
 ## Non-goals
 
-No observation-data caching, full taxonomy synchronization, portal redesign, cross-instance locks, new Redis infrastructure, background refresh, stale serving or changes to generic template services. Runtime code and dependencies are not changed by this spec PR.
+No observation-data caching, full taxonomy synchronization, portal redesign, cross-instance locks, new Redis infrastructure, background refresh, stale serving or changes to generic template services.
