@@ -7,7 +7,8 @@ the connector (not the portal) so every portal instance shares it.
 It deliberately does not use ``IntegrationStateManager``: that store is a state DB
 with no TTL support and an ephemeral write-skip, neither of which fits a cache.
 The data cached is public iNaturalist taxon metadata, so nothing sensitive is
-stored in keys or values.
+stored in keys or values. Key cardinality is bounded by the TTLs, by writing only
+validated numeric IDs, and by the dedicated Redis DB, not by a per-request ID cap.
 
 Semantics: hits do not renew expiry, and there is no stale-on-error. Backend
 failures never raise; reads report ``failed`` and writes return False.
@@ -170,10 +171,14 @@ def _minimal(taxon: Optional[Dict]) -> Optional[Dict]:
 # confirmed missing. Overlapping resolves (two portal tabs, a retry) wait on these
 # instead of re-fetching. Entries are removed as soon as their fetch settles.
 _inflight: Dict[int, "asyncio.Future[Optional[Dict]]"] = {}
+# Strong references to running shared fetches: the event loop keeps only weak ones,
+# so an unreferenced task could be garbage-collected mid-flight.
+_fetch_tasks: Set["asyncio.Task[TaxaLookup]"] = set()
 
 
 def _settle(task: "asyncio.Task[TaxaLookup]", futures: Dict[int, "asyncio.Future[Optional[Dict]]"]) -> None:
     """Done-callback of a shared fetch: resolve every owned future and unregister it."""
+    _fetch_tasks.discard(task)
     for taxon_id, fut in futures.items():
         if _inflight.get(taxon_id) is fut:
             del _inflight[taxon_id]
@@ -202,6 +207,7 @@ async def _fetch_uncached(numeric_ids: List[int]) -> TaxaLookup:
         futures = {i: loop.create_future() for i in owned}
         _inflight.update(futures)
         task = asyncio.create_task(asyncio.to_thread(lookup_taxa_by_ids, owned))
+        _fetch_tasks.add(task)
         task.add_done_callback(lambda t: _settle(t, futures))
     if waiting:
         logger.debug("taxa resolve coalesced: waited=%d owned=%d", len(waiting), len(owned))
@@ -223,7 +229,9 @@ async def resolve_taxa(ids: List[str], cache: Optional[TaxaCache]) -> Dict[str, 
 
     ``cache=None`` is the bypass path: the legacy lookup, unchanged. Otherwise only
     IDs the cache cannot answer go upstream, and the cache is written only after the
-    whole upstream fetch succeeded. Upstream errors propagate; cache errors never do.
+    whole upstream fetch succeeded and only when the cache read did not fail (a failed
+    read means the cache is bypassed for this request). Upstream errors propagate;
+    cache errors never do.
     """
     if cache is None:
         taxa = await asyncio.to_thread(get_taxa_by_ids, ids)
@@ -236,7 +244,8 @@ async def resolve_taxa(ids: List[str], cache: Optional[TaxaCache]) -> Dict[str, 
     if uncached:
         lookup = await _fetch_uncached(uncached)
         fetched = lookup.found
-        await cache.put(lookup.found, lookup.missing)
+        if not cached.failed:
+            await cache.put(lookup.found, lookup.missing)
     result: Dict[str, Dict] = {}
     for i in numeric:
         taxon = cached.found.get(i) or _minimal(fetched.get(i))

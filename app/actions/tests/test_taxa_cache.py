@@ -6,6 +6,17 @@ LEOPARD = {"id": 41955, "name": "Panthera pardus", "preferred_common_name": "Leo
            "ancestor_ids": [1, 2, 3], "wikipedia_url": "https://..."}
 
 
+@pytest.fixture(autouse=True)
+def no_leaked_inflight():
+    """A fetch left in flight by one test must not be shared into the next."""
+    from app.actions import taxa_cache
+    yield
+    leaked = dict(taxa_cache._inflight)
+    taxa_cache._inflight.clear()
+    taxa_cache._fetch_tasks.clear()
+    assert leaked == {}
+
+
 @pytest.fixture
 def clock():
     now = [1_000_000.0]
@@ -255,6 +266,17 @@ async def test_redis_read_failure_falls_back_to_upstream(cache, backend, upstrea
     backend.get_many = boom
     assert list(await resolve_taxa(["41955"], cache)) == ["41955"]
     assert upstream.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_read_skips_the_cache_write(cache, backend, upstream):   # bypass during an outage
+    from app.actions.taxa_cache import resolve_taxa
+    async def boom(keys): raise RedisConnectionError("down")
+    writes = []
+    async def spy(entries): writes.append(entries)
+    backend.get_many, backend.set_many = boom, spy
+    assert list(await resolve_taxa(["41955", "999"], cache)) == ["41955"]
+    assert upstream.call_count == 1 and writes == []
 
 
 @pytest.mark.asyncio
