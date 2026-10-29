@@ -138,6 +138,10 @@ def _plain_duration(seconds: float) -> str:
     return f"{(seconds + 30) // 60} minutes"
 
 
+def _count(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
 class _PullProgress:
     """How far a pull got, so a run that is stopped can say where it was and
     whether the time went to iNaturalist or to Gundi."""
@@ -159,14 +163,14 @@ class _PullProgress:
         return time.monotonic() - self.started
 
     def counts(self) -> str:
-        return (f"{self.events_sent} new observations sent to Gundi, {self.events_updated} updated, "
-                f"{self.photos_added} photos added")
+        return (f"{_count(self.events_sent, 'new observation', 'new observations')} sent to Gundi, "
+                f"{self.events_updated} updated, {_count(self.photos_added, 'photo', 'photos')} added")
 
     def inat_summary(self) -> str:
         if self.inat_seconds is not None:
             # Counted after the annotation filter, so "matching", not "sent".
             return (f"iNaturalist took {_plain_duration(self.inat_seconds)} to answer, "
-                    f"with {self.observations_read} matching observations")
+                    f"with {_count(self.observations_read, 'matching observation', 'matching observations')}")
         if self.asked_inat:
             return "iNaturalist hadn't finished answering"
         return "iNaturalist hadn't been asked yet"
