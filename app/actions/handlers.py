@@ -54,6 +54,8 @@ RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
 # The pull's own progress notices give up after this long, so a slow publisher
 # can't hold a stopped run (and its lock) past the time limit by much.
 PROGRESS_LOG_TIMEOUT_SECONDS = 5
+# Kept free before the time limit when publishing the finished-pull summary.
+SUMMARY_TIME_MARGIN_SECONDS = 2
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -148,7 +150,7 @@ class _PullProgress:
 
     def __init__(self):
         self.started = time.monotonic()
-        self.step = "getting ready to ask iNaturalist"
+        self.step = "getting ready to read from iNaturalist"
         self.asked_inat = False
         self.inat_seconds: Optional[float] = None
         self.observations_read = 0
@@ -162,18 +164,22 @@ class _PullProgress:
     def elapsed(self) -> float:
         return time.monotonic() - self.started
 
-    def counts(self) -> str:
-        return (f"{_count(self.events_sent, 'new observation', 'new observations')} sent to Gundi, "
+    def counts(self, at_least: bool = False) -> str:
+        # A stopped run can't know about a batch that was in flight when it stopped.
+        prefix = "at least " if at_least else ""
+        return (f"{prefix}{_count(self.events_sent, 'new observation', 'new observations')} sent to Gundi, "
                 f"{self.events_updated} updated, {_count(self.photos_added, 'photo', 'photos')} added")
 
     def inat_summary(self) -> str:
         if self.inat_seconds is not None:
-            # Counted after the annotation filter, so "matching", not "sent".
-            return (f"iNaturalist took {_plain_duration(self.inat_seconds)} to answer, "
+            # Counted after the annotation filter, so "matching", not "sent". The
+            # time includes the client's own rate limiting and parsing, hence
+            # "reading from", not "iNaturalist took".
+            return (f"Reading from iNaturalist took {_plain_duration(self.inat_seconds)}, "
                     f"with {_count(self.observations_read, 'matching observation', 'matching observations')}")
         if self.asked_inat:
-            return "iNaturalist hadn't finished answering"
-        return "iNaturalist hadn't been asked yet"
+            return "Reading from iNaturalist hadn't finished"
+        return "Reading from iNaturalist hadn't started"
 
     def data(self) -> dict:
         return {
@@ -187,8 +193,16 @@ class _PullProgress:
         }
 
 
-async def _publish_progress_log(integration: Integration, title: str, level: LogLevel, data: dict, what: str):
+async def _publish_progress_log(
+        integration: Integration, title: str, level: LogLevel, data: dict, what: str,
+        timeout: Optional[float] = None,
+):
     """Best-effort and bounded: a slow publisher must not keep a pull running."""
+    if timeout is None:
+        timeout = PROGRESS_LOG_TIMEOUT_SECONDS
+    if timeout <= 0:
+        logger.info(f"Skipped the {what} for integration ID: {integration.id}: no time left before the limit.")
+        return
     try:
         await asyncio.wait_for(
             log_action_activity(
@@ -198,7 +212,7 @@ async def _publish_progress_log(integration: Integration, title: str, level: Log
                 title=title,
                 data=data,
             ),
-            timeout=PROGRESS_LOG_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except Exception as log_error:
         # asyncio.TimeoutError included. The runner records the outcome either way.
@@ -209,7 +223,7 @@ async def _log_pull_stopped(integration: Integration, progress: _PullProgress):
     """Say where a pull was when it was stopped (the runner's time limit, or the
     service shutting down). The runner logs the stop itself, without this detail."""
     msg = (f"The pull was stopped after {_plain_duration(progress.elapsed())} while {progress.step}. "
-           f"{progress.inat_summary()}; {progress.counts()}.")
+           f"{progress.inat_summary()}; {progress.counts(at_least=True)}.")
     logger.warning(f"{msg} Integration ID: {integration.id}.")
     await _publish_progress_log(integration, msg, LogLevel.WARNING, progress.data(), "stopped-pull notice")
 
@@ -218,7 +232,13 @@ async def _log_pull_finished(integration: Integration, progress: _PullProgress):
     """Counts in the title: the runner's own "completed" entry keeps them in its details."""
     msg = (f"Pull finished in {_plain_duration(progress.elapsed())}: {progress.counts()}. "
            f"{progress.inat_summary()}.")
-    await _publish_progress_log(integration, msg, LogLevel.INFO, progress.data(), "pull summary")
+    # Only the time left before the limit: the summary must never turn a pull
+    # whose work is saved into a timeout that gets retried.
+    time_left = settings.MAX_ACTION_EXECUTION_TIME - progress.elapsed() - SUMMARY_TIME_MARGIN_SECONDS
+    await _publish_progress_log(
+        integration, msg, LogLevel.INFO, progress.data(), "pull summary",
+        timeout=min(PROGRESS_LOG_TIMEOUT_SECONDS, time_left),
+    )
 
 
 async def _run_pull(integration: Integration, action_config: PullEventsConfig):
@@ -300,6 +320,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
     projects = action_config.projects
     if projects:
+        progress.step = "checking the saved projects on iNaturalist"
+        progress.asked_inat = True
         projects = await _drop_unknown_projects(integration, projects)
         if not projects:
             # Pulling without the projects would widen the query to the whole
@@ -309,7 +331,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                                'photos_attached': 0}}
 
     # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
-    progress.step = "waiting for iNaturalist"
+    progress.step = "reading observations from iNaturalist"
     progress.asked_inat = True
     inat_started = time.monotonic()
     observations = get_observations(
@@ -328,7 +350,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
     if not observations:
         since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        msg = f"No new or changed iNaturalist observations since {since} UTC."
+        # "Matching": the annotation filter may have dropped what iNaturalist sent.
+        msg = f"No new or changed matching iNaturalist observations since {since} UTC."
         logger.info(f"{msg} Integration ID: {integration.id}.")
         # Info, not warning: a quiet window is a normal outcome.
         await log_action_activity(

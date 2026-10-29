@@ -663,7 +663,7 @@ async def test_action_pull_events_no_new_observations_is_info_with_the_window(mo
 
     await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
-    assert mock_log.call_args.kwargs["title"] == "No new or changed iNaturalist observations since 2026-10-29 08:00 UTC."
+    assert mock_log.call_args.kwargs["title"] == "No new or changed matching iNaturalist observations since 2026-10-29 08:00 UTC."
     assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
 
 
@@ -706,7 +706,7 @@ async def test_a_stopped_pull_says_where_it_was(mocker):
     stopped = mock_log.call_args.kwargs
     assert stopped["level"] == LogLevel.WARNING
     assert stopped["title"].startswith("The pull was stopped after 0 s while sending new observations to Gundi. ")
-    assert "iNaturalist took 0 s to answer, with 1 matching observation; 0 new observations sent to Gundi" in stopped["title"]
+    assert "Reading from iNaturalist took 0 s, with 1 matching observation; at least 0 new observations sent to Gundi" in stopped["title"]
     assert stopped["data"]["observations_matched"] == 1
     mock_state.delete_state_if_value.assert_called_once()  # the lock is still released
 
@@ -774,8 +774,8 @@ async def test_a_pull_stopped_before_asking_inaturalist_says_so(mocker):
         await task
 
     title = mock_log.call_args.kwargs["title"]
-    assert "while getting ready to ask iNaturalist" in title
-    assert "iNaturalist hadn't been asked yet" in title
+    assert "while getting ready to read from iNaturalist" in title
+    assert "Reading from iNaturalist hadn't started" in title
 
 
 @pytest.mark.asyncio
@@ -882,9 +882,74 @@ def test_progress_messages_use_singular_for_one():
     progress.events_sent = 1
     progress.photos_added = 1
     assert progress.counts() == "1 new observation sent to Gundi, 0 updated, 1 photo added"
-    assert progress.inat_summary() == "iNaturalist took 1 s to answer, with 1 matching observation"
+    assert progress.inat_summary() == "Reading from iNaturalist took 1 s, with 1 matching observation"
     progress.observations_read = 2
     progress.events_sent = 0
     progress.photos_added = 3
     assert progress.counts() == "0 new observations sent to Gundi, 0 updated, 3 photos added"
-    assert progress.inat_summary() == "iNaturalist took 1 s to answer, with 2 matching observations"
+    assert progress.inat_summary() == "Reading from iNaturalist took 1 s, with 2 matching observations"
+    assert progress.counts(at_least=True) == "at least 0 new observations sent to Gundi, 0 updated, 3 photos added"
+
+
+@pytest.mark.asyncio
+async def test_the_pull_summary_never_runs_past_the_time_limit(mocker):
+    """With no time left, the summary is skipped rather than turning a saved pull into a timeout."""
+    from app.actions import handlers
+    from app.actions.handlers import _PullProgress, _log_pull_finished
+
+    mocker.patch.object(handlers.settings, "MAX_ACTION_EXECUTION_TIME", 540)
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    progress = _PullProgress()
+    progress.started -= 539  # one second before the limit, inside the margin
+    progress.inat_seconds = 10
+
+    await _log_pull_finished(MagicMock(), progress)
+
+    mock_log.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_pull_summary_gets_the_time_left(mocker):
+    from app.actions import handlers
+    from app.actions.handlers import _PullProgress, _log_pull_finished
+
+    mocker.patch.object(handlers.settings, "MAX_ACTION_EXECUTION_TIME", 540)
+    publish = mocker.patch("app.actions.handlers._publish_progress_log", AsyncMock())
+    progress = _PullProgress()
+    progress.started -= 535
+    progress.inat_seconds = 10
+
+    await _log_pull_finished(MagicMock(), progress)
+
+    assert 2 <= publish.call_args.kwargs["timeout"] <= 3
+
+
+@pytest.mark.asyncio
+async def test_a_pull_stopped_while_checking_projects_says_so(mocker):
+    import asyncio
+
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    started = asyncio.Event()
+
+    async def hang(integration, projects):
+        started.set()
+        await asyncio.Event().wait()
+
+    mocker.patch("app.actions.handlers._drop_unknown_projects", side_effect=hang)
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    task = asyncio.ensure_future(action_pull_events(
+        _lock_test_integration(), PullEventsConfig(days_to_load=3, projects=["p"])
+    ))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    title = mock_log.call_args.kwargs["title"]
+    assert "while checking the saved projects on iNaturalist" in title
+    assert "Reading from iNaturalist hadn't finished" in title

@@ -8,6 +8,7 @@ from math import asin, ceil, cos, radians, sin, sqrt
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pyinaturalist import (
@@ -325,6 +326,13 @@ def _call_inat(**params) -> Dict:
         # Before ConnectionError: a connect timeout is both.
         raise INatUnavailableError("no answer in time when asked for observations") from e
     except requests.ConnectionError as e:
+        # A read timeout that outlasts the session's retries arrives as a
+        # ConnectionError wrapping urllib3's MaxRetryError: tell it apart by its reason.
+        if isinstance(getattr(e.args[0] if e.args else None, "reason", None), urllib3.exceptions.TimeoutError):
+            raise INatUnavailableError("no answer in time when asked for observations") from e
+        raise INatUnavailableError("the connection dropped when asking for observations") from e
+    except requests.exceptions.ChunkedEncodingError as e:
+        # The connection closed partway through an answer.
         raise INatUnavailableError("the connection dropped when asking for observations") from e
 
 

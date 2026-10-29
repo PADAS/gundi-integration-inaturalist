@@ -732,3 +732,24 @@ def test_lookup_taxa_by_ids_empty_input_makes_no_request(mocker):
     get_taxa = mocker.patch.object(inaturalist, "get_taxa")
     assert inaturalist.lookup_taxa_by_ids([]) == inaturalist.TaxaLookup({}, [])
     get_taxa.assert_not_called()
+
+
+def test_call_inat_reports_a_read_timeout_after_retries_as_no_answer(monkeypatch):
+    """requests wraps a read timeout that outlasts the retries in a ConnectionError."""
+    from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+    from app.datasource.inaturalist import INatUnavailableError
+
+    reason = ReadTimeoutError(None, "/v2/observations", "Read timed out.")
+    error = requests.ConnectionError(MaxRetryError(None, "/v2/observations", reason=reason))
+    monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
+    with pytest.raises(INatUnavailableError, match="no answer in time when asked for observations"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_reports_a_connection_lost_mid_answer(monkeypatch):
+    from app.datasource.inaturalist import INatUnavailableError
+
+    error = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
+    monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
+    with pytest.raises(INatUnavailableError, match="the connection dropped when asking for observations"):
+        _call_inat(page=1, per_page=0)
