@@ -133,7 +133,9 @@ def _plain_duration(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 120:
         return f"{seconds} s"
-    return f"{seconds // 60} minutes"
+    # Nearest minute: 8 min 59 s next to a 540 s limit should read as 9.
+    # Half up, unlike round(), which sends 8.5 to 8.
+    return f"{(seconds + 30) // 60} minutes"
 
 
 class _PullProgress:

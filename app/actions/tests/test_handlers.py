@@ -857,3 +857,17 @@ async def test_process_attachments_counts_each_upload_as_it_lands(mocker):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.parametrize("seconds, text", [
+    (45, "45 s"),
+    (119, "119 s"),
+    (120, "2 minutes"),
+    (539, "9 minutes"),
+    (510, "9 minutes"),
+    (509, "8 minutes"),
+])
+def test_plain_duration_rounds_to_the_nearest_minute(seconds, text):
+    from app.actions.handlers import _plain_duration
+
+    assert _plain_duration(seconds) == text
