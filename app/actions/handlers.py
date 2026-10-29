@@ -411,9 +411,10 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 # Send images as attachments (if available)
                 if action_config.include_photos:
                     progress.step = "adding photos to the new observations"
-                    attachments_response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
+                    attachments_response = await process_attachments(
+                        to_add_chunk, response, all_event_photos, integration, progress
+                    )
                     attachment_count += attachments_response
-                    progress.photos_added = attachment_count
                 # Process events to patch
                 progress.step = "saving which observations were sent"
                 await save_events_state(response, to_add_chunk, integration, inat_updated_at_map)
@@ -445,7 +446,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                        'photos_attached': attachment_count}}
 
 
-async def process_attachments(events, response, all_event_photos, integration):
+async def process_attachments(events, response, all_event_photos, integration, progress: Optional[_PullProgress] = None):
     attachments_processed = 0
     for event, event_id in zip(events, response):
         inat_id = event['event_details']['inat_id']
@@ -475,6 +476,9 @@ async def process_attachments(events, response, all_event_photos, integration):
             )
             if attachments_response:
                 attachments_processed += len(attachments)
+                # Per upload, so a pull stopped mid-chunk counts the photos already added.
+                if progress:
+                    progress.photos_added += len(attachments)
         except Exception as e:
             request = {
                 "event_id": gundi_id,

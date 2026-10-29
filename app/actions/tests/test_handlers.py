@@ -819,3 +819,41 @@ async def test_a_pull_stopped_after_saving_its_cursor_is_not_reported_as_stopped
         await task
 
     assert not any(t.startswith("The pull was stopped") for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_process_attachments_counts_each_upload_as_it_lands(mocker):
+    """A pull stopped mid-chunk should report the photos already uploaded."""
+    import asyncio
+
+    from app.actions.handlers import _PullProgress
+
+    events = [{"event_details": {"inat_id": "1"}}, {"event_details": {"inat_id": "2"}}]
+    response = [{"object_id": "g1"}, {"object_id": "g2"}]
+    photos = {"1": [(10, "https://x/10.jpg"), (11, "https://x/11.jpg")], "2": [(20, "https://x/20.jpg")]}
+    image = MagicMock()
+    image.raise_for_status = MagicMock()
+    image.aread = AsyncMock(return_value=b"img")
+    client = AsyncMock()
+    client.get.return_value = image
+    mocker.patch("app.actions.handlers.httpx.AsyncClient", return_value=MagicMock(
+        __aenter__=AsyncMock(return_value=client), __aexit__=AsyncMock(return_value=False)
+    ))
+    progress = _PullProgress()
+    first_uploaded = asyncio.Event()
+
+    async def send(event_id, attachments, integration_id):
+        if event_id == "g2":
+            first_uploaded.set()
+            await asyncio.Event().wait()
+        return [{}]
+
+    mocker.patch("app.actions.handlers.send_event_attachments_to_gundi", side_effect=send)
+    integration = MagicMock()
+
+    task = asyncio.ensure_future(process_attachments(events, response, photos, integration, progress))
+    await first_uploaded.wait()
+    assert progress.photos_added == 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
