@@ -303,6 +303,8 @@ def _http_error(payload=None, text=""):
     if payload is not None:
         response.json.return_value = payload
     response.text = text
+    response.status_code = 422
+    response.reason = "Unprocessable Entity"
     response.request = MagicMock()
     return requests.HTTPError("422 Client Error: Unprocessable Entity for url: ...", response=response)
 
@@ -358,7 +360,7 @@ def test_call_inat_falls_back_to_response_text(monkeypatch):
         "app.datasource.inaturalist.get_observations_v2",
         MagicMock(side_effect=_http_error(text="upstream exploded")),
     )
-    with pytest.raises(INatRequestError, match="422 Client Error.*upstream exploded"):
+    with pytest.raises(INatRequestError, match="422 Unprocessable Entity.*upstream exploded"):
         _call_inat(page=1, per_page=0)
 
 
@@ -368,8 +370,46 @@ def test_call_inat_ignores_html_error_body(monkeypatch):
         "app.datasource.inaturalist.get_observations_v2",
         MagicMock(side_effect=_http_error(text="<html><body>502 Bad Gateway</body></html>")),
     )
-    with pytest.raises(INatRequestError, match=r"^422 Client Error[^<]*$"):
+    with pytest.raises(INatRequestError, match=r"^iNaturalist answered with an error when asked for observations: 422 Unprocessable Entity$"):
         _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_names_inaturalist_without_the_query_url(monkeypatch):
+    """Support should see that iNaturalist failed, not a raw "for url: <query>" line."""
+    monkeypatch.setattr(
+        "app.datasource.inaturalist.get_observations_v2",
+        MagicMock(side_effect=_http_error(text="upstream exploded")),
+    )
+    with pytest.raises(INatRequestError) as excinfo:
+        _call_inat(page=1, per_page=0)
+    assert str(excinfo.value).startswith("iNaturalist answered with an error when asked for observations")
+    assert "for url" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("error, message", [
+    (requests.ReadTimeout("read timed out"), "no answer in time when asked for observations"),
+    (requests.ConnectTimeout("connect timed out"), "no answer in time when asked for observations"),
+    (requests.ConnectionError("Remote end closed connection"), "the connection dropped when asking for observations"),
+    (requests.exceptions.RetryError("too many 503 error responses"), "it kept answering with errors when asked for observations"),
+])
+def test_call_inat_reports_an_unavailable_inaturalist(monkeypatch, error, message):
+    from app.datasource.inaturalist import INatUnavailableError
+    from app.services.errors import format_error_message
+
+    monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
+    with pytest.raises(INatUnavailableError) as excinfo:
+        _call_inat(page=1, per_page=0)
+    assert format_error_message(excinfo.value) == f"iNaturalist is unavailable — {message}"
+    assert excinfo.value.__cause__ is error
+
+
+def test_an_unavailable_inaturalist_is_not_retried():
+    """A redelivery would add load while iNaturalist is struggling; the next
+    scheduled pull starts from the same point instead."""
+    from app.datasource.inaturalist import INatUnavailableError
+    from app.services.retry_policies import is_retryable_failure
+
+    assert is_retryable_failure(INatUnavailableError("no answer in time when asked for observations")) is False
 
 
 def test_get_observations_raises_inat_request_error(monkeypatch):
@@ -692,3 +732,24 @@ def test_lookup_taxa_by_ids_empty_input_makes_no_request(mocker):
     get_taxa = mocker.patch.object(inaturalist, "get_taxa")
     assert inaturalist.lookup_taxa_by_ids([]) == inaturalist.TaxaLookup({}, [])
     get_taxa.assert_not_called()
+
+
+def test_call_inat_reports_a_read_timeout_after_retries_as_no_answer(monkeypatch):
+    """requests wraps a read timeout that outlasts the retries in a ConnectionError."""
+    from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+    from app.datasource.inaturalist import INatUnavailableError
+
+    reason = ReadTimeoutError(None, "/v2/observations", "Read timed out.")
+    error = requests.ConnectionError(MaxRetryError(None, "/v2/observations", reason=reason))
+    monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
+    with pytest.raises(INatUnavailableError, match="no answer in time when asked for observations"):
+        _call_inat(page=1, per_page=0)
+
+
+def test_call_inat_reports_a_connection_lost_mid_answer(monkeypatch):
+    from app.datasource.inaturalist import INatUnavailableError
+
+    error = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
+    monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
+    with pytest.raises(INatUnavailableError, match="the connection dropped when asking for observations"):
+        _call_inat(page=1, per_page=0)

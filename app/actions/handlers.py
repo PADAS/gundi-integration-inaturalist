@@ -1,7 +1,10 @@
 import asyncio
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 import logging
-from typing import Dict, List
+import time
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 import httpx
@@ -50,6 +53,11 @@ STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
 # Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
 RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
+# The pull's own progress notices give up after this long, so a slow publisher
+# can't hold a stopped run (and its lock) past the time limit by much.
+PROGRESS_LOG_TIMEOUT_SECONDS = 5
+# Kept free before the time limit when publishing the finished-pull summary.
+SUMMARY_TIME_MARGIN_SECONDS = 2
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -124,7 +132,147 @@ def chunk_list(list_a, chunk_size):
   for i in range(0, len(list_a), chunk_size):
     yield list_a[i:i + chunk_size]
 
+
+def _plain_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} s"
+    # Nearest minute: 8 min 59 s next to a 540 s limit should read as 9.
+    # Half up, unlike round(), which sends 8.5 to 8.
+    return f"{(seconds + 30) // 60} minutes"
+
+
+# When the runner's clock for this run started, as near as the handler can see
+# it: set before the activity logger publishes "started" and the lock is taken,
+# both of which count against the time limit.
+_run_started: ContextVar[Optional[float]] = ContextVar("inat_pull_run_started", default=None)
+
+
+def _clock_run(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        token = _run_started.set(time.monotonic())
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            _run_started.reset(token)
+    return wrapper
+
+
+def _count(n: int, singular: str, plural: str) -> str:
+    return f"{n} {singular if n == 1 else plural}"
+
+
+class _PullProgress:
+    """How far a pull got, so a run that is stopped can say where it was and
+    whether the time went to iNaturalist or to Gundi."""
+
+    def __init__(self):
+        self.started = _run_started.get() or time.monotonic()
+        self.step = "getting ready to read from iNaturalist"
+        self.asked_inat = False
+        self.inat_seconds: Optional[float] = None
+        self.observations_read = 0
+        self.events_sent = 0
+        self.events_updated = 0
+        self.photos_added = 0
+        # Set once the cursor for the next pull is saved: a stop after that
+        # point (while publishing the summary) loses nothing.
+        self.finished = False
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def counts(self, at_least: bool = False) -> str:
+        # A stopped run can't know about a batch that was in flight when it stopped.
+        prefix = "at least " if at_least else ""
+        return (f"{prefix}{_count(self.events_sent, 'new observation', 'new observations')} sent to Gundi, "
+                f"{self.events_updated} updated, {_count(self.photos_added, 'photo', 'photos')} added")
+
+    def inat_summary(self) -> str:
+        if self.inat_seconds is not None:
+            # Counted after the annotation filter, so "matching", not "sent". The
+            # time includes the client's own rate limiting and parsing, hence
+            # "reading from", not "iNaturalist took".
+            return (f"Reading from iNaturalist took {_plain_duration(self.inat_seconds)}, "
+                    f"with {_count(self.observations_read, 'matching observation', 'matching observations')}")
+        if self.asked_inat:
+            return "Reading from iNaturalist hadn't finished"
+        return "Reading from iNaturalist hadn't started"
+
+    def data(self) -> dict:
+        return {
+            "step": self.step,
+            "elapsed_seconds": round(self.elapsed()),
+            "inaturalist_seconds": round(self.inat_seconds) if self.inat_seconds is not None else None,
+            "observations_matched": self.observations_read,
+            "events_sent": self.events_sent,
+            "events_updated": self.events_updated,
+            "photos_added": self.photos_added,
+        }
+
+
+async def _publish_progress_log(
+        integration: Integration, title: str, level: LogLevel, data: dict, what: str,
+        timeout: Optional[float] = None,
+):
+    """Best-effort and bounded: a slow publisher must not keep a pull running."""
+    if timeout is None:
+        timeout = PROGRESS_LOG_TIMEOUT_SECONDS
+    if timeout <= 0:
+        logger.info(f"Skipped the {what} for integration ID: {integration.id}: no time left before the limit.")
+        return
+    try:
+        await asyncio.wait_for(
+            log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=level,
+                title=title,
+                data=data,
+            ),
+            timeout=timeout,
+        )
+    except Exception as log_error:
+        # asyncio.TimeoutError included. The runner records the outcome either way.
+        logger.warning(f"Could not publish the {what} for integration ID: {integration.id}: {log_error!r}")
+
+
+async def _log_pull_stopped(integration: Integration, progress: _PullProgress):
+    """Say where a pull was when it was stopped (the runner's time limit, or the
+    service shutting down). The runner logs the stop itself, without this detail."""
+    msg = (f"The pull was stopped after {_plain_duration(progress.elapsed())} while {progress.step}. "
+           f"{progress.inat_summary()}; {progress.counts(at_least=True)}.")
+    logger.warning(f"{msg} Integration ID: {integration.id}.")
+    await _publish_progress_log(integration, msg, LogLevel.WARNING, progress.data(), "stopped-pull notice")
+
+
+async def _log_pull_finished(integration: Integration, progress: _PullProgress):
+    """Counts in the title: the runner's own "completed" entry keeps them in its details."""
+    msg = (f"Pull finished in {_plain_duration(progress.elapsed())}: {progress.counts()}. "
+           f"{progress.inat_summary()}.")
+    # Only the time left before the limit: the summary must never turn a pull
+    # whose work is saved into a timeout that gets retried.
+    time_left = settings.MAX_ACTION_EXECUTION_TIME - progress.elapsed() - SUMMARY_TIME_MARGIN_SECONDS
+    await _publish_progress_log(
+        integration, msg, LogLevel.INFO, progress.data(), "pull summary",
+        timeout=min(PROGRESS_LOG_TIMEOUT_SECONDS, time_left),
+    )
+
+
+async def _run_pull(integration: Integration, action_config: PullEventsConfig):
+    progress = _PullProgress()
+    try:
+        return await _pull_events(integration, action_config, progress)
+    except asyncio.CancelledError:
+        # Once the cursor is saved, nothing was lost: only the summary was cut off.
+        if not progress.finished:
+            await _log_pull_stopped(integration, progress)
+        raise
+
+
 @action_title("Pull iNaturalist Observations")
+@_clock_run
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
     # A redelivered run (transient failures are nacked) can overlap the next scheduled
@@ -132,15 +280,15 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     # Ephemeral runs persist no state, so they skip the lock.
     integration_id = str(integration.id)
     if ephemeral_run.get():
-        return await _pull_events(integration, action_config)
+        return await _run_pull(integration, action_config)
     lock_token = uuid4().hex
     acquired = await state_manager.set_if_absent(
         integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
         value=lock_token,
     )
     if not acquired:
-        msg = f"Skipping iNaturalist pull for integration ID: {integration_id}: another run is in progress."
-        logger.info(msg)
+        msg = "Pull skipped: the previous pull is still running."
+        logger.info(f"{msg} Integration ID: {integration_id}.")
         try:
             await log_action_activity(
                 integration_id=integration.id,
@@ -157,7 +305,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
                            'events_updated': 0,
                            'photos_attached': 0}}
     try:
-        return await _pull_events(integration, action_config)
+        return await _run_pull(integration, action_config)
     finally:
         try:
             released = await state_manager.delete_state_if_value(
@@ -173,7 +321,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
             logger.exception(f"Error releasing the pull lock for integration ID: {integration_id}.")
 
 
-async def _pull_events(integration: Integration, action_config: PullEventsConfig):
+async def _pull_events(integration: Integration, action_config: PullEventsConfig, progress: _PullProgress):
 
     # Log the id only: the Integration carries every action config, including
     # the auth row's api_key.
@@ -192,6 +340,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
     projects = action_config.projects
     if projects:
+        progress.step = "checking the saved projects on iNaturalist"
+        progress.asked_inat = True
         projects = await _drop_unknown_projects(integration, projects)
         if not projects:
             # Pulling without the projects would widen the query to the whole
@@ -201,6 +351,9 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                                'photos_attached': 0}}
 
     # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
+    progress.step = "reading observations from iNaturalist"
+    progress.asked_inat = True
+    inat_started = time.monotonic()
     observations = get_observations(
         load_since,
         bounding_box=action_config.bounding_box,
@@ -209,14 +362,22 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         quality_grade=action_config.quality_grade,
         annotations=action_config.annotations_dict,
     )
+    # get_observations blocks, so a stop requested while it runs lands after it
+    # returns: the time it took is what tells iNaturalist's share apart.
+    progress.inat_seconds = time.monotonic() - inat_started
+    progress.observations_read = len(observations)
+    progress.step = "checking which observations are new or changed"
 
     if not observations:
-        msg = f"No new iNaturalist observations to process for integration ID: {str(integration.id)}."
-        logger.info(msg)
+        since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        # "Matching": the annotation filter may have dropped what iNaturalist sent.
+        msg = f"No new or changed matching iNaturalist observations since {since} UTC."
+        logger.info(f"{msg} Integration ID: {integration.id}.")
+        # Info, not warning: a quiet window is a normal outcome.
         await log_action_activity(
             integration_id=integration.id,
             action_id="pull_events",
-            level=LogLevel.WARNING,
+            level=LogLevel.INFO,
             title=msg,
             data={"message": msg}
         )
@@ -290,15 +451,21 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
             logger.info(f"Processing chunk #{i+1}")
 
+            progress.step = "sending new observations to Gundi"
             response = await send_events_to_gundi(events=to_add_chunk, integration_id=str(integration.id))
             added_count += len(response)
+            progress.events_sent = added_count
 
             if response:
                 # Send images as attachments (if available)
                 if action_config.include_photos:
-                    attachments_response = await process_attachments(to_add_chunk, response, all_event_photos, integration)
+                    progress.step = "adding photos to the new observations"
+                    attachments_response = await process_attachments(
+                        to_add_chunk, response, all_event_photos, integration, progress
+                    )
                     attachment_count += attachments_response
                 # Process events to patch
+                progress.step = "saving which observations were sent"
                 await save_events_state(response, to_add_chunk, integration, inat_updated_at_map)
 
     else:
@@ -307,22 +474,28 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     if events_to_patch:
         # Process events to patch
         logger.info(f"Updating {len(events_to_patch)} events from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
-        response = await patch_events(events_to_patch, action_config, integration)
+        progress.step = "updating changed observations in Gundi"
+        response = await patch_events(events_to_patch, action_config, integration, progress)
         updated_count += len(response)
+        progress.step = "saving which observations were updated"
         await save_patched_events_state(events_to_patch, integration)
 
     last_updated = max(ob.updated_at for ob in observations.values())
     logger.info("Updating state through %s", last_updated)
+    progress.step = "saving where the next pull starts"
     await state_manager.set_state(
         str(integration.id), "pull_events", _build_pull_events_state(last_updated)
     )
-        
+    progress.finished = True
+
+    await _log_pull_finished(integration, progress)
+
     return {'result': {'events_extracted': added_count,
                        'events_updated': updated_count,
                        'photos_attached': attachment_count}}
 
 
-async def process_attachments(events, response, all_event_photos, integration):
+async def process_attachments(events, response, all_event_photos, integration, progress: Optional[_PullProgress] = None):
     attachments_processed = 0
     for event, event_id in zip(events, response):
         inat_id = event['event_details']['inat_id']
@@ -352,6 +525,9 @@ async def process_attachments(events, response, all_event_photos, integration):
             )
             if attachments_response:
                 attachments_processed += len(attachments)
+                # Per upload, so a pull stopped mid-chunk counts the photos already added.
+                if progress:
+                    progress.photos_added += len(attachments)
         except Exception as e:
             request = {
                 "event_id": gundi_id,
@@ -380,7 +556,7 @@ async def process_attachments(events, response, all_event_photos, integration):
     return attachments_processed
 
 
-async def patch_events(events, updated_config_data, integration):
+async def patch_events(events, updated_config_data, integration, progress: Optional[_PullProgress] = None):
     responses = []
     for event in events:
         gundi_object_id = event[0]
@@ -393,6 +569,8 @@ async def patch_events(events, updated_config_data, integration):
                 integration_id=str(integration.id)
             )
             responses.append(response)
+            if progress:
+                progress.events_updated = len(responses)
     return responses
 
 
