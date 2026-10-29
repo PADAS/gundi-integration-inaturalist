@@ -52,6 +52,9 @@ STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
 # Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
 RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
+# The pull's own progress notices give up after this long, so a slow publisher
+# can't hold a stopped run (and its lock) past the time limit by much.
+PROGRESS_LOG_TIMEOUT_SECONDS = 5
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
@@ -128,7 +131,8 @@ def chunk_list(list_a, chunk_size):
 
 
 def _plain_duration(seconds: float) -> str:
-    seconds = int(seconds)
+    # Never negative: clocks on two instances can disagree by a few seconds.
+    seconds = max(0, int(seconds))
     if seconds < 120:
         return f"{seconds} s"
     return f"{seconds // 60} minutes"
@@ -140,12 +144,16 @@ class _PullProgress:
 
     def __init__(self):
         self.started = time.monotonic()
-        self.step = "waiting for iNaturalist"
+        self.step = "getting ready to ask iNaturalist"
+        self.asked_inat = False
         self.inat_seconds: Optional[float] = None
         self.observations_read = 0
         self.events_sent = 0
         self.events_updated = 0
         self.photos_added = 0
+        # Set once the cursor for the next pull is saved: a stop after that
+        # point (while publishing the summary) loses nothing.
+        self.finished = False
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
@@ -154,62 +162,59 @@ class _PullProgress:
         return (f"{self.events_sent} new observations sent to Gundi, {self.events_updated} updated, "
                 f"{self.photos_added} photos added")
 
+    def inat_summary(self) -> str:
+        if self.inat_seconds is not None:
+            # Counted after the annotation filter, so "matching", not "sent".
+            return (f"iNaturalist took {_plain_duration(self.inat_seconds)} to answer, "
+                    f"with {self.observations_read} matching observations")
+        if self.asked_inat:
+            return "iNaturalist hadn't finished answering"
+        return "iNaturalist hadn't been asked yet"
+
+    def data(self) -> dict:
+        return {
+            "step": self.step,
+            "elapsed_seconds": round(self.elapsed()),
+            "inaturalist_seconds": round(self.inat_seconds) if self.inat_seconds is not None else None,
+            "observations_matched": self.observations_read,
+            "events_sent": self.events_sent,
+            "events_updated": self.events_updated,
+            "photos_added": self.photos_added,
+        }
+
+
+async def _publish_progress_log(integration: Integration, title: str, level: LogLevel, data: dict, what: str):
+    """Best-effort and bounded: a slow publisher must not keep a pull running."""
+    try:
+        await asyncio.wait_for(
+            log_action_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=level,
+                title=title,
+                data=data,
+            ),
+            timeout=PROGRESS_LOG_TIMEOUT_SECONDS,
+        )
+    except Exception as log_error:
+        # asyncio.TimeoutError included. The runner records the outcome either way.
+        logger.warning(f"Could not publish the {what} for integration ID: {integration.id}: {log_error!r}")
+
 
 async def _log_pull_stopped(integration: Integration, progress: _PullProgress):
     """Say where a pull was when it was stopped (the runner's time limit, or the
     service shutting down). The runner logs the stop itself, without this detail."""
-    if progress.inat_seconds is None:
-        inat = "iNaturalist hadn't finished answering"
-    else:
-        inat = (f"iNaturalist took {_plain_duration(progress.inat_seconds)} to send "
-                f"{progress.observations_read} observations")
     msg = (f"The pull was stopped after {_plain_duration(progress.elapsed())} while {progress.step}. "
-           f"{inat}; {progress.counts()}.")
+           f"{progress.inat_summary()}; {progress.counts()}.")
     logger.warning(f"{msg} Integration ID: {integration.id}.")
-    try:
-        await log_action_activity(
-            integration_id=integration.id,
-            action_id="pull_events",
-            level=LogLevel.WARNING,
-            title=msg,
-            data={
-                "step": progress.step,
-                "elapsed_seconds": round(progress.elapsed()),
-                "inaturalist_seconds": round(progress.inat_seconds) if progress.inat_seconds is not None else None,
-                "observations_read": progress.observations_read,
-                "events_sent": progress.events_sent,
-                "events_updated": progress.events_updated,
-                "photos_added": progress.photos_added,
-            },
-        )
-    except Exception as log_error:
-        # Best-effort: the stop is reported by the runner either way.
-        logger.warning(f"Could not publish the stopped-pull notice for integration ID: {integration.id}: {log_error}")
+    await _publish_progress_log(integration, msg, LogLevel.WARNING, progress.data(), "stopped-pull notice")
 
 
 async def _log_pull_finished(integration: Integration, progress: _PullProgress):
     """Counts in the title: the runner's own "completed" entry keeps them in its details."""
     msg = (f"Pull finished in {_plain_duration(progress.elapsed())}: {progress.counts()}. "
-           f"iNaturalist took {_plain_duration(progress.inat_seconds or 0)} to send "
-           f"{progress.observations_read} observations.")
-    try:
-        await log_action_activity(
-            integration_id=integration.id,
-            action_id="pull_events",
-            level=LogLevel.INFO,
-            title=msg,
-            data={
-                "elapsed_seconds": round(progress.elapsed()),
-                "inaturalist_seconds": round(progress.inat_seconds or 0),
-                "observations_read": progress.observations_read,
-                "events_sent": progress.events_sent,
-                "events_updated": progress.events_updated,
-                "photos_added": progress.photos_added,
-            },
-        )
-    except Exception as log_error:
-        # Best-effort: a publisher failure must not fail a pull that already succeeded.
-        logger.warning(f"Could not publish the pull summary for integration ID: {integration.id}: {log_error}")
+           f"{progress.inat_summary()}.")
+    await _publish_progress_log(integration, msg, LogLevel.INFO, progress.data(), "pull summary")
 
 
 async def _run_pull(integration: Integration, action_config: PullEventsConfig):
@@ -217,7 +222,9 @@ async def _run_pull(integration: Integration, action_config: PullEventsConfig):
     try:
         return await _pull_events(integration, action_config, progress)
     except asyncio.CancelledError:
-        await _log_pull_stopped(integration, progress)
+        # Once the cursor is saved, nothing was lost: only the summary was cut off.
+        if not progress.finished:
+            await _log_pull_stopped(integration, progress)
         raise
 
 
@@ -257,17 +264,14 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
             msg = "Pull skipped: the previous pull is still running."
         else:
             msg = f"Pull skipped: the previous pull has been running for {_plain_duration(age)}."
-        # Past the time limit the previous run should have been stopped, so its
-        # lock was left behind by a run that died.
-        level = LogLevel.WARNING if age is not None and age > settings.MAX_ACTION_EXECUTION_TIME else LogLevel.INFO
         logger.info(f"{msg} Integration ID: {integration_id}.")
         try:
             await log_action_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
-                level=level,
+                level=LogLevel.INFO,
                 title=msg,
-                data={"message": msg, "previous_run_seconds": round(age) if age is not None else None}
+                data={"message": msg, "previous_run_seconds": max(0, round(age)) if age is not None else None}
             )
         except Exception as log_error:
             # Best-effort, like the runner's own skip: a publisher failure must not
@@ -321,6 +325,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                                'photos_attached': 0}}
 
     # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
+    progress.step = "waiting for iNaturalist"
+    progress.asked_inat = True
     inat_started = time.monotonic()
     observations = get_observations(
         load_since,
@@ -452,6 +458,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     await state_manager.set_state(
         str(integration.id), "pull_events", _build_pull_events_state(last_updated)
     )
+    progress.finished = True
 
     await _log_pull_finished(integration, progress)
 
