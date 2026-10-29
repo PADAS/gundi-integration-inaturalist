@@ -22,7 +22,7 @@ from pyinaturalist import (
     get_taxa_autocomplete,
 )
 
-from app.services.errors import IntegrationConnectionError
+from app.services.errors import IntegrationConnectionError, IntegrationError
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,18 @@ class INatRequestError(requests.HTTPError):
     Subclasses requests.HTTPError so the request/response metadata that
     action_runner._handle_error reports keeps flowing through.
     """
+
+
+class INatUnavailableError(IntegrationError):
+    """iNaturalist didn't answer, dropped the connection, or kept answering with
+    errors while the observations were being read.
+
+    Not retried (its error_type is outside the runner's retryable set): the
+    next scheduled pull starts from the same point, and a redelivery would only
+    add load while iNaturalist is struggling.
+    """
+    error_type = "provider_unavailable"
+    default_title = "iNaturalist is unavailable"
 
 
 class INatIncompleteBatchError(INatRequestError):
@@ -291,15 +303,29 @@ def _call_inat(**params) -> Dict:
     requests raises a bare "422 Client Error: ... for url: <query string>", which
     hides the actual reason (unknown project slug, bad taxon id, ...). iNat puts
     that in the response body, so lift it into the exception message.
+
+    Every message names iNaturalist, so the activity log shows at a glance that
+    the failure is on iNaturalist's side rather than Gundi's.
     """
     try:
         return get_observations_v2(**params)
     except requests.HTTPError as e:
         detail = _error_detail(e.response)
+        status = f"{e.response.status_code} {e.response.reason or ''}".strip() if e.response is not None else str(e)
+        message = f"iNaturalist answered with an error when asked for observations: {status}"
         raise INatRequestError(
-            f"{e} - {detail}" if detail else str(e),
+            f"{message} - {detail}" if detail else message,
             request=e.request, response=e.response,
         ) from e
+    except requests.exceptions.RetryError as e:
+        # pyinaturalist's session retries 5xx answers itself; this is what is left
+        # when every retry got one.
+        raise INatUnavailableError("it kept answering with errors when asked for observations") from e
+    except requests.Timeout as e:
+        # Before ConnectionError: a connect timeout is both.
+        raise INatUnavailableError("no answer in time when asked for observations") from e
+    except requests.ConnectionError as e:
+        raise INatUnavailableError("the connection dropped when asking for observations") from e
 
 
 TAXA_BATCH_SIZE = 100

@@ -38,6 +38,14 @@ async def test_execute_pull_observations_action(
     assert response["result"].get("photos_attached") == 5
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
+    # Support sees the counts in the title, not only in the "completed" details.
+    titles = [
+        c.kwargs["event"].payload.title for c in mock_publish_event.call_args_list
+        if getattr(c.kwargs["event"].payload, "title", None)
+    ]
+    summary = next(t for t in titles if t.startswith("Pull finished in "))
+    assert "2 new observations sent to Gundi, 0 updated, 5 photos added" in summary
+    assert "iNaturalist took " in summary
 
 
 @pytest.mark.asyncio

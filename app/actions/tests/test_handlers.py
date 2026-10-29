@@ -632,3 +632,129 @@ async def test_action_pull_events_refuses_an_unbounded_config(mocker):
     error = activity.call_args.kwargs
     assert error["level"] == LogLevel.ERROR
     assert "no project and no bounding box" in error["title"]
+
+
+# --- activity logs support reads ---
+
+
+def _lock_started(seconds_ago):
+    started = datetime.now(tz=timezone.utc) - timedelta(seconds=seconds_ago)
+    return {"token": "other-run", "started_at": started.strftime(STATE_DATETIME_FMT)}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_lock_carries_its_start_time(mocker):
+    import json
+
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
+
+    lock = json.loads(mock_state.set_if_absent.call_args.kwargs["value"])
+    assert lock["token"]
+    started_at = datetime.strptime(lock["started_at"], STATE_DATETIME_FMT)
+    assert datetime.now(tz=timezone.utc) - started_at < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_ago, title, level", [
+    (8 * 60 + 20, "Pull skipped: the previous pull has been running for 8 minutes.", LogLevel.INFO),
+    (45, "Pull skipped: the previous pull has been running for 45 s.", LogLevel.INFO),
+    (560, "Pull skipped: the previous pull has been running for 9 minutes.", LogLevel.WARNING),
+    (None, "Pull skipped: the previous pull is still running.", LogLevel.INFO),
+])
+async def test_action_pull_events_skip_says_how_long_the_previous_run_has_been_going(mocker, seconds_ago, title, level):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = False
+    # Built here, not at collection time, so the age is exact when the run reads it.
+    mock_state.get_state.return_value = _lock_started(seconds_ago) if seconds_ago is not None else {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.settings.MAX_ACTION_EXECUTION_TIME", 540)
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
+
+    assert mock_log.call_args.kwargs["title"] == title
+    assert mock_log.call_args.kwargs["level"] == level
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_skip_handles_an_old_format_lock(mocker):
+    """A lock written before it carried its start time is a bare hex token."""
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = False
+    mock_state.get_state.side_effect = ValueError("Expecting value")
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
+
+    assert mock_log.call_args.kwargs["title"] == "Pull skipped: the previous pull is still running."
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_no_new_observations_is_info_with_the_window(mocker):
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {STATE_LAST_RUN_KEY: "2026-10-29 08:00:00+0000"}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
+
+    assert mock_log.call_args.kwargs["title"] == "No new or changed iNaturalist observations since 2026-10-29 08:00 UTC."
+    assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_pull_says_where_it_was(mocker):
+    """The runner's time limit cancels the handler; before the cancellation
+    goes on, the pull logs its step and how long iNaturalist took."""
+    import asyncio
+
+    observation = MagicMock()
+    observation.id = 1
+    observation.photos = []
+    observation.created_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    observation.updated_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={1: observation})
+    mocker.patch("app.actions.handlers._transform_inat_to_gundi_event",
+                 return_value={"event_details": {"inat_id": "1"}})
+    sending = asyncio.Event()
+
+    async def hang(**kwargs):
+        sending.set()
+        await asyncio.Event().wait()
+
+    mocker.patch("app.actions.handlers.send_events_to_gundi", side_effect=hang)
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    task = asyncio.ensure_future(action_pull_events(
+        _lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]")
+    ))
+    await sending.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stopped = mock_log.call_args.kwargs
+    assert stopped["level"] == LogLevel.WARNING
+    assert stopped["title"].startswith("The pull was stopped after 0 s while sending new observations to Gundi. ")
+    assert "iNaturalist took 0 s to send 1 observations; 0 new observations sent to Gundi" in stopped["title"]
+    assert stopped["data"]["observations_read"] == 1
+    mock_state.delete_state_if_value.assert_called_once()  # the lock is still released
