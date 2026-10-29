@@ -953,3 +953,35 @@ async def test_a_pull_stopped_while_checking_projects_says_so(mocker):
     title = mock_log.call_args.kwargs["title"]
     assert "while checking the saved projects on iNaturalist" in title
     assert "Reading from iNaturalist hadn't finished" in title
+
+
+@pytest.mark.asyncio
+async def test_the_pull_clock_starts_before_the_started_entry_and_the_lock(mocker):
+    """The time limit covers the "started" publish and the lock, so the pull's clock does too."""
+    import asyncio
+
+    from app.actions import handlers
+
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.return_value = {}
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    mocker.patch("app.actions.handlers.get_observations", return_value={})
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+
+    async def slow_started(**kwargs):
+        await asyncio.sleep(0.3)
+
+    mocker.patch("app.services.activity_logger.publish_event", side_effect=slow_started)
+    seen = {}
+    real_init = handlers._PullProgress.__init__
+
+    def spy(self):
+        real_init(self)
+        seen["elapsed"] = self.elapsed()
+
+    mocker.patch.object(handlers._PullProgress, "__init__", spy)
+
+    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
+
+    assert seen["elapsed"] >= 0.3

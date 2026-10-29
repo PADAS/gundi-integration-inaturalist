@@ -1,5 +1,7 @@
 import asyncio
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 import logging
 import time
 from typing import Dict, List, Optional
@@ -140,6 +142,23 @@ def _plain_duration(seconds: float) -> str:
     return f"{(seconds + 30) // 60} minutes"
 
 
+# When the runner's clock for this run started, as near as the handler can see
+# it: set before the activity logger publishes "started" and the lock is taken,
+# both of which count against the time limit.
+_run_started: ContextVar[Optional[float]] = ContextVar("inat_pull_run_started", default=None)
+
+
+def _clock_run(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        token = _run_started.set(time.monotonic())
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            _run_started.reset(token)
+    return wrapper
+
+
 def _count(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
 
@@ -149,7 +168,7 @@ class _PullProgress:
     whether the time went to iNaturalist or to Gundi."""
 
     def __init__(self):
-        self.started = time.monotonic()
+        self.started = _run_started.get() or time.monotonic()
         self.step = "getting ready to read from iNaturalist"
         self.asked_inat = False
         self.inat_seconds: Optional[float] = None
@@ -253,6 +272,7 @@ async def _run_pull(integration: Integration, action_config: PullEventsConfig):
 
 
 @action_title("Pull iNaturalist Observations")
+@_clock_run
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
     # A redelivered run (transient failures are nacked) can overlap the next scheduled
