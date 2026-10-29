@@ -637,63 +637,10 @@ async def test_action_pull_events_refuses_an_unbounded_config(mocker):
 # --- activity logs support reads ---
 
 
-def _lock_started(seconds_ago):
-    started = datetime.now(tz=timezone.utc) - timedelta(seconds=seconds_ago)
-    return {"token": "other-run", "started_at": started.strftime(STATE_DATETIME_FMT)}
-
-
 @pytest.mark.asyncio
-async def test_action_pull_events_lock_carries_its_start_time(mocker):
-    import json
-
-    mock_state = AsyncMock()
-    mock_state.set_if_absent.return_value = True
-    mock_state.get_state.return_value = {}
-    mocker.patch("app.actions.handlers.state_manager", mock_state)
-    mocker.patch("app.actions.handlers.get_observations", return_value={})
-    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
-
-    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
-
-    lock = json.loads(mock_state.set_if_absent.call_args.kwargs["value"])
-    assert lock["token"]
-    started_at = datetime.strptime(lock["started_at"], STATE_DATETIME_FMT)
-    assert datetime.now(tz=timezone.utc) - started_at < timedelta(minutes=1)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("seconds_ago, title, level", [
-    (8 * 60 + 20, "Pull skipped: the previous pull has been running for 8 minutes.", LogLevel.INFO),
-    (45, "Pull skipped: the previous pull has been running for 45 s.", LogLevel.INFO),
-    # Past the time limit is still info: the previous pull is usually still
-    # running then (get_observations blocks), not dead.
-    (560, "Pull skipped: the previous pull has been running for 9 minutes.", LogLevel.INFO),
-    # Clocks on two instances can disagree.
-    (-3, "Pull skipped: the previous pull has been running for 0 s.", LogLevel.INFO),
-    (None, "Pull skipped: the previous pull is still running.", LogLevel.INFO),
-])
-async def test_action_pull_events_skip_says_how_long_the_previous_run_has_been_going(mocker, seconds_ago, title, level):
+async def test_action_pull_events_skip_says_the_previous_pull_is_still_running(mocker):
     mock_state = AsyncMock()
     mock_state.set_if_absent.return_value = False
-    # Built here, not at collection time, so the age is exact when the run reads it.
-    mock_state.get_state.return_value = _lock_started(seconds_ago) if seconds_ago is not None else {}
-    mocker.patch("app.actions.handlers.state_manager", mock_state)
-    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
-    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
-
-    await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
-
-    assert mock_log.call_args.kwargs["title"] == title
-    assert mock_log.call_args.kwargs["level"] == level
-
-
-@pytest.mark.asyncio
-async def test_action_pull_events_skip_handles_an_old_format_lock(mocker):
-    """A lock written before it carried its start time is a bare hex token."""
-    mock_state = AsyncMock()
-    mock_state.set_if_absent.return_value = False
-    mock_state.get_state.side_effect = ValueError("Expecting value")
     mocker.patch("app.actions.handlers.state_manager", mock_state)
     mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
     mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
@@ -701,6 +648,7 @@ async def test_action_pull_events_skip_handles_an_old_format_lock(mocker):
     await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
     assert mock_log.call_args.kwargs["title"] == "Pull skipped: the previous pull is still running."
+    assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
 
 
 @pytest.mark.asyncio

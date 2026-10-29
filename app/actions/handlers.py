@@ -1,6 +1,5 @@
 import asyncio
 from datetime import date, datetime, timedelta, timezone
-import json
 import logging
 import time
 from typing import Dict, List, Optional
@@ -131,8 +130,7 @@ def chunk_list(list_a, chunk_size):
 
 
 def _plain_duration(seconds: float) -> str:
-    # Never negative: clocks on two instances can disagree by a few seconds.
-    seconds = max(0, int(seconds))
+    seconds = int(seconds)
     if seconds < 120:
         return f"{seconds} s"
     return f"{seconds // 60} minutes"
@@ -228,17 +226,6 @@ async def _run_pull(integration: Integration, action_config: PullEventsConfig):
         raise
 
 
-async def _previous_run_age(integration_id: str) -> Optional[float]:
-    """Seconds since the run holding the lock started, or None when unknown."""
-    try:
-        lock = await state_manager.get_state(integration_id, "pull_events", source_id=STATE_RUN_LOCK_SOURCE_ID)
-        started_at = datetime.strptime(lock["started_at"], STATE_DATETIME_FMT)
-    except Exception:
-        # A lock written before it carried its start time, or a failed read.
-        return None
-    return (datetime.now(tz=timezone.utc) - started_at).total_seconds()
-
-
 @action_title("Pull iNaturalist Observations")
 @activity_logger()
 async def action_pull_events(integration: Integration, action_config: PullEventsConfig):
@@ -248,22 +235,13 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
     integration_id = str(integration.id)
     if ephemeral_run.get():
         return await _run_pull(integration, action_config)
-    # The start time rides in the lock so a skipped run can say how long the
-    # previous one has been going. The token keeps each run's value unique.
-    lock_token = json.dumps({
-        "token": uuid4().hex,
-        "started_at": datetime.now(tz=timezone.utc).strftime(STATE_DATETIME_FMT),
-    })
+    lock_token = uuid4().hex
     acquired = await state_manager.set_if_absent(
         integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
         value=lock_token,
     )
     if not acquired:
-        age = await _previous_run_age(integration_id)
-        if age is None:
-            msg = "Pull skipped: the previous pull is still running."
-        else:
-            msg = f"Pull skipped: the previous pull has been running for {_plain_duration(age)}."
+        msg = "Pull skipped: the previous pull is still running."
         logger.info(f"{msg} Integration ID: {integration_id}.")
         try:
             await log_action_activity(
@@ -271,7 +249,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
                 action_id="pull_events",
                 level=LogLevel.INFO,
                 title=msg,
-                data={"message": msg, "previous_run_seconds": max(0, round(age)) if age is not None else None}
+                data={"message": msg}
             )
         except Exception as log_error:
             # Best-effort, like the runner's own skip: a publisher failure must not
