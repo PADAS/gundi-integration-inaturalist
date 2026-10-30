@@ -475,10 +475,14 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         # Process events to patch
         logger.info(f"Updating {len(events_to_patch)} events from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
         progress.step = "updating changed observations in Gundi"
-        response = await patch_events(events_to_patch, action_config, integration, progress)
-        updated_count += len(response)
-        progress.step = "saving which observations were updated"
-        await save_patched_events_state(events_to_patch, integration)
+        # Save after each chunk so a run that times out keeps what it finished
+        # and the next run skips those observations.
+        for patch_chunk in chunk_list(events_to_patch, GUNDI_SUBMISSION_CHUNK_SIZE):
+            progress.step = "updating changed observations in Gundi"
+            response = await patch_events(patch_chunk, action_config, integration, progress)
+            updated_count += len(response)
+            progress.step = "saving which observations were updated"
+            await save_patched_events_state(patch_chunk, integration)
 
     last_updated = max(ob.updated_at for ob in observations.values())
     logger.info("Updating state through %s", last_updated)
@@ -570,7 +574,7 @@ async def patch_events(events, updated_config_data, integration, progress: Optio
             )
             responses.append(response)
             if progress:
-                progress.events_updated = len(responses)
+                progress.events_updated += 1
     return responses
 
 

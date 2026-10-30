@@ -321,3 +321,34 @@ async def test_attachment_errors_do_not_log_photo_bytes(mocker, caplog, inatural
     activity = log_activity.call_args.kwargs
     assert repr(photo_bytes) not in activity["title"]
     assert repr(photo_bytes) not in str(activity["data"])
+
+
+@pytest.mark.asyncio
+async def test_pull_events_saves_updated_observations_per_chunk(
+        mocker, mock_state_manager, inaturalist_integration_v2, mock_get_gundi_api_key,
+        mock_get_observations_v2, mock_publish_event
+):
+    """A run that stops partway through the updates keeps the chunks it finished,
+    so the next run doesn't send them again."""
+    from app.actions import handlers
+
+    stale_state = {"object_id": "gundi-1", handlers.STATE_INAT_UPDATED_AT_KEY: "2000-01-01 00:00:00+0000"}
+    mock_state_manager.get_state.return_value = async_return(stale_state)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch.object(handlers, "state_manager", mock_state_manager)
+    mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 1)
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
+    update = mocker.patch.object(
+        handlers, "update_event_in_gundi",
+        side_effect=[{"object_id": "gundi-1"}, RuntimeError("Gundi is down")],
+    )
+    action_config = PullEventsConfig.parse_obj(inaturalist_integration_v2.configurations[0].data)
+
+    with pytest.raises(RuntimeError):
+        await handlers.action_pull_events(inaturalist_integration_v2, action_config)
+
+    assert update.call_count == 2
+    saved = [c.kwargs for c in mock_state_manager.set_state.call_args_list if c.kwargs.get("source_id")]
+    assert len(saved) == 1
+    # The cursor stays put, so the unfinished observation is read again next run.
+    assert not [c for c in mock_state_manager.set_state.call_args_list if not c.kwargs.get("source_id")]
