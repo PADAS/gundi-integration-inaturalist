@@ -10,7 +10,9 @@
 
 **Tech Stack:** Python 3.10, FastAPI action runner, `pyinaturalist` 0.19 (sync, `requests`), pydantic v1, pytest + pytest-asyncio + pytest-mock.
 
-**Spec:** `docs/superpowers/specs/2026-11-02-bounded-resumable-pulls-design.md`. Ticket GUNDI-5908.
+**Spec:** `docs/superpowers/specs/2026-11-02-bounded-resumable-pulls-design.md`. Read §3–§6 before starting. Ticket GUNDI-5908.
+
+**Out of scope for this plan:** narrowing the IberoMAB route's configuration (operational, not code), the Cloud Run `timeoutSeconds` question (spec §7.1), quiet periods and density-based windows (spec non-goals).
 
 ## Global Constraints
 
@@ -30,6 +32,19 @@
 3. **Cursor monotonicity:** `cursor_reached` never goes backwards across windows, including the "10,000 share one timestamp" branch. Pinned in Task 1.
 4. **No-progress run is an ERROR:** a run whose first window cannot finish inside the budget leaves the cursor where it was and logs ERROR, not WARNING. Pinned in Task 3.
 5. **Other runs on the instance keep moving:** with the read in a thread, a concurrent small pull on the same loop completes while a slow read is in progress. Pinned in Task 2.
+
+---
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| `app/datasource/inaturalist.py` | `ObservationWindow`, `iter_observation_windows` (window loop with deadline); `get_observations` consumes it |
+| `app/actions/handlers.py` | `_pull_events` window loop in a thread, `_process_window`, cursor save per window, budget and cap checks, `_log_pull_paused`, `_PullProgress` fields |
+| `app/settings/__init__.py` | `PULL_TIME_BUDGET_FRACTION`, `MAX_OBSERVATIONS_PER_PULL` |
+| `README.md` | New activity entries and the two settings |
+| `app/datasource/tests/test_inaturalist.py` | Window generator, cursor monotonicity, deadline inside the thread |
+| `app/actions/tests/test_handlers.py` | Per-window save order, stop entries, cap, resume after a mid-window stop, concurrency on one loop |
 
 ---
 
