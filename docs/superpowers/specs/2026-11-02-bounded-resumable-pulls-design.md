@@ -52,9 +52,10 @@ File references are to `gundi-integration-movebank` `app/actions/handlers.py` at
 
 | # | Decision | Why |
 |---|---|---|
-| D1 | Run the read with `asyncio.to_thread`, keeping `pyinaturalist` | Same effect as M1 for the other runs on the instance; `action_list_projects` and `action_list_taxa` already do this. A thread cannot be cancelled, so D3 is also needed |
+| D1 | Run every `pyinaturalist` call in `_pull_events` with `asyncio.to_thread`: the observation read and the project check in `_drop_unknown_projects` (`find_existing_projects`), keeping `pyinaturalist` | Same effect as M1 for the other runs on the instance; `action_list_projects` and `action_list_taxa` already do this. A thread cannot be cancelled, so D3 is also needed |
 | D2 | Process and save **one window at a time**: the existing 10,000-observation windows become the unit of work, each followed by the cursor save | M2. The window loop already exists; only its output and the save point move |
-| D3 | A **time budget** passed into the read: `PULL_TIME_BUDGET_FRACTION × MAX_ACTION_EXECUTION_TIME` (proposed 0.8) from `_PullProgress.started`, checked between pages and between windows | M4. Stopping is a decision the run makes with its cursor saved, not something done to it |
+| D3 | A **time budget** for the whole run, read and processing alike: `PULL_TIME_BUDGET_FRACTION × MAX_ACTION_EXECUTION_TIME` (proposed 0.8) from `_PullProgress.started`, checked between pages, between windows and between 100-event chunks while processing. The 100-event chunk is the commit unit: its per-observation state is saved (GUNDI-5889) before the next chunk starts, so a run can stop between chunks without losing or repeating work | M4. Stopping is a decision the run makes with its progress saved, not something done to it. A window can hold 10,000 observations, so a budget on the read alone could leave too little time to send them |
+| D9 | With more than `TAXA_BATCH_SIZE` (100) configured taxa the read runs one query per taxa batch; the saved cursor is the **minimum** point reached across all batches, advanced after each round of one window per batch | A cursor saved from batch A alone would skip batch B's older observations on resume. The minimum re-reads a little for the batches that were ahead; GUNDI-5889's per-observation state drops what was already sent |
 | D4 | A **cap per run**, `MAX_OBSERVATIONS_PER_PULL` (proposed 2000), checked between windows | M3. A backlog drains over scheduled runs instead of one |
 | D5 | The cursor is written only after every observation in the window has been sent or patched and its state saved | A run stopped mid-window re-reads that window; GUNDI-5889's per-observation state skips what was already sent, so nothing is lost or duplicated |
 | D6 | A stop on the budget logs **WARNING** when the cursor moved and **ERROR** when it did not | ERROR feeds the existing 3-errors-per-hour health rule, so a stuck route shows unhealthy; a route that is catching up stays visible without being flagged |
@@ -67,11 +68,14 @@ File references are to `gundi-integration-movebank` `app/actions/handlers.py` at
 action_pull_events ──▶ _run_pull ──▶ _pull_events (event loop)
                                         │  deadline = started + 0.8 × MAX_ACTION_EXECUTION_TIME
                                         │
-                                        ├─ await to_thread(next, windows) ──▶ iter_observation_windows (worker thread)
-                                        │        ◀── (observations, cursor_reached, more)       pages of 200, checks deadline between pages
+                                        ├─ await to_thread(_drop_unknown_projects' find_existing_projects)
                                         │
-                                        ├─ _process_window: split new/changed → send in chunks of 100 (+photos) → patch → save per-observation state
-                                        ├─ set_state(STATE_LAST_RUN_KEY = cursor_reached)
+                                        ├─ await to_thread(next, windows) ──▶ iter_observation_windows (worker thread)
+                                        │        ◀── (observations, cursor_reached, more)       pages of 200, one window per taxa batch per round,
+                                        │                                                       checks deadline between pages
+                                        ├─ _process_window: split new/changed → per chunk of 100: send (+photos) → save per-observation state → check deadline
+                                        │                   → patch per chunk the same way
+                                        ├─ set_state(STATE_LAST_RUN_KEY = cursor_reached)      only after the whole window is processed
                                         │
                                         └─ repeat until: no more windows | deadline | MAX_OBSERVATIONS_PER_PULL
                                              then _log_pull_finished | _log_pull_paused (WARNING / ERROR)
@@ -80,7 +84,7 @@ action_pull_events ──▶ _run_pull ──▶ _pull_events (event loop)
 ### 5.1 Code layout
 
 - `app/datasource/inaturalist.py` — `iter_observation_windows(...)` (the window loop from `_get_observations_for_taxa_batch`, as a generator with a `deadline`); `get_observations` consumes it.
-- `app/actions/handlers.py` — `_pull_events` drives the generator from a thread, calls `_process_window` per window, saves the cursor, checks budget and cap; `_log_pull_paused` next to `_log_pull_stopped`; `_PullProgress` gains `windows_read` and `cursor_reached`.
+- `app/actions/handlers.py` — `_drop_unknown_projects` runs `find_existing_projects` in a thread; `_pull_events` drives the generator from a thread, calls `_process_window` per window with the deadline checked between chunks, saves the cursor, checks budget and cap; `_log_pull_paused` next to `_log_pull_stopped`; `_PullProgress` gains `windows_read` and `cursor_reached`.
 - `app/settings/__init__.py` — `PULL_TIME_BUDGET_FRACTION`, `MAX_OBSERVATIONS_PER_PULL`.
 
 No change to `app/services/` (template code) or `docker/`.
@@ -89,13 +93,13 @@ No change to `app/services/` (template code) or `docker/`.
 
 ### 6.1 Windows and the cursor
 
-`iter_observation_windows` yields `(observations, cursor_reached, more)` per window. `cursor_reached` is the last `updated_at` seen in the window, or the window end when the window fit in one query. The "10,000 share one timestamp" step stays as it is. `cursor_reached` never goes backwards across windows.
+`iter_observation_windows` yields `(observations, cursor_reached, more)` per window. For one taxa batch (the common case: no taxa, or up to 100), `cursor_reached` is the last `updated_at` seen in the window, or the window end when the window fit in one query. With several taxa batches the generator takes one window from each batch in turn (round-robin), keeps a reached point per batch, and reports `cursor_reached` as the minimum across batches, treating a batch that has no more windows as reached at the run's start time (D9). The "10,000 share one timestamp" step stays as it is. `cursor_reached` never goes backwards.
 
-`_pull_events` runs the existing pipeline on each window, then writes the cursor as `cursor_reached` (D5). The per-chunk per-observation saves from GUNDI-5889 are unchanged.
+`_pull_events` runs the existing pipeline on each window, then writes the cursor as `cursor_reached` (D5). The per-chunk per-observation saves from GUNDI-5889 are unchanged and are what make the chunk the commit unit.
 
 ### 6.2 Stopping on the budget
 
-The generator checks the deadline before each page request and before each new window. When it is reached it finishes the page in flight, yields what it has with `more=True`, and returns. The handler also checks the deadline before asking for another window. The run then saves the cursor and logs through `_publish_progress_log`:
+The deadline is checked at three points: in the generator before each page request and before each new window, and in the handler before each 100-event chunk while sending or patching. When the generator reaches it, it finishes the page in flight, yields what it has with `more=True`, and returns. When the handler reaches it mid-window, it finishes the chunk in flight (whose per-observation state is then saved), does not write the cursor for that window, and stops; the next run re-reads the window and skips the chunks already sent. Photo downloads inside a chunk keep the existing 120 s client timeout, so one chunk is bounded. The run then logs through `_publish_progress_log`:
 
 - cursor moved → WARNING, e.g. "Pull stopped after 7 minutes with the cursor at 2026-06-22 21:17 UTC because the time limit was close. 1,840 new observations sent to Gundi, 12 updated, 95 photos added."
 - cursor did not move → ERROR, same shape, "…and the cursor did not move."

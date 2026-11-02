@@ -20,7 +20,9 @@
 - The cursor is written only after every observation in a window has been sent or patched and its state saved. Never write a cursor past data that was not processed.
 - `get_observations(since, *, bounding_box, taxa, projects, quality_grade, annotations)` keeps its signature and return type; it consumes the new generator.
 - New constants, all in `app/actions/handlers.py` unless noted: `PULL_TIME_BUDGET_FRACTION = 0.8`, `MAX_OBSERVATIONS_PER_PULL = 2000`. Both read from settings with these defaults so they can be tuned per deployment.
-- Deadline checks happen between page requests and between windows, never mid-request; a page in flight finishes.
+- Deadline checks happen between page requests, between windows, and between 100-event chunks while sending or patching, never mid-request; a page or chunk in flight finishes. The chunk is the commit unit: its per-observation state is saved before the next chunk starts.
+- With several taxa batches the generator takes one window per batch per round and reports `cursor_reached` as the minimum reached across batches; a batch with no more windows counts as reached at the run's start time. The cursor is never written from one batch alone.
+- Every `pyinaturalist` call made during `_pull_events` runs through `asyncio.to_thread`, including `find_existing_projects` in `_drop_unknown_projects`.
 - The stop entry is WARNING when the cursor moved during the run and ERROR when it did not. Wording follows the existing `_log_pull_stopped` style: plain words, no prediction of what the next run will do.
 - No change to `app/services/` (template code), to `docker/`, or to the portal.
 - Tests use mocked iNaturalist responses and the existing state-manager fixtures under `app/actions/tests/` and `app/datasource/tests/`; no production services.
@@ -31,7 +33,9 @@
 2. **Deadline inside the thread:** the generator must stop within one page request of the deadline even when iNaturalist is slow; the handler must not wait on a second `next()` after the deadline. Pinned in Tasks 2 and 3.
 3. **Cursor monotonicity:** `cursor_reached` never goes backwards across windows, including the "10,000 share one timestamp" branch. Pinned in Task 1.
 4. **No-progress run is an ERROR:** a run whose first window cannot finish inside the budget leaves the cursor where it was and logs ERROR, not WARNING. Pinned in Task 3.
-5. **Other runs on the instance keep moving:** with the read in a thread, a concurrent small pull on the same loop completes while a slow read is in progress. Pinned in Task 2.
+5. **Other runs on the instance keep moving:** with the read and the project check in threads, a concurrent small pull on the same loop completes while a slow read or a slow `find_existing_projects` is in progress. Pinned in Task 2.
+6. **Two taxa batches, stop between them:** a run that finishes batch A's window and stops before batch B's must leave the cursor where batch B still starts from, so B's older observations are read on the next run. Pinned in Tasks 1 and 4.
+7. **Budget runs out while processing:** a 10,000-observation window read just before the deadline must stop between chunks with the chunks sent so far recorded and the cursor not advanced, instead of being cancelled by the runner. Pinned in Task 3.
 
 ---
 
@@ -72,8 +76,9 @@ def iter_observation_windows(
   - A backlog of 25,000 mocked observations yields three windows with strictly increasing `cursor_reached`; the merged result equals today's `get_observations` output.
   - The "all share one timestamp" branch still advances by one second and `cursor_reached` does not go backwards.
   - With a deadline already passed before the second page, the generator yields one partial window with `more=True` and stops after that page.
-  - The taxa-batch path (several `taxon_id` batches) still yields windows per batch in order.
-- [ ] **Step 2: Implement `iter_observation_windows`** by moving the `while True` loop out of `_get_observations_for_taxa_batch` into the generator and adding the deadline check before each page and before each new window.
+  - The taxa-batch path (several `taxon_id` batches) yields one window per batch per round, and `cursor_reached` after batch A's first window is still batch B's starting point (the minimum), not batch A's reached point.
+  - With two batches and a deadline that passes after batch A's first window, the generator stops with `cursor_reached` at the minimum and `more=True`.
+- [ ] **Step 2: Implement `iter_observation_windows`** by moving the `while True` loop out of `_get_observations_for_taxa_batch` into the generator, taking one window per taxa batch per round with a reached point per batch, and adding the deadline check before each page and before each new window.
 - [ ] **Step 3: Reimplement `get_observations`** as `merge(iter_observation_windows(...))` and run the existing datasource suite unchanged.
 
 ### Task 2: Drive the generator from a worker thread
@@ -84,8 +89,8 @@ def iter_observation_windows(
 
 - [ ] **Step 1: Write the failing tests**
   - `_pull_events` calls `asyncio.to_thread` for each window (assert on a patched `to_thread`).
-  - A slow mocked read (a `threading.Event` the test releases) does not stop a second, small `_pull_events` on the same loop from finishing first.
-- [ ] **Step 2: Replace the single `get_observations` call** with a loop: `window = await asyncio.to_thread(next, windows, None)`; `None` ends the loop. Pass `deadline` computed from `progress.started` and `PULL_TIME_BUDGET_FRACTION`.
+  - A slow mocked read (a `threading.Event` the test releases) does not stop a second, small `_pull_events` on the same loop from finishing first; the same with a slow mocked `find_existing_projects`.
+- [ ] **Step 2: Replace the single `get_observations` call** with a loop: `window = await asyncio.to_thread(next, windows, None)`; `None` ends the loop. Pass `deadline` computed from `progress.started` and `PULL_TIME_BUDGET_FRACTION`. In `_drop_unknown_projects`, call `find_existing_projects` through `asyncio.to_thread`, keeping its exception handling.
 - [ ] **Step 3: Keep `_PullProgress` accurate:** add `windows_read` and `cursor_reached`; `inat_seconds` accumulates across windows.
 
 ### Task 3: Process, save and stop per window
@@ -99,8 +104,9 @@ def iter_observation_windows(
   - A run that reaches the deadline after two full windows saves the second window's cursor and publishes a WARNING entry whose title names the elapsed time and the cursor.
   - A run whose first window cannot finish before the deadline leaves the cursor untouched and publishes an ERROR entry.
   - A run that reaches `MAX_OBSERVATIONS_PER_PULL` stops taking windows, saves the cursor and publishes an INFO entry saying more remain.
-- [ ] **Step 2: Move the existing pipeline** (split new/changed, `send_events_to_gundi` in chunks, `process_attachments`, `save_events_state`, `patch_events`, `save_patched_events_state`) into `_process_window(...)` and call it per window.
-- [ ] **Step 3: Write the cursor after `_process_window`** returns, then check `deadline` and the cap before asking for the next window.
+  - A window of 10,000 mocked observations read just before the deadline: `_process_window` stops after the chunk in flight, that chunk's per-observation state is saved, the cursor is not written, and the stop entry is published before `MAX_ACTION_EXECUTION_TIME`.
+- [ ] **Step 2: Move the existing pipeline** (split new/changed, `send_events_to_gundi` in chunks, `process_attachments`, `save_events_state`, `patch_events`, `save_patched_events_state`) into `_process_window(...)` and call it per window. `_process_window` takes the deadline and returns whether it finished the window; it checks the deadline before each chunk, after the previous chunk's state save.
+- [ ] **Step 3: Write the cursor only when `_process_window`** reports the window finished, then check `deadline` and the cap before asking for the next window.
 - [ ] **Step 4: Add `_log_pull_paused`** next to `_log_pull_stopped`, choosing WARNING or ERROR from whether the cursor moved, using `_publish_progress_log` with the remaining-time timeout as `_log_pull_finished` does.
 
 ### Task 4: Resume correctness
@@ -108,7 +114,9 @@ def iter_observation_windows(
 **Files:**
 - Test: `app/actions/tests/test_handlers.py`
 
-- [ ] **Step 1: Write the test:** run 1 is cancelled (simulate `asyncio.CancelledError` from `send_events_to_gundi`) after sending the first 100-event chunk of window 2; assert the cursor equals window 1's `cursor_reached`. Run 2 with the same mocked data re-reads window 2, sends only the events without saved state, and ends with the cursor at window 2's `cursor_reached`.
+- [ ] **Step 1: Write the tests:**
+  - Run 1 is cancelled (simulate `asyncio.CancelledError` from `send_events_to_gundi`) after sending the first 100-event chunk of window 2; assert the cursor equals window 1's `cursor_reached`. Run 2 with the same mocked data re-reads window 2, sends only the events without saved state, and ends with the cursor at window 2's `cursor_reached`.
+  - Two taxa batches (150 configured taxa): run 1's deadline passes after batch A's first window and before batch B's; assert the cursor still equals the original `since`. Run 2 reads batch B's older observations and sends them exactly once, and batch A's already-sent observations are skipped.
 - [ ] **Step 2: Fix anything the test exposes** in the order of saves inside `_process_window`.
 
 ### Task 5: Settings, docs and rollout
