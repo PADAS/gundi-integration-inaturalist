@@ -10,6 +10,7 @@ from app.datasource.inaturalist import (
     OBSERVATION_FIELDS,
     INatRequestError,
     get_observations,
+    iter_observation_pages,
     _call_inat,
     _match_annotations_to_config,
     find_existing_projects,
@@ -753,3 +754,86 @@ def test_call_inat_reports_a_connection_lost_mid_answer(monkeypatch):
     monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
     with pytest.raises(INatUnavailableError, match="the connection dropped when asking for observations"):
         _call_inat(page=1, per_page=0)
+
+
+
+# --- iter_observation_pages ---
+
+
+def _paged_inat(mocker, all_obs):
+    """A fake iNat that pages all_obs by updated_since (inclusive), oldest first."""
+    calls = []
+
+    def side_effect(**kwargs):
+        calls.append(kwargs)
+        page, per_page = kwargs.get("page", 1), kwargs.get("per_page")
+        matching = [o for o in all_obs if datetime.fromisoformat(o["updated_at"]) >= kwargs["updated_since"]]
+        if "taxon_id" in kwargs:
+            matching = [o for o in matching if str(o["taxon"]) in kwargs["taxon_id"].split(",")]
+        if per_page == 0:
+            return {"total_results": len(matching), "results": []}
+        start = (page - 1) * per_page
+        return {"total_results": len(matching), "page": page, "per_page": per_page,
+                "results": matching[start:start + per_page]}
+
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=side_effect)
+    return calls
+
+
+def _obs(i, seconds, taxon=1):
+    from datetime import timedelta
+    base = datetime(2026, 6, 19, tzinfo=timezone.utc)
+    return {"id": i, "updated_at": (base + timedelta(seconds=seconds)).isoformat(),
+            "photos": [], "annotations": [], "taxon": taxon}
+
+
+def test_iter_observation_pages_reads_only_the_pages_asked_for(mocker):
+    calls = _paged_inat(mocker, [_obs(i, i) for i in range(1, 1001)])
+
+    pages = iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc))
+    first = next(pages)
+
+    assert [o.id for o in first] == list(range(1, 201))
+    assert [c["page"] for c in calls if c.get("per_page")] == [1]
+
+
+def test_iter_observation_pages_with_several_taxa_batches_is_oldest_first_across_them(mocker):
+    from app.datasource import inaturalist
+    mocker.patch.object(inaturalist, "TAXA_BATCH_SIZE", 1)
+    all_obs = sorted([_obs(i, i * 2, taxon=1) for i in range(1, 6)] +
+                     [_obs(100 + i, i * 2 + 1, taxon=2) for i in range(1, 6)],
+                     key=lambda o: o["updated_at"])
+    _paged_inat(mocker, all_obs)
+
+    pages = list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), taxa="1,2"))
+
+    assert [o.id for page in pages for o in page] == [1, 101, 2, 102, 3, 103, 4, 104, 5, 105]
+
+
+def test_iter_observation_pages_leaves_annotation_filtering_to_the_caller(mocker):
+    """Every observation comes back, so the caller can move its cursor past
+    the ones the filter drops."""
+    _paged_inat(mocker, [_obs(i, i) for i in range(1, 4)])
+
+    pages = list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"22": ["24"]}))
+
+    assert [o.id for page in pages for o in page] == [1, 2, 3]
+
+
+def test_reads_send_one_required_annotation_to_inaturalist(mocker):
+    """iNat narrows the read to observations with the first required term and
+    value; the rest of the config is still checked on our side."""
+    calls = _paged_inat(mocker, [])
+
+    list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"1": ["2", "3"], "17": ["18"]}))
+    get_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"1": ["2", "3"]})
+
+    assert calls and all(c["term_id"] == "1" and c["term_value_id"] == "2" for c in calls)
+
+
+def test_reads_without_annotations_send_no_annotation_filter(mocker):
+    calls = _paged_inat(mocker, [])
+
+    list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc)))
+
+    assert calls and all("term_id" not in c for c in calls)

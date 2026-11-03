@@ -350,11 +350,20 @@ def _get_observations_for_taxa_batch(
     annotations: Optional[Dict],
     fields: str,
 ) -> Dict[int, Observation]:
+    observation_map = {}
+    for page in _iter_batch_pages(base_params, taxa_batch, fields):
+        for o in page:
+            if not annotations or _match_annotations_to_config(o.annotations, annotations):
+                observation_map[o.id] = o
+    return observation_map
+
+
+def _iter_batch_pages(base_params: Dict, taxa_batch: Optional[str], fields: str) -> Iterator[List[Observation]]:
+    """Pages of one taxa batch's observations, oldest change first, before the annotation filter."""
     params = {**base_params}
     if taxa_batch:
         params["taxon_id"] = taxa_batch
 
-    observation_map = {}
     updated_since = params["updated_since"]
     while True:
         window_params = {**params, "updated_since": updated_since}
@@ -371,11 +380,7 @@ def _get_observations_for_taxa_batch(
             for o in observations:
                 if o.updated_at:
                     last_updated_at = o.updated_at
-                if annotations:
-                    if _match_annotations_to_config(o.annotations, annotations):
-                        observation_map[o.id] = o
-                else:
-                    observation_map[o.id] = o
+            yield observations
 
         if inat_count <= INAT_MAX_RESULTS_PER_QUERY:
             break
@@ -406,7 +411,58 @@ def _get_observations_for_taxa_batch(
         )
         updated_since = last_updated_at
 
-    return observation_map
+
+def _observation_query(
+    since: datetime,
+    bounding_box: Optional[List[float]],
+    taxa: Optional[str],
+    projects: Optional[List[str]],
+    quality_grade: Optional[List[str]],
+    annotations: Optional[Dict],
+) -> Tuple[Dict, List[Optional[str]]]:
+    """The query shared by every request, and the taxa batches to run it for."""
+    nelat = nelng = swlat = swlng = None
+    if bounding_box and len(bounding_box) >= 4:
+        nelat, nelng, swlat, swlng = bounding_box[:4]
+
+    base_params = {
+        "updated_since": since,
+        "order_by": "updated_at",
+        "order": "asc",
+    }
+    if projects is not None:
+        base_params["project_id"] = projects
+    if quality_grade is not None:
+        base_params["quality_grade"] = quality_grade
+    base_params.update(_annotation_narrowing(annotations))
+    if nelat is not None and nelng is not None and swlat is not None and swlng is not None:
+        base_params["nelat"] = nelat
+        base_params["nelng"] = nelng
+        base_params["swlat"] = swlat
+        base_params["swlng"] = swlng
+
+    taxa_ids = [t.strip() for t in taxa.split(",") if t.strip()] if taxa else []
+    if taxa_ids:
+        batches = [
+            ",".join(taxa_ids[i:i + TAXA_BATCH_SIZE])
+            for i in range(0, len(taxa_ids), TAXA_BATCH_SIZE)
+        ]
+    else:
+        batches = [None]
+    return base_params, batches
+
+
+def _annotation_narrowing(annotations: Optional[Dict]) -> Dict:
+    """One required annotation (term and value) for iNaturalist to filter on.
+
+    iNat filters on one term at a time and reads several values as "any of",
+    while the config needs every term and every value, so one pair is sent to
+    cut down what iNat returns and _match_annotations_to_config checks the rest.
+    """
+    for term, values in (annotations or {}).items():
+        if values:
+            return {"term_id": str(term), "term_value_id": str(values[0])}
+    return {}
 
 
 def get_observations(
@@ -424,35 +480,8 @@ def get_observations(
     Returns a dict mapping observation id -> Observation for all observations
     that match the filters (and annotation filter when annotations is set).
     """
-    nelat = nelng = swlat = swlng = None
-    if bounding_box and len(bounding_box) >= 4:
-        nelat, nelng, swlat, swlng = bounding_box[:4]
-
     fields = ",".join(OBSERVATION_FIELDS)
-
-    base_params = {
-        "updated_since": since,
-        "order_by": "updated_at",
-        "order": "asc",
-    }
-    if projects is not None:
-        base_params["project_id"] = projects
-    if quality_grade is not None:
-        base_params["quality_grade"] = quality_grade
-    if nelat is not None and nelng is not None and swlat is not None and swlng is not None:
-        base_params["nelat"] = nelat
-        base_params["nelng"] = nelng
-        base_params["swlat"] = swlat
-        base_params["swlng"] = swlng
-
-    taxa_ids = [t.strip() for t in taxa.split(",") if t.strip()] if taxa else []
-    if taxa_ids:
-        batches = [
-            ",".join(taxa_ids[i:i + TAXA_BATCH_SIZE])
-            for i in range(0, len(taxa_ids), TAXA_BATCH_SIZE)
-        ]
-    else:
-        batches = [None]
+    base_params, batches = _observation_query(since, bounding_box, taxa, projects, quality_grade, annotations)
 
     observation_map = {}
     for batch in batches:
@@ -460,3 +489,35 @@ def get_observations(
         observation_map.update(batch_results)
 
     return observation_map
+
+
+def iter_observation_pages(
+    since: datetime,
+    *,
+    bounding_box: Optional[List[float]] = None,
+    taxa: Optional[str] = None,
+    projects: Optional[List[str]] = None,
+    quality_grade: Optional[List[str]] = None,
+    annotations: Optional[Dict] = None,
+) -> Iterator[List[Observation]]:
+    """Pages of observations updated since the given datetime, oldest change
+    first, so a caller can stop reading once it has enough.
+
+    Pages are not annotation-filtered: the caller filters with
+    _match_annotations_to_config, and still sees every observation's updated_at.
+    With several taxa batches the order only holds across all of them, so
+    everything is read first and handed out in order.
+    """
+    fields = ",".join(OBSERVATION_FIELDS)
+    base_params, batches = _observation_query(since, bounding_box, taxa, projects, quality_grade, annotations)
+    if len(batches) == 1:
+        yield from _iter_batch_pages(base_params, batches[0], fields)
+        return
+
+    everything = {}
+    for batch in batches:
+        for page in _iter_batch_pages(base_params, batch, fields):
+            everything.update((o.id, o) for o in page)
+    ordered = sorted(everything.values(), key=lambda o: o.updated_at or since)
+    for i in range(0, len(ordered), INAT_PAGE_SIZE):
+        yield ordered[i:i + INAT_PAGE_SIZE]

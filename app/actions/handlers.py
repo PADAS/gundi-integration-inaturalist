@@ -32,7 +32,10 @@ from app.services.gundi import (
     update_event_in_gundi,
 )
 from app.datasource.inaturalist import (
-    get_observations,
+    INatRequestError,
+    INatUnavailableError,
+    _match_annotations_to_config,
+    iter_observation_pages,
     bbox_to_search_circle,
     find_existing_projects,
     get_projects_by_values,
@@ -43,6 +46,9 @@ from app.datasource.inaturalist import (
 from app.services.state import IntegrationStateManager
 
 GUNDI_SUBMISSION_CHUNK_SIZE = 100
+# With photos: at about a second per photo, a chunk this size fits in the time
+# budget's margin (INAT_PULL_TIME_MARGIN_SECONDS).
+PHOTO_CHUNK_SIZE = 20
 
 # Pull-events state: single key for the cursor (legacy "updated_to" still read for backward compatibility)
 STATE_LAST_RUN_KEY = "last_run"
@@ -53,6 +59,9 @@ STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
 # Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
 RUN_LOCK_TTL_SECONDS = settings.MAX_ACTION_EXECUTION_TIME + 60
+# Pulls in a row in which iNaturalist was down: warnings until this many, then an error.
+STATE_INAT_DOWN_SOURCE_ID = "inat_down"
+INAT_DOWN_RUNS_BEFORE_ERROR = 3
 # The pull's own progress notices give up after this long, so a slow publisher
 # can't hold a stopped run (and its lock) past the time limit by much.
 PROGRESS_LOG_TIMEOUT_SECONDS = 5
@@ -75,7 +84,9 @@ def _build_pull_events_state(last_updated: datetime) -> dict:
     """Build the state dict to persist after a pull_events run."""
     return {STATE_LAST_RUN_KEY: last_updated.strftime(STATE_DATETIME_FMT)}
 
-async def _drop_unknown_projects(integration: Integration, projects: List[str]) -> List[str]:
+async def _drop_unknown_projects(
+        integration: Integration, projects: List[str], timeout: Optional[float] = None
+) -> List[str]:
     """The saved projects that exist on iNaturalist, warning about the rest.
 
     iNat rejects an observations query whose projects are all unknown (422), so
@@ -83,10 +94,11 @@ async def _drop_unknown_projects(integration: Integration, projects: List[str]) 
     projects are used as saved.
     """
     try:
-        existing = find_existing_projects(projects)
-    except (requests.RequestException, BucketFullException) as e:
+        # pyinaturalist is synchronous: a thread keeps the other runs on this instance going.
+        existing = await asyncio.wait_for(asyncio.to_thread(find_existing_projects, projects), timeout)
+    except (requests.RequestException, BucketFullException, asyncio.TimeoutError) as e:
         # BucketFullException is pyinaturalist's rate-limit error, not a RequestException.
-        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e}")
+        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e!r}")
         return projects
     unknown = [p for p in projects if p not in existing]
     if unknown:
@@ -179,6 +191,9 @@ class _PullProgress:
         # Set once the cursor for the next pull is saved: a stop after that
         # point (while publishing the summary) loses nothing.
         self.finished = False
+        # Where the cursor was saved when the run reached the limit of new events.
+        self.capped_at: Optional[datetime] = None
+        self.chunks_done = 0
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
@@ -251,6 +266,9 @@ async def _log_pull_finished(integration: Integration, progress: _PullProgress):
     """Counts in the title: the runner's own "completed" entry keeps them in its details."""
     msg = (f"Pull finished in {_plain_duration(progress.elapsed())}: {progress.counts()}. "
            f"{progress.inat_summary()}.")
+    if progress.capped_at:
+        msg += (f" It stopped at the limit of {settings.INAT_MAX_NEW_EVENTS_PER_PULL} new observations per pull, "
+                f"with observations updated up to {_utc_minute(progress.capped_at)} UTC done.")
     # Only the time left before the limit: the summary must never turn a pull
     # whose work is saved into a timeout that gets retried.
     time_left = settings.MAX_ACTION_EXECUTION_TIME - progress.elapsed() - SUMMARY_TIME_MARGIN_SECONDS
@@ -258,6 +276,32 @@ async def _log_pull_finished(integration: Integration, progress: _PullProgress):
         integration, msg, LogLevel.INFO, progress.data(), "pull summary",
         timeout=min(PROGRESS_LOG_TIMEOUT_SECONDS, time_left),
     )
+
+
+async def _log_pull_paused(integration: Integration, progress: _PullProgress, done_through: Optional[datetime]):
+    """The pull stopped taking new work to stay inside the time limit. Info
+    while it gets further each run; an error when it got nowhere, so a route
+    that can't move shows as unhealthy."""
+    if progress.chunks_done:
+        msg = (f"Pull stopped after {_plain_duration(progress.elapsed())} to stay within the time limit, "
+               f"with observations updated up to {_utc_minute(done_through)} UTC done: {progress.counts()}. "
+               f"{progress.inat_summary()}.")
+        level = LogLevel.INFO
+    else:
+        msg = (f"The pull didn't send anything to Gundi because the time limit came before it finished "
+               f"its first observations. {progress.inat_summary()}.")
+        level = LogLevel.ERROR
+    log = logger.info if level == LogLevel.INFO else logger.error
+    log(f"{msg} Integration ID: {integration.id}.")
+    time_left = settings.MAX_ACTION_EXECUTION_TIME - progress.elapsed() - SUMMARY_TIME_MARGIN_SECONDS
+    await _publish_progress_log(
+        integration, msg, level, progress.data(), "paused-pull notice",
+        timeout=min(PROGRESS_LOG_TIMEOUT_SECONDS, time_left),
+    )
+
+
+def _utc_minute(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
 async def _run_pull(integration: Integration, action_config: PullEventsConfig):
@@ -331,44 +375,69 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         # The config validator already rejects this; this guards configs that
         # bypass it, since the query would pull every observation worldwide.
         await _skip_unbounded_pull(integration)
-        return {'result': {'events_extracted': 0,
-                           'events_updated': 0,
-                           'photos_attached': 0}}
+        return _pull_result(0, 0, 0)
 
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
+
+    # The budget covers the iNaturalist calls too: a thread can't be stopped,
+    # but the run stops waiting for it.
+    deadline = progress.started + _pull_time_budget()
 
     projects = action_config.projects
     if projects:
         progress.step = "checking the saved projects on iNaturalist"
         progress.asked_inat = True
-        projects = await _drop_unknown_projects(integration, projects)
+        projects = await _drop_unknown_projects(integration, projects, timeout=_time_left(deadline))
         if not projects:
             # Pulling without the projects would widen the query to the whole
             # bounding box (or the world), so skip until the config is fixed.
-            return {'result': {'events_extracted': 0,
-                               'events_updated': 0,
-                               'photos_attached': 0}}
+            return _pull_result(0, 0, 0)
 
-    # Todo: write an async version of get_observations that uses httpx.AsyncClient to fetch the observations.
     progress.step = "reading observations from iNaturalist"
     progress.asked_inat = True
     inat_started = time.monotonic()
-    observations = get_observations(
+    annotations = action_config.annotations_dict
+    pages = iter_observation_pages(
         load_since,
         bounding_box=action_config.bounding_box,
         taxa=action_config.taxa_str,
         projects=projects,
         quality_grade=action_config.quality_grade,
-        annotations=action_config.annotations_dict,
+        annotations=annotations,
     )
-    # get_observations blocks, so a stop requested while it runs lands after it
-    # returns: the time it took is what tells iNaturalist's share apart.
+    max_new = settings.INAT_MAX_NEW_EVENTS_PER_PULL
+    # Everything read, oldest change first: the matching ones are sent or
+    # updated, the rest only move the cursor past them.
+    read = []
+    new_ids, patch_targets = set(), {}
+    read_all = False
+    try:
+        while len(new_ids) < max_new and time.monotonic() < deadline:
+            # pyinaturalist is synchronous: a thread keeps the other runs on
+            # this instance going, and lets a stop land while a page is read.
+            page = await _wait_for_read(deadline, asyncio.to_thread(next, pages, None))
+            if page is None:
+                read_all = True
+                break
+            for ob in page:
+                read.append(ob)
+                if not annotations or _match_annotations_to_config(ob.annotations, annotations):
+                    progress.observations_read += 1
+                    await _sort_observation(integration, ob, new_ids, patch_targets)
+                if len(new_ids) >= max_new:
+                    break
+    except (INatUnavailableError, INatRequestError) as e:
+        if not _inat_is_down(e):
+            raise
+        await _handle_inat_down(integration, e)
+        return _pull_result(0, 0, 0)
+    await _clear_inat_down(integration)
+    # The time the read took is what tells iNaturalist's share apart.
     progress.inat_seconds = time.monotonic() - inat_started
-    progress.observations_read = len(observations)
     progress.step = "checking which observations are new or changed"
 
-    if not observations:
+    if read_all and not progress.observations_read:
         since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
         # "Matching": the annotation filter may have dropped what iNaturalist sent.
         msg = f"No new or changed matching iNaturalist observations since {since} UTC."
@@ -386,117 +455,179 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         await state_manager.set_state(
             str(integration.id), "pull_events", _build_pull_events_state(now)
         )
-        return {'result': {'events_extracted': 0,
-                           'events_updated': 0,
-                           'photos_attached': 0}}
+        return _pull_result(0, 0, 0)
 
-    logger.info(f"Processing {len(observations)} observations from iNaturalist.")
+    logger.info(f"Processing {len(read)} observations from iNaturalist.")
 
-    async def get_inaturalist_events_to_patch():
-        # Split observations into: new (create in Gundi) vs existing (patch only if observation changed).
-        patch_these_events = []
-        process_these_events = []
-        for event_id, observation in observations.items():
-            saved_event = await state_manager.get_state(str(integration.id), "pull_events", str(event_id))
-            if not saved_event:
-                process_these_events.append(observation)
-                continue
-            # Only patch when the observation has changed since we last synced it (avoids updating every run)
-            last_synced_at = saved_event.get(STATE_INAT_UPDATED_AT_KEY)
-            if last_synced_at:
-                try:
-                    if isinstance(last_synced_at, str):
-                        last_synced_at = datetime.strptime(last_synced_at, STATE_DATETIME_FMT)
-                    ob_updated = observation.updated_at
-                    if ob_updated.tzinfo is None:
-                        ob_updated = ob_updated.replace(tzinfo=timezone.utc)
-                    if last_synced_at.tzinfo is None:
-                        last_synced_at = last_synced_at.replace(tzinfo=timezone.utc)
-                    if ob_updated <= last_synced_at:
-                        continue  # Already in sync, skip patch
-                except (ValueError, TypeError):
-                    pass  # Bad or legacy value, patch to be safe
-            patch_these_events.append((saved_event.get("object_id"), observation))
-        return process_these_events, patch_these_events
-
-    filtered_observations, events_to_patch = await get_inaturalist_events_to_patch()
-
-    events_to_process = []
-
-    updated_count = 0
-    added_count = 0
-    attachment_count = 0
-
-    if filtered_observations:
-        all_event_photos = {}
-        inat_updated_at_map = {}  # inat_id -> updated_at for state we persist after create
-        newest = None
-        for ob in filtered_observations:
-
-            if(not newest or (newest < ob.created_at)):
-                newest = ob.created_at
-
-            e = _transform_inat_to_gundi_event(ob, action_config)
-            events_to_process.append(e)
-
-            inat_id = e['event_details']['inat_id']
-            inat_updated_at_map[inat_id] = ob.updated_at
-            all_event_photos[inat_id] = []
-            for photo in ob.photos:
-                all_event_photos[inat_id].append((photo.id, photo.large_url if photo.large_url else photo.url))
-
-        logger.info(f"Submitting {len(events_to_process)} iNaturalist observations to Gundi")
-
-        for i, to_add_chunk in enumerate(chunk_list(events_to_process, GUNDI_SUBMISSION_CHUNK_SIZE)):
-
-            logger.info(f"Processing chunk #{i+1}")
-
-            progress.step = "sending new observations to Gundi"
-            response = await send_events_to_gundi(events=to_add_chunk, integration_id=str(integration.id))
-            added_count += len(response)
-            progress.events_sent = added_count
-
-            if response:
-                # Send images as attachments (if available)
-                if action_config.include_photos:
-                    progress.step = "adding photos to the new observations"
-                    attachments_response = await process_attachments(
-                        to_add_chunk, response, all_event_photos, integration, progress
-                    )
-                    attachment_count += attachments_response
-                # Process events to patch
-                progress.step = "saving which observations were sent"
-                await save_events_state(response, to_add_chunk, integration, inat_updated_at_map)
-
-    else:
-        logger.info(f"No new iNaturalist observations to process for integration ID: {str(integration.id)}.")
-
-    if events_to_patch:
-        # Process events to patch
-        logger.info(f"Updating {len(events_to_patch)} events from iNaturalist observations to Gundi for integration ID: {str(integration.id)}.")
-        progress.step = "updating changed observations in Gundi"
-        # Save after each chunk so a run that times out keeps what it finished
-        # and the next run skips those observations.
-        for patch_chunk in chunk_list(events_to_patch, GUNDI_SUBMISSION_CHUNK_SIZE):
+    # Photos are slow (about a second each), so a chunk stays small enough to
+    # finish inside the margin left by the time budget.
+    chunk_size = PHOTO_CHUNK_SIZE if action_config.include_photos else GUNDI_SUBMISSION_CHUNK_SIZE
+    added_count = updated_count = attachment_count = 0
+    done_through = None
+    stopped_early = False
+    for chunk in chunk_list(read, chunk_size):
+        to_add = [ob for ob in chunk if ob.id in new_ids]
+        to_patch = [(patch_targets[ob.id], ob) for ob in chunk if ob.id in patch_targets]
+        # A chunk with nothing to send only moves the cursor, so it never waits on the time.
+        if (to_add or to_patch) and time.monotonic() >= deadline:
+            stopped_early = True
+            break
+        if to_add:
+            added, photos = await _send_new_observations(integration, action_config, to_add, progress)
+            added_count += added
+            attachment_count += photos
+        if to_patch:
             progress.step = "updating changed observations in Gundi"
-            response = await patch_events(patch_chunk, action_config, integration, progress)
+            response = await patch_events(to_patch, action_config, integration, progress)
             updated_count += len(response)
             progress.step = "saving which observations were updated"
-            await save_patched_events_state(patch_chunk, integration)
+            await save_patched_events_state(to_patch, integration)
+        done_through = chunk[-1].updated_at
+        progress.chunks_done += 1
 
-    last_updated = max(ob.updated_at for ob in observations.values())
-    logger.info("Updating state through %s", last_updated)
-    progress.step = "saving where the next pull starts"
-    await state_manager.set_state(
-        str(integration.id), "pull_events", _build_pull_events_state(last_updated)
-    )
+    # Inclusive: the next pull reads from this time again and skips what was saved.
+    if done_through is not None:
+        progress.step = "saving where the next pull starts"
+        await state_manager.set_state(
+            str(integration.id), "pull_events", _build_pull_events_state(done_through)
+        )
     progress.finished = True
 
-    await _log_pull_finished(integration, progress)
+    if stopped_early or not (read_all or len(new_ids) >= max_new):
+        # Out of time, while reading or sending.
+        await _log_pull_paused(integration, progress, done_through)
+    else:
+        if not read_all:
+            progress.capped_at = done_through
+        await _log_pull_finished(integration, progress)
 
-    return {'result': {'events_extracted': added_count,
-                       'events_updated': updated_count,
-                       'photos_attached': attachment_count}}
+    return _pull_result(added_count, updated_count, attachment_count)
+
+
+def _pull_result(added: int, updated: int, photos: int) -> dict:
+    # Gundi monitoring reads these numbers.
+    return {'result': {'events_extracted': added,
+                       'events_updated': updated,
+                       'photos_attached': photos}}
+
+
+def _time_left(deadline: float) -> float:
+    return max(deadline - time.monotonic(), 0)
+
+
+async def _wait_for_read(deadline: float, read):
+    """The read, or INatUnavailableError if it outlasts the time budget."""
+    try:
+        return await asyncio.wait_for(read, _time_left(deadline))
+    except asyncio.TimeoutError as e:
+        raise INatUnavailableError("no answer in time when asked for observations") from e
+
+
+def _pull_time_budget() -> float:
+    """Seconds a pull may spend before it stops taking new chunks: the tighter
+    of the runner's and Cloud Run's limits, less a margin for the chunk in
+    flight and the summary."""
+    limit = min(settings.MAX_ACTION_EXECUTION_TIME, settings.INAT_PULL_TIME_LIMIT_SECONDS)
+    return limit - settings.INAT_PULL_TIME_MARGIN_SECONDS
+
+
+async def _sort_observation(integration: Integration, observation: Observation, new_ids: set, patch_targets: dict):
+    """Add the observation's id to new_ids when it isn't in Gundi yet, or to
+    patch_targets ({id: Gundi object_id}) when it changed since it was last
+    synced. An observation already in sync goes in neither."""
+    saved_event = await state_manager.get_state(str(integration.id), "pull_events", str(observation.id))
+    if not saved_event:
+        new_ids.add(observation.id)
+        return
+    # Only patch when the observation has changed since we last synced it (avoids updating every run)
+    last_synced_at = saved_event.get(STATE_INAT_UPDATED_AT_KEY)
+    if last_synced_at:
+        try:
+            if isinstance(last_synced_at, str):
+                last_synced_at = datetime.strptime(last_synced_at, STATE_DATETIME_FMT)
+            ob_updated = observation.updated_at
+            if ob_updated.tzinfo is None:
+                ob_updated = ob_updated.replace(tzinfo=timezone.utc)
+            if last_synced_at.tzinfo is None:
+                last_synced_at = last_synced_at.replace(tzinfo=timezone.utc)
+            if ob_updated <= last_synced_at:
+                return  # Already in sync, skip patch
+        except (ValueError, TypeError):
+            pass  # Bad or legacy value, patch to be safe
+    patch_targets[observation.id] = saved_event.get("object_id")
+
+
+async def _send_new_observations(integration, action_config, observations, progress: _PullProgress):
+    """Send one chunk of new observations with their photos, then save their
+    state, so a stop after it loses nothing and repeats nothing."""
+    events = []
+    all_event_photos = {}
+    inat_updated_at_map = {}  # inat_id -> updated_at for state we persist after create
+    for ob in observations:
+        e = _transform_inat_to_gundi_event(ob, action_config)
+        events.append(e)
+        inat_id = e['event_details']['inat_id']
+        inat_updated_at_map[inat_id] = ob.updated_at
+        all_event_photos[inat_id] = [
+            (photo.id, photo.large_url if photo.large_url else photo.url) for photo in ob.photos
+        ]
+
+    logger.info(f"Submitting {len(events)} iNaturalist observations to Gundi")
+    progress.step = "sending new observations to Gundi"
+    response = await send_events_to_gundi(events=events, integration_id=str(integration.id))
+    progress.events_sent += len(response)
+    photos = 0
+    if response:
+        if action_config.include_photos:
+            progress.step = "adding photos to the new observations"
+            photos = await process_attachments(events, response, all_event_photos, integration, progress)
+        progress.step = "saving which observations were sent"
+        await save_events_state(response, events, integration, inat_updated_at_map)
+    return len(response), photos
+
+
+def _inat_is_down(error: Exception) -> bool:
+    """iNaturalist didn't answer, or answered with a server error (5xx): its
+    side, and usually short-lived. A 4xx is a problem with the query."""
+    if isinstance(error, INatUnavailableError):
+        return True
+    response = getattr(error, "response", None)
+    return response is not None and response.status_code >= 500
+
+
+async def _handle_inat_down(integration: Integration, error: Exception):
+    """A warning while iNaturalist is down for a run or two; an error (so the
+    route shows as unhealthy) from the INAT_DOWN_RUNS_BEFORE_ERROR-th pull in a row."""
+    saved = await state_manager.get_state(str(integration.id), "pull_events", STATE_INAT_DOWN_SOURCE_ID)
+    runs = (saved or {}).get("runs", 0) + 1
+    await state_manager.set_state(
+        str(integration.id), "pull_events", {"runs": runs}, source_id=STATE_INAT_DOWN_SOURCE_ID
+    )
+    reason = getattr(error, "message", None) or str(error)
+    if runs >= INAT_DOWN_RUNS_BEFORE_ERROR:
+        # Logged here rather than raised: a raised 5xx would be redelivered and
+        # run again at once, adding load while iNaturalist is struggling.
+        msg = (f"The pull didn't get observations from iNaturalist because it had a problem "
+               f"{runs} pulls in a row: {reason}.")
+        level = LogLevel.ERROR
+    else:
+        msg = f"The pull didn't get observations from iNaturalist because iNaturalist had a problem: {reason}."
+        level = LogLevel.WARNING
+    log = logger.error if level == LogLevel.ERROR else logger.warning
+    log(f"{msg} Integration ID: {integration.id}.")
+    await log_action_activity(
+        integration_id=integration.id,
+        action_id="pull_events",
+        level=level,
+        title=msg,
+        data={"reason": reason, "pulls_in_a_row": runs},
+    )
+
+
+async def _clear_inat_down(integration: Integration):
+    saved = await state_manager.get_state(str(integration.id), "pull_events", STATE_INAT_DOWN_SOURCE_ID)
+    if saved and saved.get("runs"):
+        await state_manager.delete_state(str(integration.id), "pull_events", STATE_INAT_DOWN_SOURCE_ID)
 
 
 async def process_attachments(events, response, all_event_photos, integration, progress: Optional[_PullProgress] = None):
