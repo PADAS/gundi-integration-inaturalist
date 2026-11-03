@@ -2,7 +2,10 @@ from typing import Optional, List, Dict, Literal
 import json
 import pydantic
 from pyinaturalist.constants import QUALITY_GRADES
-from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration
+from .core import (
+    PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration,
+    InternalActionConfiguration,
+)
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
@@ -360,6 +363,15 @@ class PullEventsConfig(PullActionConfiguration):
             },
             "else": {"required": ["days_to_load"]},
         }
+
+
+class AddPhotosConfig(InternalActionConfiguration):
+    """Started by pull_events (and by itself, to continue): the observations
+    whose photos are still to add. The photos themselves are listed in each
+    observation's saved state."""
+    observation_ids: List[str] = pydantic.Field(default_factory=list)
+    # Photo runs in a row that couldn't add any photo, for the warning/error choice.
+    runs_without_progress: int = 0
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):

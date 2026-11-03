@@ -10,3 +10,18 @@ INAT_TAXA_CACHE_ENABLED = env.bool("INAT_TAXA_CACHE_ENABLED", True)
 INAT_TAXA_CACHE_TTL_SECONDS = env.int("INAT_TAXA_CACHE_TTL_SECONDS", 86400, validate=lambda n: n > 0)
 INAT_TAXA_CACHE_MISSING_TTL_SECONDS = env.int("INAT_TAXA_CACHE_MISSING_TTL_SECONDS", 300, validate=lambda n: n > 0)
 INAT_TAXA_CACHE_TIMEOUT_SECONDS = env.float("INAT_TAXA_CACHE_TIMEOUT_SECONDS", 0.5, validate=lambda s: s > 0)
+
+# Most new events one pull_events run sends to Gundi: the run reads from
+# iNaturalist only until it has found this many, so a large backlog drains over
+# several scheduled runs. Updates found on the way are sent too and don't count.
+INAT_MAX_NEW_EVENTS_PER_PULL = env.int("INAT_MAX_NEW_EVENTS_PER_PULL", 150, validate=lambda n: n > 0)
+# A pull stops taking new work this many seconds before the tighter of
+# MAX_ACTION_EXECUTION_TIME and INAT_PULL_TIME_LIMIT_SECONDS (Cloud Run's request
+# timeout), so it ends with its progress saved instead of being cut off.
+INAT_PULL_TIME_LIMIT_SECONDS = env.int("INAT_PULL_TIME_LIMIT_SECONDS", 300, validate=lambda n: n > 0)
+INAT_PULL_TIME_MARGIN_SECONDS = env.int("INAT_PULL_TIME_MARGIN_SECONDS", 60, validate=lambda n: n >= 0)
+
+# pull_events starts add_photos through the runner's actions topic. The infra
+# module names it "<name>-actions-topic" and doesn't pass the name to the
+# service, so fall back to it here; an env var still overrides it.
+INTEGRATION_COMMANDS_TOPIC = env.str("INTEGRATION_COMMANDS_TOPIC", "inaturalist-actions-topic")

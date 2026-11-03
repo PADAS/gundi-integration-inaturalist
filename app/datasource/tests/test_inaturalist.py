@@ -10,6 +10,7 @@ from app.datasource.inaturalist import (
     OBSERVATION_FIELDS,
     INatRequestError,
     get_observations,
+    iter_observation_pages,
     _call_inat,
     _match_annotations_to_config,
     find_existing_projects,
@@ -370,7 +371,7 @@ def test_call_inat_ignores_html_error_body(monkeypatch):
         "app.datasource.inaturalist.get_observations_v2",
         MagicMock(side_effect=_http_error(text="<html><body>502 Bad Gateway</body></html>")),
     )
-    with pytest.raises(INatRequestError, match=r"^iNaturalist answered with an error when asked for observations: 422 Unprocessable Entity$"):
+    with pytest.raises(INatRequestError, match=r"^iNaturalist answered with an error \(422 Unprocessable Entity\)$"):
         _call_inat(page=1, per_page=0)
 
 
@@ -382,15 +383,15 @@ def test_call_inat_names_inaturalist_without_the_query_url(monkeypatch):
     )
     with pytest.raises(INatRequestError) as excinfo:
         _call_inat(page=1, per_page=0)
-    assert str(excinfo.value).startswith("iNaturalist answered with an error when asked for observations")
+    assert str(excinfo.value).startswith("iNaturalist answered with an error")
     assert "for url" not in str(excinfo.value)
 
 
 @pytest.mark.parametrize("error, message", [
-    (requests.ReadTimeout("read timed out"), "no answer in time when asked for observations"),
-    (requests.ConnectTimeout("connect timed out"), "no answer in time when asked for observations"),
-    (requests.ConnectionError("Remote end closed connection"), "the connection dropped when asking for observations"),
-    (requests.exceptions.RetryError("too many 503 error responses"), "it kept answering with errors when asked for observations"),
+    (requests.ReadTimeout("read timed out"), "iNaturalist didn't answer in time"),
+    (requests.ConnectTimeout("connect timed out"), "iNaturalist didn't answer in time"),
+    (requests.ConnectionError("Remote end closed connection"), "the connection to iNaturalist dropped"),
+    (requests.exceptions.RetryError("too many 503 error responses"), "iNaturalist kept answering with errors"),
 ])
 def test_call_inat_reports_an_unavailable_inaturalist(monkeypatch, error, message):
     from app.datasource.inaturalist import INatUnavailableError
@@ -409,7 +410,7 @@ def test_an_unavailable_inaturalist_is_not_retried():
     from app.datasource.inaturalist import INatUnavailableError
     from app.services.retry_policies import is_retryable_failure
 
-    assert is_retryable_failure(INatUnavailableError("no answer in time when asked for observations")) is False
+    assert is_retryable_failure(INatUnavailableError("iNaturalist didn't answer in time")) is False
 
 
 def test_get_observations_raises_inat_request_error(monkeypatch):
@@ -742,7 +743,7 @@ def test_call_inat_reports_a_read_timeout_after_retries_as_no_answer(monkeypatch
     reason = ReadTimeoutError(None, "/v2/observations", "Read timed out.")
     error = requests.ConnectionError(MaxRetryError(None, "/v2/observations", reason=reason))
     monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
-    with pytest.raises(INatUnavailableError, match="no answer in time when asked for observations"):
+    with pytest.raises(INatUnavailableError, match="iNaturalist didn't answer in time"):
         _call_inat(page=1, per_page=0)
 
 
@@ -751,5 +752,88 @@ def test_call_inat_reports_a_connection_lost_mid_answer(monkeypatch):
 
     error = requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead")
     monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
-    with pytest.raises(INatUnavailableError, match="the connection dropped when asking for observations"):
+    with pytest.raises(INatUnavailableError, match="the connection to iNaturalist dropped"):
         _call_inat(page=1, per_page=0)
+
+
+
+# --- iter_observation_pages ---
+
+
+def _paged_inat(mocker, all_obs):
+    """A fake iNat that pages all_obs by updated_since (inclusive), oldest first."""
+    calls = []
+
+    def side_effect(**kwargs):
+        calls.append(kwargs)
+        page, per_page = kwargs.get("page", 1), kwargs.get("per_page")
+        matching = [o for o in all_obs if datetime.fromisoformat(o["updated_at"]) >= kwargs["updated_since"]]
+        if "taxon_id" in kwargs:
+            matching = [o for o in matching if str(o["taxon"]) in kwargs["taxon_id"].split(",")]
+        if per_page == 0:
+            return {"total_results": len(matching), "results": []}
+        start = (page - 1) * per_page
+        return {"total_results": len(matching), "page": page, "per_page": per_page,
+                "results": matching[start:start + per_page]}
+
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=side_effect)
+    return calls
+
+
+def _obs(i, seconds, taxon=1):
+    from datetime import timedelta
+    base = datetime(2026, 6, 19, tzinfo=timezone.utc)
+    return {"id": i, "updated_at": (base + timedelta(seconds=seconds)).isoformat(),
+            "photos": [], "annotations": [], "taxon": taxon}
+
+
+def test_iter_observation_pages_reads_only_the_pages_asked_for(mocker):
+    calls = _paged_inat(mocker, [_obs(i, i) for i in range(1, 1001)])
+
+    pages = iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc))
+    first = next(pages)
+
+    assert [o.id for o in first] == list(range(1, 201))
+    assert [c["page"] for c in calls if c.get("per_page")] == [1]
+
+
+def test_iter_observation_pages_with_several_taxa_batches_is_oldest_first_across_them(mocker):
+    from app.datasource import inaturalist
+    mocker.patch.object(inaturalist, "TAXA_BATCH_SIZE", 1)
+    all_obs = sorted([_obs(i, i * 2, taxon=1) for i in range(1, 6)] +
+                     [_obs(100 + i, i * 2 + 1, taxon=2) for i in range(1, 6)],
+                     key=lambda o: o["updated_at"])
+    _paged_inat(mocker, all_obs)
+
+    pages = list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), taxa="1,2"))
+
+    assert [o.id for page in pages for o in page] == [1, 101, 2, 102, 3, 103, 4, 104, 5, 105]
+
+
+def test_iter_observation_pages_leaves_annotation_filtering_to_the_caller(mocker):
+    """Every observation comes back, so the caller can move its cursor past
+    the ones the filter drops."""
+    _paged_inat(mocker, [_obs(i, i) for i in range(1, 4)])
+
+    pages = list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"22": ["24"]}))
+
+    assert [o.id for page in pages for o in page] == [1, 2, 3]
+
+
+def test_reads_send_one_required_annotation_to_inaturalist(mocker):
+    """iNat narrows the read to observations with the first required term and
+    value; the rest of the config is still checked on our side."""
+    calls = _paged_inat(mocker, [])
+
+    list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"1": ["2", "3"], "17": ["18"]}))
+    get_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"1": ["2", "3"]})
+
+    assert calls and all(c["term_id"] == "1" and c["term_value_id"] == "2" for c in calls)
+
+
+def test_reads_without_annotations_send_no_annotation_filter(mocker):
+    calls = _paged_inat(mocker, [])
+
+    list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc)))
+
+    assert calls and all("term_id" not in c for c in calls)
