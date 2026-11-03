@@ -44,7 +44,7 @@ async def test_execute_pull_observations_action(
         if getattr(c.kwargs["event"].payload, "title", None)
     ]
     summary = next(t for t in titles if t.startswith("Pull finished in "))
-    assert "2 new observations sent to Gundi, 0 updated, 5 photos added" in summary
+    assert "It sent 2 new iNaturalist observations to Gundi, updated 0 and added 5 photos" in summary
     assert "iNaturalist took " in summary
 
 

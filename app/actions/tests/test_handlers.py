@@ -568,7 +568,7 @@ async def test_action_pull_events_skips_when_no_saved_project_exists(mocker):
     get_observations.assert_not_called()
     warning = activity.call_args.kwargs
     assert warning["level"] == LogLevel.WARNING
-    assert "pull was skipped" in warning["title"]
+    assert warning["title"].startswith("The pull didn't run because none of the saved projects exist on iNaturalist")
 
 
 @pytest.mark.asyncio
@@ -663,7 +663,7 @@ async def test_action_pull_events_skip_says_the_previous_pull_is_still_running(m
 
     await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
-    assert mock_log.call_args.kwargs["title"] == "Pull skipped: the previous pull is still running."
+    assert mock_log.call_args.kwargs["title"] == "The pull didn't run because the previous pull for this connection is still running."
     assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
 
 
@@ -679,7 +679,7 @@ async def test_action_pull_events_no_new_observations_is_info_with_the_window(mo
 
     await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
-    assert mock_log.call_args.kwargs["title"] == "No new or changed matching iNaturalist observations since 2026-10-29 08:00 UTC."
+    assert mock_log.call_args.kwargs["title"] == "No observations matching the settings were added or changed on iNaturalist since 2026-10-29 08:00 UTC."
     assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
 
 
@@ -721,8 +721,9 @@ async def test_a_stopped_pull_says_where_it_was(mocker):
 
     stopped = mock_log.call_args.kwargs
     assert stopped["level"] == LogLevel.WARNING
-    assert stopped["title"].startswith("The pull was stopped after 0 s while sending new observations to Gundi. ")
-    assert "Reading from iNaturalist took 0 s, with 1 matching observation; at least 0 new observations sent to Gundi" in stopped["title"]
+    assert stopped["title"].startswith("The pull was cut off after 0 seconds while sending new observations to Gundi. ")
+    assert ("Before that, it sent at least 0 new iNaturalist observations to Gundi, updated 0 and added 0 photos. "
+            "Reading from iNaturalist took 0 seconds and found 1 observation that matches the settings.") in stopped["title"]
     assert stopped["data"]["observations_matched"] == 1
     mock_state.delete_state_if_value.assert_called_once()  # the lock is still released
 
@@ -876,8 +877,8 @@ async def test_process_attachments_counts_each_upload_as_it_lands(mocker):
 
 
 @pytest.mark.parametrize("seconds, text", [
-    (45, "45 s"),
-    (119, "119 s"),
+    (45, "45 seconds"),
+    (119, "119 seconds"),
     (120, "2 minutes"),
     (539, "9 minutes"),
     (510, "9 minutes"),
@@ -897,14 +898,14 @@ def test_progress_messages_use_singular_for_one():
     progress.observations_read = 1
     progress.events_sent = 1
     progress.photos_added = 1
-    assert progress.counts() == "1 new observation sent to Gundi, 0 updated, 1 photo added"
-    assert progress.inat_summary() == "Reading from iNaturalist took 1 s, with 1 matching observation"
+    assert progress.counts() == "it sent 1 new iNaturalist observation to Gundi, updated 0 and added 1 photo"
+    assert progress.inat_summary() == "Reading from iNaturalist took 1 second and found 1 observation that matches the settings"
     progress.observations_read = 2
     progress.events_sent = 0
     progress.photos_added = 3
-    assert progress.counts() == "0 new observations sent to Gundi, 0 updated, 3 photos added"
-    assert progress.inat_summary() == "Reading from iNaturalist took 1 s, with 2 matching observations"
-    assert progress.counts(at_least=True) == "at least 0 new observations sent to Gundi, 0 updated, 3 photos added"
+    assert progress.counts() == "it sent 0 new iNaturalist observations to Gundi, updated 0 and added 3 photos"
+    assert progress.inat_summary() == "Reading from iNaturalist took 1 second and found 2 observations that match the settings"
+    assert progress.counts(at_least=True) == "it sent at least 0 new iNaturalist observations to Gundi, updated 0 and added 3 photos"
 
 
 @pytest.mark.asyncio
@@ -1181,8 +1182,8 @@ async def test_a_pull_stops_reading_once_it_has_the_limit_of_new_events(mocker):
     assert result["result"]["events_extracted"] == 3
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:03:00+0000"
     finished = [t for t in _titles(mock_log) if t.startswith("Pull finished")][-1]
-    assert finished.endswith("It stopped at the limit of 3 new observations per pull, "
-                             "with observations updated up to 2026-10-29 08:03 UTC done.")
+    assert finished.endswith("It stopped after 3 new observations, the most one pull sends. "
+                             "Observations changed on iNaturalist up to 2026-10-29 08:03 UTC are in Gundi.")
 
 
 @pytest.mark.asyncio
@@ -1252,7 +1253,8 @@ async def test_a_pull_stops_on_the_time_budget_with_its_progress_saved(mocker):
     assert result["result"]["events_extracted"] == 2
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
     paused = [t for t in _titles(mock_log, LogLevel.INFO) if t.startswith("Pull stopped after")]
-    assert paused and "with observations updated up to 2026-10-29 08:02 UTC done: 2 new observations sent to Gundi" in paused[0]
+    assert paused and ("Observations changed on iNaturalist up to 2026-10-29 08:02 UTC are in Gundi: "
+                       "it sent 2 new iNaturalist observations to Gundi") in paused[0]
     assert not _titles(mock_log, LogLevel.ERROR)
 
 
@@ -1274,7 +1276,7 @@ async def test_a_pull_that_runs_out_of_time_before_any_work_logs_an_error(mocker
     assert "no-source" not in store  # the cursor stays where it was
     errors = _titles(mock_log, LogLevel.ERROR)
     assert errors and errors[0].startswith(
-        "The pull didn't send anything to Gundi because the time limit came before it finished its first observations.")
+        "The pull didn't send anything to Gundi because it ran out of time while ")
 
 
 def test_the_time_budget_uses_the_tighter_limit(mocker):
@@ -1294,11 +1296,11 @@ def _inat_down_error(kind):
     from app.datasource.inaturalist import INatRequestError, INatUnavailableError
 
     if kind == "unavailable":
-        return INatUnavailableError("no answer in time when asked for observations")
+        return INatUnavailableError("iNaturalist didn't answer in time")
     response = requests.Response()
     response.status_code = 503 if kind == "503" else 422
     response.reason = "Backend fetch failed" if kind == "503" else "Unprocessable"
-    return INatRequestError(f"iNaturalist answered with an error when asked for observations: {response.status_code}",
+    return INatRequestError(f"iNaturalist answered with an error ({response.status_code})",
                             response=response)
 
 
@@ -1311,9 +1313,10 @@ async def test_inaturalist_down_is_a_warning_until_it_repeats(mocker, kind):
     for _ in range(2):
         result = await action_pull_events(_lock_test_integration(), _config())
         assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
-    warnings = [t for t in _titles(mock_log, LogLevel.WARNING) if "iNaturalist had a problem" in t]
+    warnings = [t for t in _titles(mock_log, LogLevel.WARNING)
+                if t.startswith("The pull didn't get observations from iNaturalist because ")]
     assert len(warnings) == 2
-    assert warnings[0].startswith("The pull didn't get observations from iNaturalist because iNaturalist had a problem: ")
+    assert "iNaturalist" in warnings[0].split("because ", 1)[1]
     assert store["inat_down"] == {"runs": 2}
 
     # The third pull in a row is an error, logged by the pull itself: a raised
@@ -1322,7 +1325,8 @@ async def test_inaturalist_down_is_a_warning_until_it_repeats(mocker, kind):
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
     errors = _titles(mock_log, LogLevel.ERROR)
     assert len(errors) == 1
-    assert errors[0].startswith("The pull didn't get observations from iNaturalist because it had a problem 3 pulls in a row: ")
+    assert errors[0].startswith("The pull didn't get observations from iNaturalist because ")
+    assert errors[0].endswith(" This is pull 3 in a row with a problem on iNaturalist's side.")
     assert store["inat_down"] == {"runs": 3}
 
 
@@ -1349,9 +1353,10 @@ async def test_a_rejected_query_is_an_error_right_away(mocker):
 
 
 @pytest.mark.asyncio
-async def test_a_read_that_outlasts_the_time_budget_counts_as_inaturalist_not_answering(mocker):
+async def test_a_read_that_outlasts_the_time_budget_is_logged_as_running_out_of_time(mocker):
     """The read runs in a thread that can't be stopped, but the run stops
-    waiting for it at the budget, so it ends inside the time limit."""
+    waiting for it at the budget. iNaturalist may be answering fine, so the
+    log says the pull ran out of time, not that iNaturalist had a problem."""
     import asyncio
     import threading
 
@@ -1365,10 +1370,11 @@ async def test_a_read_that_outlasts_the_time_budget_counts_as_inaturalist_not_an
         release.set()
 
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
-    warnings = _titles(mock_log, LogLevel.WARNING)
-    assert warnings[-1] == ("The pull didn't get observations from iNaturalist because iNaturalist had a problem: "
-                            "no answer in time when asked for observations.")
-    assert store["inat_down"] == {"runs": 1}
+    assert not [t for t in _titles(mock_log) if "didn't get observations from iNaturalist" in t]
+    errors = _titles(mock_log, LogLevel.ERROR)
+    assert errors == ["The pull didn't send anything to Gundi because it ran out of time while reading "
+                      "observations from iNaturalist, before any were ready to send."]
+    assert "inat_down" not in store
     assert "no-source" not in store  # the cursor stays where it was
 
 
@@ -1431,7 +1437,7 @@ async def test_inaturalist_failing_after_some_pages_keeps_what_was_sent(mocker):
 
     def pages():
         yield [_observation(1), _observation(2)]
-        raise INatUnavailableError("the connection dropped when asking for observations")
+        raise INatUnavailableError("the connection to iNaturalist dropped")
     _, send, store, mock_log = _pull_setup(mocker, 0, pages=pages())
 
     result = await action_pull_events(_lock_test_integration(), _config())
@@ -1439,7 +1445,7 @@ async def test_inaturalist_failing_after_some_pages_keeps_what_was_sent(mocker):
     assert result["result"]["events_extracted"] == 2
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
     assert _titles(mock_log, LogLevel.WARNING)[-1].startswith(
-        "The pull didn't get observations from iNaturalist because iNaturalist had a problem: ")
+        "The pull didn't get observations from iNaturalist because the connection to iNaturalist dropped.")
 
 
 @pytest.mark.asyncio

@@ -313,7 +313,7 @@ def _call_inat(**params) -> Dict:
     except requests.HTTPError as e:
         detail = _error_detail(e.response)
         status = f"{e.response.status_code} {e.response.reason or ''}".strip() if e.response is not None else str(e)
-        message = f"iNaturalist answered with an error when asked for observations: {status}"
+        message = f"iNaturalist answered with an error ({status})"
         raise INatRequestError(
             f"{message} - {detail}" if detail else message,
             request=e.request, response=e.response,
@@ -321,19 +321,19 @@ def _call_inat(**params) -> Dict:
     except requests.exceptions.RetryError as e:
         # pyinaturalist's session retries 5xx answers itself; this is what is left
         # when every retry got one.
-        raise INatUnavailableError("it kept answering with errors when asked for observations") from e
+        raise INatUnavailableError("iNaturalist kept answering with errors") from e
     except requests.Timeout as e:
         # Before ConnectionError: a connect timeout is both.
-        raise INatUnavailableError("no answer in time when asked for observations") from e
+        raise INatUnavailableError("iNaturalist didn't answer in time") from e
     except requests.ConnectionError as e:
         # A read timeout that outlasts the session's retries arrives as a
         # ConnectionError wrapping urllib3's MaxRetryError: tell it apart by its reason.
         if isinstance(getattr(e.args[0] if e.args else None, "reason", None), urllib3.exceptions.TimeoutError):
-            raise INatUnavailableError("no answer in time when asked for observations") from e
-        raise INatUnavailableError("the connection dropped when asking for observations") from e
+            raise INatUnavailableError("iNaturalist didn't answer in time") from e
+        raise INatUnavailableError("the connection to iNaturalist dropped") from e
     except requests.exceptions.ChunkedEncodingError as e:
         # The connection closed partway through an answer.
-        raise INatUnavailableError("the connection dropped when asking for observations") from e
+        raise INatUnavailableError("the connection to iNaturalist dropped") from e
 
 
 TAXA_BATCH_SIZE = 100

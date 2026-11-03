@@ -103,11 +103,11 @@ async def _drop_unknown_projects(
     unknown = [p for p in projects if p not in existing]
     if unknown:
         if existing:
-            msg = (f"These saved projects don't exist on iNaturalist and were left out of the pull: "
+            msg = (f"These saved projects don't exist on iNaturalist, so the pull left them out: "
                    f"{', '.join(unknown)}.")
         else:
-            msg = (f"None of the saved projects exist on iNaturalist ({', '.join(unknown)}), "
-                   f"so the pull was skipped. Update the projects in the configuration.")
+            msg = (f"The pull didn't run because none of the saved projects exist on iNaturalist "
+                   f"({', '.join(unknown)}). Update the projects in the settings.")
         logger.warning(f"{msg} Integration ID: {integration.id}.")
         try:
             await log_action_activity(
@@ -125,8 +125,8 @@ async def _drop_unknown_projects(
 
 async def _skip_unbounded_pull(integration: Integration):
     """Record that a pull with no project and no bounding box was refused."""
-    msg = ("The pull was skipped: the configuration has no project and no bounding box, "
-           "so it would load observations worldwide. Choose a project or draw a bounding box.")
+    msg = ("The pull didn't run because the settings have no project and no bounding box, "
+           "so it would load observations from the whole world. Choose a project or draw a bounding box.")
     logger.error(f"{msg} Integration ID: {integration.id}.")
     try:
         await log_action_activity(
@@ -148,7 +148,7 @@ def chunk_list(list_a, chunk_size):
 def _plain_duration(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 120:
-        return f"{seconds} s"
+        return _count(seconds, "second", "seconds")
     # Nearest minute: 8 min 59 s next to a 540 s limit should read as 9.
     # Half up, unlike round(), which sends 8.5 to 8.
     return f"{(seconds + 30) // 60} minutes"
@@ -169,6 +169,10 @@ def _clock_run(func):
         finally:
             _run_started.reset(token)
     return wrapper
+
+
+def _capitalized(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 def _count(n: int, singular: str, plural: str) -> str:
@@ -201,16 +205,17 @@ class _PullProgress:
     def counts(self, at_least: bool = False) -> str:
         # A stopped run can't know about a batch that was in flight when it stopped.
         prefix = "at least " if at_least else ""
-        return (f"{prefix}{_count(self.events_sent, 'new observation', 'new observations')} sent to Gundi, "
-                f"{self.events_updated} updated, {_count(self.photos_added, 'photo', 'photos')} added")
+        return (f"it sent {prefix}{_count(self.events_sent, 'new iNaturalist observation', 'new iNaturalist observations')} "
+                f"to Gundi, updated {self.events_updated} and added {_count(self.photos_added, 'photo', 'photos')}")
 
     def inat_summary(self) -> str:
         if self.inat_seconds is not None:
             # Counted after the annotation filter, so "matching", not "sent". The
             # time includes the client's own rate limiting and parsing, hence
             # "reading from", not "iNaturalist took".
-            return (f"Reading from iNaturalist took {_plain_duration(self.inat_seconds)}, "
-                    f"with {_count(self.observations_read, 'matching observation', 'matching observations')}")
+            found = _count(self.observations_read, "observation that matches", "observations that match")
+            return (f"Reading from iNaturalist took {_plain_duration(self.inat_seconds)} "
+                    f"and found {found} the settings")
         if self.asked_inat:
             return "Reading from iNaturalist hadn't finished"
         return "Reading from iNaturalist hadn't started"
@@ -256,19 +261,19 @@ async def _publish_progress_log(
 async def _log_pull_stopped(integration: Integration, progress: _PullProgress):
     """Say where a pull was when it was stopped (the runner's time limit, or the
     service shutting down). The runner logs the stop itself, without this detail."""
-    msg = (f"The pull was stopped after {_plain_duration(progress.elapsed())} while {progress.step}. "
-           f"{progress.inat_summary()}; {progress.counts(at_least=True)}.")
+    msg = (f"The pull was cut off after {_plain_duration(progress.elapsed())} while {progress.step}. "
+           f"Before that, {progress.counts(at_least=True)}. {progress.inat_summary()}.")
     logger.warning(f"{msg} Integration ID: {integration.id}.")
     await _publish_progress_log(integration, msg, LogLevel.WARNING, progress.data(), "stopped-pull notice")
 
 
 async def _log_pull_finished(integration: Integration, progress: _PullProgress):
     """Counts in the title: the runner's own "completed" entry keeps them in its details."""
-    msg = (f"Pull finished in {_plain_duration(progress.elapsed())}: {progress.counts()}. "
+    msg = (f"Pull finished in {_plain_duration(progress.elapsed())}. {_capitalized(progress.counts())}. "
            f"{progress.inat_summary()}.")
     if progress.capped_at:
-        msg += (f" It stopped at the limit of {settings.INAT_MAX_NEW_EVENTS_PER_PULL} new observations per pull, "
-                f"with observations updated up to {_utc_minute(progress.capped_at)} UTC done.")
+        msg += (f" It stopped after {settings.INAT_MAX_NEW_EVENTS_PER_PULL} new observations, the most one pull "
+                f"sends. Observations changed on iNaturalist up to {_utc_minute(progress.capped_at)} UTC are in Gundi.")
     # Only the time left before the limit: the summary must never turn a pull
     # whose work is saved into a timeout that gets retried.
     time_left = settings.MAX_ACTION_EXECUTION_TIME - progress.elapsed() - SUMMARY_TIME_MARGIN_SECONDS
@@ -283,13 +288,13 @@ async def _log_pull_paused(integration: Integration, progress: _PullProgress, do
     while it gets further each run; an error when it got nowhere, so a route
     that can't move shows as unhealthy."""
     if progress.chunks_done:
-        msg = (f"Pull stopped after {_plain_duration(progress.elapsed())} to stay within the time limit, "
-               f"with observations updated up to {_utc_minute(done_through)} UTC done: {progress.counts()}. "
-               f"{progress.inat_summary()}.")
+        msg = (f"Pull stopped after {_plain_duration(progress.elapsed())} so it would finish within its time "
+               f"limit. Observations changed on iNaturalist up to {_utc_minute(done_through)} UTC are in Gundi: "
+               f"{progress.counts()}. {progress.inat_summary()}.")
         level = LogLevel.INFO
     else:
-        msg = (f"The pull didn't send anything to Gundi because the time limit came before it finished "
-               f"its first observations. {progress.inat_summary()}.")
+        msg = (f"The pull didn't send anything to Gundi because it ran out of time while {progress.step}, "
+               f"before any were ready to send.")
         level = LogLevel.ERROR
     log = logger.info if level == LogLevel.INFO else logger.error
     log(f"{msg} Integration ID: {integration.id}.")
@@ -331,7 +336,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         value=lock_token,
     )
     if not acquired:
-        msg = "Pull skipped: the previous pull is still running."
+        msg = "The pull didn't run because the previous pull for this connection is still running."
         logger.info(f"{msg} Integration ID: {integration_id}.")
         try:
             await log_action_activity(
@@ -422,9 +427,15 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 break
             progress.step = "reading observations from iNaturalist"
             read_started = time.monotonic()
-            # pyinaturalist is synchronous: a thread keeps the other runs on
-            # this instance going, and lets a stop land while a page is read.
-            page = await _wait_for_read(deadline, asyncio.to_thread(next, pages, None))
+            try:
+                # pyinaturalist is synchronous: a thread keeps the other runs on
+                # this instance going, and lets a stop land while a page is read.
+                page = await asyncio.wait_for(asyncio.to_thread(next, pages, None), _time_left(deadline))
+            except asyncio.TimeoutError:
+                # Our time budget ran out, not iNaturalist: logged as a stop on time.
+                stopped_on_time = True
+                break
+            # Pages that came back only, so an unfinished read says so.
             progress.inat_seconds = (progress.inat_seconds or 0) + time.monotonic() - read_started
             if page is None:
                 read_all = True
@@ -482,7 +493,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     if read_all and not progress.observations_read:
         since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
         # "Matching": the annotation filter may have dropped what iNaturalist sent.
-        msg = f"No new or changed matching iNaturalist observations since {since} UTC."
+        msg = f"No observations matching the settings were added or changed on iNaturalist since {since} UTC."
         logger.info(f"{msg} Integration ID: {integration.id}.")
         # Info, not warning: a quiet window is a normal outcome.
         await log_action_activity(
@@ -518,14 +529,6 @@ def _pull_result(added: int, updated: int, photos: int) -> dict:
 
 def _time_left(deadline: float) -> float:
     return max(deadline - time.monotonic(), 0)
-
-
-async def _wait_for_read(deadline: float, read):
-    """The read, or INatUnavailableError if it outlasts the time budget."""
-    try:
-        return await asyncio.wait_for(read, _time_left(deadline))
-    except asyncio.TimeoutError as e:
-        raise INatUnavailableError("no answer in time when asked for observations") from e
 
 
 def _pull_time_budget() -> float:
@@ -612,11 +615,11 @@ async def _handle_inat_down(integration: Integration, error: Exception):
     if runs >= INAT_DOWN_RUNS_BEFORE_ERROR:
         # Logged here rather than raised: a raised 5xx would be redelivered and
         # run again at once, adding load while iNaturalist is struggling.
-        msg = (f"The pull didn't get observations from iNaturalist because it had a problem "
-               f"{runs} pulls in a row: {reason}.")
+        msg = (f"The pull didn't get observations from iNaturalist because {reason}. "
+               f"This is pull {runs} in a row with a problem on iNaturalist's side.")
         level = LogLevel.ERROR
     else:
-        msg = f"The pull didn't get observations from iNaturalist because iNaturalist had a problem: {reason}."
+        msg = f"The pull didn't get observations from iNaturalist because {reason}."
         level = LogLevel.WARNING
     log = logger.error if level == LogLevel.ERROR else logger.warning
     log(f"{msg} Integration ID: {integration.id}.")
@@ -671,12 +674,12 @@ async def process_attachments(events, response, all_event_photos, integration, p
                 "attachments": [filename for filename, _ in attachments],
                 "integration_id": str(integration.id)
             }
-            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"
-            logger.exception(message, extra={
+            message = f"Photos for one observation weren't added to Gundi event {gundi_id} because of an error: {e}"
+            logger.exception(f"{message}. Request: {request}", extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
-            log_data = {"message": message}
+            log_data = {"message": message, "request": request}
             if isinstance(e, GundiAPIError):
                 log_data["server_response_body"] = e.detail
             elif server_response := getattr(e, "response", None):
