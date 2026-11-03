@@ -860,3 +860,21 @@ def test_get_observations_reads_everything(mocker):
     _paged_inat(mocker, [_obs(i, i) for i in range(1, 451)])
 
     assert len(get_observations(datetime(2026, 6, 19, tzinfo=timezone.utc))) == 450
+
+
+def test_read_observations_sends_one_required_annotation_to_inaturalist(mocker):
+    """iNat narrows the read to observations with the first required term and
+    value; the rest of the config is still checked on our side."""
+    calls = _paged_inat(mocker, [])
+
+    read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"1": ["2", "3"], "17": ["18"]})
+
+    assert all(c["term_id"] == "1" and c["term_value_id"] == "2" for c in calls)
+
+
+def test_read_observations_without_annotations_sends_no_annotation_filter(mocker):
+    calls = _paged_inat(mocker, [])
+
+    read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={})
+
+    assert all("term_id" not in c for c in calls)

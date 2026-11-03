@@ -72,6 +72,19 @@ def _match_annotations_to_config(annotations: List[Annotation], config: Dict) ->
     return True
 
 
+def _annotation_narrowing(annotations: Optional[Dict]) -> Dict:
+    """One required annotation (term and value) for iNaturalist to filter on.
+
+    iNat filters on one term at a time and reads several values as "any of",
+    while the config needs every term and every value, so one pair is sent to
+    cut down what iNat returns and _match_annotations_to_config checks the rest.
+    """
+    for term, values in (annotations or {}).items():
+        if values:
+            return {"term_id": str(term), "term_value_id": str(values[0])}
+    return {}
+
+
 def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     lat1, lng1, lat2, lng2 = map(radians, (lat1, lng1, lat2, lng2))
     a = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lng2 - lng1) / 2) ** 2
@@ -488,6 +501,9 @@ def read_observations(
         base_params["project_id"] = projects
     if quality_grade is not None:
         base_params["quality_grade"] = quality_grade
+    narrowing = _annotation_narrowing(annotations)
+    if narrowing:
+        base_params.update(narrowing)
     if nelat is not None and nelng is not None and swlat is not None and swlng is not None:
         base_params["nelat"] = nelat
         base_params["nelng"] = nelng

@@ -1254,9 +1254,14 @@ async def test_inaturalist_down_is_a_warning_until_it_repeats(mocker, kind):
     assert warnings[0].startswith("The pull didn't get observations from iNaturalist because iNaturalist had a problem: ")
     assert store["inat_down"] == {"runs": 2}
 
-    # The third pull in a row raises, and the runner logs it as an error.
-    with pytest.raises(Exception):
-        await action_pull_events(_lock_test_integration(), _config())
+    # The third pull in a row is an error, logged by the pull itself: a raised
+    # 5xx would be redelivered and run again at once.
+    result = await action_pull_events(_lock_test_integration(), _config())
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    errors = _titles(mock_log, LogLevel.ERROR)
+    assert len(errors) == 1
+    assert errors[0].startswith("The pull didn't get observations from iNaturalist because it had a problem 3 pulls in a row: ")
+    assert store["inat_down"] == {"runs": 3}
 
 
 @pytest.mark.asyncio

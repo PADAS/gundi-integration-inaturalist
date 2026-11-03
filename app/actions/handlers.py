@@ -587,22 +587,28 @@ def _inat_is_down(error: Exception) -> bool:
 
 async def _handle_inat_down(integration: Integration, error: Exception):
     """A warning while iNaturalist is down for a run or two; an error (so the
-    route shows as unhealthy) once it has failed INAT_DOWN_RUNS_BEFORE_ERROR
-    pulls in a row."""
+    route shows as unhealthy) from the INAT_DOWN_RUNS_BEFORE_ERROR-th pull in a row."""
     saved = await state_manager.get_state(str(integration.id), "pull_events", STATE_INAT_DOWN_SOURCE_ID)
     runs = (saved or {}).get("runs", 0) + 1
     await state_manager.set_state(
         str(integration.id), "pull_events", {"runs": runs}, source_id=STATE_INAT_DOWN_SOURCE_ID
     )
-    if runs >= INAT_DOWN_RUNS_BEFORE_ERROR:
-        raise error
     reason = getattr(error, "message", None) or str(error)
-    msg = f"The pull didn't get observations from iNaturalist because iNaturalist had a problem: {reason}."
-    logger.warning(f"{msg} Integration ID: {integration.id}.")
+    if runs >= INAT_DOWN_RUNS_BEFORE_ERROR:
+        # Logged here rather than raised: a raised 5xx would be redelivered and
+        # run again at once, adding load while iNaturalist is struggling.
+        msg = (f"The pull didn't get observations from iNaturalist because it had a problem "
+               f"{runs} pulls in a row: {reason}.")
+        level = LogLevel.ERROR
+    else:
+        msg = f"The pull didn't get observations from iNaturalist because iNaturalist had a problem: {reason}."
+        level = LogLevel.WARNING
+    log = logger.error if level == LogLevel.ERROR else logger.warning
+    log(f"{msg} Integration ID: {integration.id}.")
     await log_action_activity(
         integration_id=integration.id,
         action_id="pull_events",
-        level=LogLevel.WARNING,
+        level=level,
         title=msg,
         data={"reason": reason, "pulls_in_a_row": runs},
     )
