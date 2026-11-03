@@ -83,7 +83,9 @@ def _build_pull_events_state(last_updated: datetime) -> dict:
     """Build the state dict to persist after a pull_events run."""
     return {STATE_LAST_RUN_KEY: last_updated.strftime(STATE_DATETIME_FMT)}
 
-async def _drop_unknown_projects(integration: Integration, projects: List[str]) -> List[str]:
+async def _drop_unknown_projects(
+        integration: Integration, projects: List[str], timeout: Optional[float] = None
+) -> List[str]:
     """The saved projects that exist on iNaturalist, warning about the rest.
 
     iNat rejects an observations query whose projects are all unknown (422), so
@@ -92,10 +94,10 @@ async def _drop_unknown_projects(integration: Integration, projects: List[str]) 
     """
     try:
         # pyinaturalist is synchronous: a thread keeps the other runs on this instance going.
-        existing = await asyncio.to_thread(find_existing_projects, projects)
-    except (requests.RequestException, BucketFullException) as e:
+        existing = await asyncio.wait_for(asyncio.to_thread(find_existing_projects, projects), timeout)
+    except (requests.RequestException, BucketFullException, asyncio.TimeoutError) as e:
         # BucketFullException is pyinaturalist's rate-limit error, not a RequestException.
-        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e}")
+        logger.warning(f"Could not check the saved iNaturalist projects for integration ID: {integration.id}: {e!r}")
         return projects
     unknown = [p for p in projects if p not in existing]
     if unknown:
@@ -377,11 +379,15 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     state = await state_manager.get_state(integration.id, "pull_events")
     load_since = _get_load_since(state, action_config.days_to_load)
 
+    # The budget covers the iNaturalist calls too: a thread can't be stopped,
+    # but the run stops waiting for it.
+    deadline = progress.started + _pull_time_budget()
+
     projects = action_config.projects
     if projects:
         progress.step = "checking the saved projects on iNaturalist"
         progress.asked_inat = True
-        projects = await _drop_unknown_projects(integration, projects)
+        projects = await _drop_unknown_projects(integration, projects, timeout=_time_left(deadline))
         if not projects:
             # Pulling without the projects would widen the query to the whole
             # bounding box (or the world), so skip until the config is fixed.
@@ -393,7 +399,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     try:
         # pyinaturalist is synchronous: a thread keeps the other runs on this
         # instance going, and lets a stop land while the read is in progress.
-        read = await asyncio.to_thread(
+        read = await _wait_for_read(deadline, asyncio.to_thread(
             read_observations,
             load_since,
             bounding_box=action_config.bounding_box,
@@ -402,7 +408,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
             quality_grade=action_config.quality_grade,
             annotations=action_config.annotations_dict,
             max_results=settings.INAT_MAX_OBSERVATIONS_PER_PULL,
-        )
+        ))
     except (INatUnavailableError, INatRequestError) as e:
         if not _inat_is_down(e):
             raise
@@ -449,7 +455,6 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     ordered = sorted(observations.values(), key=lambda ob: ob.updated_at)
     new_ids, patch_targets = await _split_new_and_changed(integration, ordered)
 
-    deadline = progress.started + _pull_time_budget()
     # Photos are slow (about a second each), so a chunk stays small enough to
     # finish inside the margin left by the time budget.
     chunk_size = PHOTO_CHUNK_SIZE if action_config.include_photos else GUNDI_SUBMISSION_CHUNK_SIZE
@@ -508,6 +513,18 @@ def _pull_result(added: int, updated: int, photos: int) -> dict:
     return {'result': {'events_extracted': added,
                        'events_updated': updated,
                        'photos_attached': photos}}
+
+
+def _time_left(deadline: float) -> float:
+    return max(deadline - time.monotonic(), 0)
+
+
+async def _wait_for_read(deadline: float, read):
+    """The read, or INatUnavailableError if it outlasts the time budget."""
+    try:
+        return await asyncio.wait_for(read, _time_left(deadline))
+    except asyncio.TimeoutError as e:
+        raise INatUnavailableError("no answer in time when asked for observations") from e
 
 
 def _pull_time_budget() -> float:

@@ -947,7 +947,7 @@ async def test_a_pull_stopped_while_checking_projects_says_so(mocker):
     mocker.patch("app.actions.handlers.state_manager", mock_state)
     started = asyncio.Event()
 
-    async def hang(integration, projects):
+    async def hang(integration, projects, **kwargs):
         started.set()
         await asyncio.Event().wait()
 
@@ -1203,8 +1203,15 @@ async def test_a_pull_stops_on_the_time_budget_with_its_progress_saved(mocker):
 @pytest.mark.asyncio
 async def test_a_pull_that_runs_out_of_time_before_any_work_logs_an_error(mocker):
     """No progress at all is a stuck route: an error, so it shows as unhealthy."""
-    mocker.patch("app.actions.handlers._pull_time_budget", return_value=-1)
-    _, send, store, mock_log = _pull_setup(mocker, 5)
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    read, send, store, mock_log = _pull_setup(mocker, 5)
+    observations = read.side_effect
+
+    def slow_read(*args, **kwargs):
+        now[0] += 250  # the read uses up the 240 s budget
+        return observations(*args, **kwargs)
+    read.side_effect = slow_read
 
     await action_pull_events(_lock_test_integration(), _config())
 
@@ -1283,3 +1290,47 @@ async def test_a_rejected_query_is_an_error_right_away(mocker):
 
     with pytest.raises(INatRequestError):
         await action_pull_events(_lock_test_integration(), _config())
+
+
+
+@pytest.mark.asyncio
+async def test_a_read_that_outlasts_the_time_budget_counts_as_inaturalist_not_answering(mocker):
+    """The read runs in a thread that can't be stopped, but the run stops
+    waiting for it at the budget, so it ends inside the time limit."""
+    import asyncio
+    import threading
+
+    _, _, store, mock_log = _pull_setup(mocker, 0)
+    release, started = threading.Event(), threading.Event()
+    _mock_read(mocker, side_effect=_blocking(release, started))
+    mocker.patch("app.actions.handlers._pull_time_budget", return_value=0.2)
+    try:
+        result = await asyncio.wait_for(action_pull_events(_lock_test_integration(), _config()), timeout=5)
+    finally:
+        release.set()
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+    warnings = _titles(mock_log, LogLevel.WARNING)
+    assert warnings[-1] == ("The pull didn't get observations from iNaturalist because iNaturalist had a problem: "
+                            "no answer in time when asked for observations.")
+    assert store["inat_down"] == {"runs": 1}
+    assert "no-source" not in store  # the cursor stays where it was
+
+
+@pytest.mark.asyncio
+async def test_a_project_check_that_outlasts_the_time_budget_uses_the_saved_projects(mocker):
+    import asyncio
+    import threading
+
+    read, _, _, _ = _pull_setup(mocker, 0)
+    release, started = threading.Event(), threading.Event()
+    mocker.patch("app.actions.handlers.find_existing_projects", side_effect=_blocking(release, started))
+    time_left = iter([0.2] + [240] * 10)  # short for the project check, enough for the read
+    mocker.patch("app.actions.handlers._time_left", side_effect=lambda deadline: next(time_left))
+    try:
+        await asyncio.wait_for(
+            action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, projects=["p"])), timeout=5)
+    finally:
+        release.set()
+
+    assert read.call_args.kwargs["projects"] == ["p"]
