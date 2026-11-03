@@ -17,6 +17,7 @@ from gundi_client_v2.errors import GundiAPIError
 
 from app import settings
 from app.actions.configurations import (
+    AddPhotosConfig,
     PullEventsConfig,
     ListProjectsQuery,
     ListAnnotationTermsQuery,
@@ -25,6 +26,7 @@ from app.actions.configurations import (
 )
 from app.actions import taxa_cache
 from app.actions.core import ReferenceDataResponse, ReferenceOption, action_title
+from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, ephemeral_run, log_action_activity
 from app.services.gundi import (
     send_event_attachments_to_gundi,
@@ -46,9 +48,19 @@ from app.datasource.inaturalist import (
 from app.services.state import IntegrationStateManager
 
 GUNDI_SUBMISSION_CHUNK_SIZE = 100
-# With photos: at about a second per photo, a chunk this size fits in the time
-# budget's margin (INAT_PULL_TIME_MARGIN_SECONDS).
-PHOTO_CHUNK_SIZE = 20
+# Per-observation state: photos still to add to its Gundi event, as [photo_id, url]
+# pairs. pull_events writes the list when it creates the event; add_photos empties it.
+STATE_PHOTOS_PENDING_KEY = "photos_pending"
+# Held by the photo run working on an observation, so two runs never upload its photos twice.
+STATE_PHOTOS_LOCK_PREFIX = "photos_lock."
+# Seconds a photo run waits before trying failed photos again, while it has time left.
+PHOTO_RETRY_WAIT_SECONDS = 30
+# Photo runs in a row that add nothing: warnings until this many (about an hour), then errors.
+PHOTO_RUNS_BEFORE_ERROR = 15
+# Answers that mean a photo can't be added at all (iNat no longer has it, or the event is gone).
+PHOTO_GONE_STATUSES = {403, 404, 410}
+# Seconds one photo download may take, at most (less near the deadline).
+PHOTO_DOWNLOAD_TIMEOUT_SECONDS = 120
 
 # Pull-events state: single key for the cursor (legacy "updated_to" still read for backward compatibility)
 STATE_LAST_RUN_KEY = "last_run"
@@ -191,7 +203,7 @@ class _PullProgress:
         self.observations_read = 0
         self.events_sent = 0
         self.events_updated = 0
-        self.photos_added = 0
+        self.photos_handed_off = 0
         # Set once the cursor for the next pull is saved: a stop after that
         # point (while publishing the summary) loses nothing.
         self.finished = False
@@ -205,8 +217,11 @@ class _PullProgress:
     def counts(self, at_least: bool = False) -> str:
         # A stopped run can't know about a batch that was in flight when it stopped.
         prefix = "at least " if at_least else ""
-        return (f"it sent {prefix}{_count(self.events_sent, 'new iNaturalist observation', 'new iNaturalist observations')} "
-                f"to Gundi, updated {self.events_updated} and added {_count(self.photos_added, 'photo', 'photos')}")
+        text = (f"it sent {prefix}{_count(self.events_sent, 'new iNaturalist observation', 'new iNaturalist observations')} "
+                f"to Gundi and updated {self.events_updated}")
+        if self.photos_handed_off:
+            text += f", and handed their {_count(self.photos_handed_off, 'photo', 'photos')} to a separate photo run"
+        return text
 
     def inat_summary(self) -> str:
         if self.inat_seconds is not None:
@@ -228,13 +243,13 @@ class _PullProgress:
             "observations_matched": self.observations_read,
             "events_sent": self.events_sent,
             "events_updated": self.events_updated,
-            "photos_added": self.photos_added,
+            "photos_handed_off": self.photos_handed_off,
         }
 
 
 async def _publish_progress_log(
         integration: Integration, title: str, level: LogLevel, data: dict, what: str,
-        timeout: Optional[float] = None,
+        timeout: Optional[float] = None, action_id: str = "pull_events",
 ):
     """Best-effort and bounded: a slow publisher must not keep a pull running."""
     if timeout is None:
@@ -246,7 +261,7 @@ async def _publish_progress_log(
         await asyncio.wait_for(
             log_action_activity(
                 integration_id=integration.id,
-                action_id="pull_events",
+                action_id=action_id,
                 level=level,
                 title=title,
                 data=data,
@@ -410,9 +425,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         annotations=annotations,
     )
     max_new = settings.INAT_MAX_NEW_EVENTS_PER_PULL
-    # Photos are slow (about a second each), so a chunk stays small enough to
-    # finish inside the margin left by the time budget.
-    chunk_size = PHOTO_CHUNK_SIZE if action_config.include_photos else GUNDI_SUBMISSION_CHUNK_SIZE
+    # Photos are added by a separate photo run, so chunks only create and update events.
+    chunk_size = GUNDI_SUBMISSION_CHUNK_SIZE
     # Page by page, oldest change first: each page is sent in chunks and the
     # cursor saved after each one, until max_new new observations, the end of
     # what changed, or the time budget.
@@ -566,32 +580,37 @@ async def _sort_observation(integration: Integration, observation: Observation, 
 
 
 async def _send_new_observations(integration, action_config, observations, progress: _PullProgress):
-    """Send one chunk of new observations with their photos, then save their
-    state, so a stop after it loses nothing and repeats nothing."""
+    """Send one chunk of new observations and save their state, listing each
+    one's photos as pending; then start a photo run to add them. Recording the
+    event before any photo work means a stop never sends it twice."""
     events = []
-    all_event_photos = {}
+    pending_photos = {}  # inat_id -> [[photo_id, url], ...]
     inat_updated_at_map = {}  # inat_id -> updated_at for state we persist after create
     for ob in observations:
         e = _transform_inat_to_gundi_event(ob, action_config)
         events.append(e)
         inat_id = e['event_details']['inat_id']
         inat_updated_at_map[inat_id] = ob.updated_at
-        all_event_photos[inat_id] = [
-            (photo.id, photo.large_url if photo.large_url else photo.url) for photo in ob.photos
-        ]
+        if action_config.include_photos:
+            pending_photos[inat_id] = [
+                [photo.id, photo.large_url if photo.large_url else photo.url] for photo in ob.photos
+            ]
 
     logger.info(f"Submitting {len(events)} iNaturalist observations to Gundi")
     progress.step = "sending new observations to Gundi"
     response = await send_events_to_gundi(events=events, integration_id=str(integration.id))
     progress.events_sent += len(response)
-    photos = 0
-    if response:
-        if action_config.include_photos:
-            progress.step = "adding photos to the new observations"
-            photos = await process_attachments(events, response, all_event_photos, integration, progress)
-        progress.step = "saving which observations were sent"
-        await save_events_state(response, events, integration, inat_updated_at_map)
-    return len(response), photos
+    if not response:
+        return 0, 0
+    progress.step = "saving which observations were sent"
+    await save_events_state(response, events, integration, inat_updated_at_map, pending_photos)
+    with_photos = [e['event_details']['inat_id'] for e in events[:len(response)]
+                   if pending_photos.get(e['event_details']['inat_id'])]
+    if with_photos and not ephemeral_run.get():
+        progress.step = "starting a photo run for the new observations"
+        await trigger_action(str(integration.id), "add_photos", AddPhotosConfig(observation_ids=with_photos))
+        progress.photos_handed_off += sum(len(pending_photos[i]) for i in with_photos)
+    return len(response), 0
 
 
 def _inat_is_down(error: Exception) -> bool:
@@ -634,65 +653,150 @@ async def _clear_inat_down(integration: Integration):
         await state_manager.delete_state(str(integration.id), "pull_events", STATE_INAT_DOWN_SOURCE_ID)
 
 
-async def process_attachments(events, response, all_event_photos, integration, progress: Optional[_PullProgress] = None):
-    attachments_processed = 0
-    for event, event_id in zip(events, response):
-        inat_id = event['event_details']['inat_id']
-        gundi_id = event_id['object_id']
-        available_photos = all_event_photos.get(inat_id, [])
-        if not available_photos:
-            continue
-        attachments = []
+class _PhotoGone(Exception):
+    """The photo can't be added at all: iNat no longer has it, or the Gundi event is gone."""
+
+
+async def _add_photo(integration: Integration, gundi_id: str, photo_id, url: str, deadline: float):
+    """Download one photo and attach it to the Gundi event. Raises _PhotoGone
+    when it can never be added, and anything else when a later try may work."""
+    filename = f"{photo_id}.{url.split('.')[-1]}"
+    timeout = max(min(PHOTO_DOWNLOAD_TIMEOUT_SECONDS, deadline - time.monotonic()), 1)
+    logger.info(f"Adding {url} to Gundi event {gundi_id}")
+    async with httpx.AsyncClient(timeout=timeout, verify=False) as session:
+        image_response = await session.get(url)
+    if image_response.status_code in PHOTO_GONE_STATUSES:
+        raise _PhotoGone("iNaturalist no longer has it")
+    image_response.raise_for_status()
+    try:
+        await send_event_attachments_to_gundi(
+            event_id=gundi_id, attachments=[(filename, image_response.content)], integration_id=str(integration.id)
+        )
+    except GundiAPIError as e:
+        if getattr(e, "status_code", None) in PHOTO_GONE_STATUSES:
+            raise _PhotoGone("its event is no longer in Gundi") from e
+        raise
+
+
+class _PhotoRun:
+    """What one photo run did, for its log entry."""
+
+    def __init__(self):
+        self.started = _run_started.get() or time.monotonic()
+        self.added = 0
+        self.gone = 0
+        self.observations_done = 0
+        self.last_problem: Optional[str] = None
+
+
+async def _add_pending_photos(integration: Integration, obs_id: str, deadline: float, run: _PhotoRun) -> bool:
+    """Add one observation's pending photos, saving after each. True when none
+    are left; False when time ran out or a photo failed (it stays pending)."""
+    integration_id = str(integration.id)
+    note = await state_manager.get_state(integration_id, "pull_events", obs_id)
+    pending = list((note or {}).get(STATE_PHOTOS_PENDING_KEY) or [])
+    while pending:
+        if time.monotonic() >= deadline:
+            return False
+        photo_id, url = pending[0]
         try:
-            for photo_id, photo_url in available_photos:
-                logger.info(f"Adding {photo_url} from iNat event {inat_id} to Gundi event {gundi_id}")
-
-                filename = str(photo_id) + "." + photo_url.split(".")[-1]
-
-                async with httpx.AsyncClient(timeout=120, verify=False) as session:
-                    image_response = await session.get(photo_url)
-                    image_response.raise_for_status()
-
-                img = await image_response.aread()
-
-                attachments.append((filename, img))
-
-            attachments_response = await send_event_attachments_to_gundi(
-                event_id=gundi_id,
-                attachments=attachments,
-                integration_id=str(integration.id)
-            )
-            if attachments_response:
-                attachments_processed += len(attachments)
-                # Per upload, so a pull stopped mid-chunk counts the photos already added.
-                if progress:
-                    progress.photos_added += len(attachments)
+            await _add_photo(integration, note["object_id"], photo_id, url, deadline)
+            run.added += 1
+        except _PhotoGone as e:
+            logger.warning(f"Photo {photo_id} for iNaturalist observation {obs_id} wasn't added because {e}.")
+            run.gone += 1
         except Exception as e:
-            request = {
-                "event_id": gundi_id,
-                # Filenames only: the tuples also hold the raw photo bytes.
-                "attachments": [filename for filename, _ in attachments],
-                "integration_id": str(integration.id)
-            }
-            message = f"Photos for one observation weren't added to Gundi event {gundi_id} because of an error: {e}"
-            logger.exception(f"{message}. Request: {request}", extra={
-                "integration_id": str(integration.id),
-                "attention_needed": True
-            })
-            log_data = {"message": message, "request": request}
-            if isinstance(e, GundiAPIError):
-                log_data["server_response_body"] = e.detail
-            elif server_response := getattr(e, "response", None):
-                log_data["server_response_body"] = server_response.text
-            await log_action_activity(
-                integration_id=integration.id,
-                action_id="pull_events",
-                level=LogLevel.WARNING,
-                title=message,
-                data=log_data
-            )
-            continue
-    return attachments_processed
+            logger.warning(f"Photo {photo_id} for iNaturalist observation {obs_id} wasn't added yet: {e!r}")
+            run.last_problem = _plain_problem(e)
+            return False
+        pending.pop(0)
+        note[STATE_PHOTOS_PENDING_KEY] = pending
+        await state_manager.set_state(integration_id, "pull_events", note, source_id=obs_id)
+    run.observations_done += 1
+    return True
+
+
+def _plain_problem(error: Exception) -> str:
+    """Why a photo couldn't be added this time, in plain words."""
+    if isinstance(error, httpx.TimeoutException):
+        return "a photo download from iNaturalist didn't finish in time"
+    if isinstance(error, httpx.TransportError):
+        return "the connection to iNaturalist's photo server dropped"
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"iNaturalist's photo server answered with an error ({error.response.status_code})"
+    if isinstance(error, GundiAPIError):
+        return "Gundi didn't accept a photo"
+    return "a photo couldn't be added"
+
+
+@action_title("Add iNaturalist Photos")
+@_clock_run
+@activity_logger()
+async def action_add_photos(integration: Integration, action_config: AddPhotosConfig):
+    """Add the pending photos of the given observations' Gundi events, until the
+    time budget; then start another photo run for whatever is left."""
+    integration_id = str(integration.id)
+    run = _PhotoRun()
+    deadline = run.started + _pull_time_budget()
+    left = list(action_config.observation_ids)
+    while left and time.monotonic() < deadline:
+        failed = []
+        for index, obs_id in enumerate(left):
+            if time.monotonic() >= deadline:
+                failed.extend(left[index:])
+                break
+            # Another photo run (a repeated message) may be on this observation: leave it to that run.
+            lock_token = uuid4().hex
+            lock_id = STATE_PHOTOS_LOCK_PREFIX + obs_id
+            if not await state_manager.set_if_absent(
+                    integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=lock_id,
+                    value=lock_token):
+                continue
+            try:
+                if not await _add_pending_photos(integration, obs_id, deadline, run):
+                    failed.append(obs_id)
+            finally:
+                await state_manager.delete_state_if_value(integration_id, "pull_events", lock_token, source_id=lock_id)
+        left = failed
+        if left and time.monotonic() + PHOTO_RETRY_WAIT_SECONDS < deadline and run.last_problem:
+            await asyncio.sleep(PHOTO_RETRY_WAIT_SECONDS)
+
+    made_progress = bool(run.added or run.gone)
+    runs_without_progress = 0 if made_progress else action_config.runs_without_progress + 1
+    if left:
+        await trigger_action(integration_id, "add_photos", AddPhotosConfig(
+            observation_ids=left, runs_without_progress=runs_without_progress))
+    await _log_photo_run(integration, run, left, runs_without_progress)
+    return {"result": {"photos_attached": run.added, "photos_not_available": run.gone,
+                       "observations_left": len(left)}}
+
+
+async def _log_photo_run(integration: Integration, run: _PhotoRun, left: List[str], runs_without_progress: int):
+    took = _plain_duration(time.monotonic() - run.started)
+    msg = f"Added {_count(run.added, 'photo', 'photos')} to iNaturalist observations in Gundi in {took}."
+    if run.gone:
+        msg += (f" {run.gone} of the photos couldn't be added because iNaturalist no longer has them "
+                f"or their event is no longer in Gundi.")
+    level = LogLevel.INFO
+    if left:
+        still = f"Photos for {_count(len(left), 'observation are', 'observations are')} still to add"
+        still = still.replace("1 observation are", "1 observation is")
+        msg += f" {still}, and another photo run was started for them."
+        if runs_without_progress:
+            problem = run.last_problem or "the time ran out"
+            msg = (f"No photos were added to iNaturalist observations in Gundi because {problem}. "
+                   f"{still}, and another photo run was started for them.")
+            level = LogLevel.WARNING
+            if runs_without_progress >= PHOTO_RUNS_BEFORE_ERROR:
+                msg += f" This is photo run {runs_without_progress} in a row that couldn't add any."
+                level = LogLevel.ERROR
+    log = {LogLevel.INFO: logger.info, LogLevel.WARNING: logger.warning}.get(level, logger.error)
+    log(f"{msg} Integration ID: {integration.id}.")
+    await _publish_progress_log(integration, msg, level, {
+        "photos_added": run.added, "photos_not_available": run.gone,
+        "observations_done": run.observations_done, "observations_left": len(left),
+        "runs_without_progress": runs_without_progress,
+    }, "photo run summary", action_id="add_photos")
 
 
 async def patch_events(events, updated_config_data, integration, progress: Optional[_PullProgress] = None):
@@ -713,9 +817,11 @@ async def patch_events(events, updated_config_data, integration, progress: Optio
     return responses
 
 
-async def save_events_state(response, events, integration, inat_updated_at_map=None):
-    """Persist Gundi event state per observation so we know what we created and when we last synced."""
+async def save_events_state(response, events, integration, inat_updated_at_map=None, pending_photos=None):
+    """Persist Gundi event state per observation so we know what we created and when we last synced,
+    and which of its photos are still to add."""
     inat_updated_at_map = inat_updated_at_map or {}
+    pending_photos = pending_photos or {}
     for saved_event, event in zip(response, events):
         try:
             event_id = event["event_details"]["inat_id"]
@@ -726,6 +832,8 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
                     updated_at.strftime(STATE_DATETIME_FMT)
                     if hasattr(updated_at, "strftime") else str(updated_at)
                 )
+            if pending_photos.get(event_id):
+                state[STATE_PHOTOS_PENDING_KEY] = pending_photos[event_id]
             await state_manager.set_state(
                 integration_id=str(integration.id),
                 action_id="pull_events",
@@ -747,7 +855,10 @@ async def save_patched_events_state(events_to_patch, integration):
     for gundi_object_id, observation in events_to_patch:
         try:
             updated_at = observation.updated_at
+            # Keep the rest of the note: its photos may still be pending.
+            saved = await state_manager.get_state(str(integration.id), "pull_events", str(observation.id))
             state = {
+                **(saved or {}),
                 "object_id": gundi_object_id,
                 STATE_INAT_UPDATED_AT_KEY: (
                     updated_at.strftime(STATE_DATETIME_FMT)

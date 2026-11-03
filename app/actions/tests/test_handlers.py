@@ -18,7 +18,6 @@ from app.actions.handlers import (
     _transform_inat_to_gundi_event,
     action_pull_events,
     chunk_list,
-    process_attachments,
 )
 from app.actions.configurations import PullEventsConfig
 
@@ -487,40 +486,6 @@ async def test_action_pull_events_does_not_release_a_lock_taken_after_its_own_ex
     assert "had already expired or been taken by another run" in caplog.text
 
 
-# --- process_attachments: error logging ---
-
-
-@pytest.mark.asyncio
-async def test_process_attachments_logs_gundi_error_detail(mocker):
-    from gundi_client_v2.errors import GundiAPIError
-
-    image_response = MagicMock()
-    image_response.aread = AsyncMock(return_value=b"raw-image-bytes")
-    session = AsyncMock()
-    session.get.return_value = image_response
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=session)
-    client.__aexit__ = AsyncMock(return_value=False)
-    mocker.patch("app.actions.handlers.httpx.AsyncClient", return_value=client)
-    mocker.patch(
-        "app.actions.handlers.send_event_attachments_to_gundi",
-        AsyncMock(side_effect=GundiAPIError(413, "Request too large")),
-    )
-    mock_log_activity = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
-    integration = _lock_test_integration()
-
-    processed = await process_attachments(
-        events=[{"event_details": {"inat_id": "999"}}],
-        response=[{"object_id": "gundi-uuid-999"}],
-        all_event_photos={"999": [(42, "https://example.com/photo.jpg")]},
-        integration=integration,
-    )
-
-    assert processed == 0
-    log_data = mock_log_activity.call_args.kwargs["data"]
-    assert log_data["server_response_body"] == "Request too large"
-
-
 # --- action_pull_events: saved projects that don't exist on iNaturalist ---
 
 
@@ -722,7 +687,7 @@ async def test_a_stopped_pull_says_where_it_was(mocker):
     stopped = mock_log.call_args.kwargs
     assert stopped["level"] == LogLevel.WARNING
     assert stopped["title"].startswith("The pull was cut off after 0 seconds while sending new observations to Gundi. ")
-    assert ("Before that, it sent at least 0 new iNaturalist observations to Gundi, updated 0 and added 0 photos. "
+    assert ("Before that, it sent at least 0 new iNaturalist observations to Gundi and updated 0. "
             "Reading from iNaturalist took 0 seconds and found 1 observation that matches the settings.") in stopped["title"]
     assert stopped["data"]["observations_matched"] == 1
     mock_state.delete_state_if_value.assert_called_once()  # the lock is still released
@@ -838,44 +803,6 @@ async def test_a_pull_stopped_after_saving_its_cursor_is_not_reported_as_stopped
     assert not any(t.startswith("The pull was stopped") for t in titles)
 
 
-@pytest.mark.asyncio
-async def test_process_attachments_counts_each_upload_as_it_lands(mocker):
-    """A pull stopped mid-chunk should report the photos already uploaded."""
-    import asyncio
-
-    from app.actions.handlers import _PullProgress
-
-    events = [{"event_details": {"inat_id": "1"}}, {"event_details": {"inat_id": "2"}}]
-    response = [{"object_id": "g1"}, {"object_id": "g2"}]
-    photos = {"1": [(10, "https://x/10.jpg"), (11, "https://x/11.jpg")], "2": [(20, "https://x/20.jpg")]}
-    image = MagicMock()
-    image.raise_for_status = MagicMock()
-    image.aread = AsyncMock(return_value=b"img")
-    client = AsyncMock()
-    client.get.return_value = image
-    mocker.patch("app.actions.handlers.httpx.AsyncClient", return_value=MagicMock(
-        __aenter__=AsyncMock(return_value=client), __aexit__=AsyncMock(return_value=False)
-    ))
-    progress = _PullProgress()
-    first_uploaded = asyncio.Event()
-
-    async def send(event_id, attachments, integration_id):
-        if event_id == "g2":
-            first_uploaded.set()
-            await asyncio.Event().wait()
-        return [{}]
-
-    mocker.patch("app.actions.handlers.send_event_attachments_to_gundi", side_effect=send)
-    integration = MagicMock()
-
-    task = asyncio.ensure_future(process_attachments(events, response, photos, integration, progress))
-    await first_uploaded.wait()
-    assert progress.photos_added == 2
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
 @pytest.mark.parametrize("seconds, text", [
     (45, "45 seconds"),
     (119, "119 seconds"),
@@ -897,15 +824,16 @@ def test_progress_messages_use_singular_for_one():
     progress.inat_seconds = 1
     progress.observations_read = 1
     progress.events_sent = 1
-    progress.photos_added = 1
-    assert progress.counts() == "it sent 1 new iNaturalist observation to Gundi, updated 0 and added 1 photo"
+    progress.photos_handed_off = 1
+    assert progress.counts() == ("it sent 1 new iNaturalist observation to Gundi and updated 0, "
+                                 "and handed their 1 photo to a separate photo run")
     assert progress.inat_summary() == "Reading from iNaturalist took 1 second and found 1 observation that matches the settings"
     progress.observations_read = 2
     progress.events_sent = 0
-    progress.photos_added = 3
-    assert progress.counts() == "it sent 0 new iNaturalist observations to Gundi, updated 0 and added 3 photos"
+    progress.photos_handed_off = 0
+    assert progress.counts() == "it sent 0 new iNaturalist observations to Gundi and updated 0"
     assert progress.inat_summary() == "Reading from iNaturalist took 1 second and found 2 observations that match the settings"
-    assert progress.counts(at_least=True) == "it sent at least 0 new iNaturalist observations to Gundi, updated 0 and added 3 photos"
+    assert progress.counts(at_least=True) == "it sent at least 0 new iNaturalist observations to Gundi and updated 0"
 
 
 @pytest.mark.asyncio
@@ -1140,7 +1068,7 @@ def _pull_setup(mocker, count, saved_state=None, pages=None):
     send = mocker.patch("app.actions.handlers.send_events_to_gundi",
                         side_effect=lambda events, integration_id: [{"object_id": "x"}] * len(events))
 
-    async def save_sent(response, events, integration, inat_updated_at_map=None):
+    async def save_sent(response, events, integration, inat_updated_at_map=None, pending_photos=None):
         for event in events:
             store[event["event_details"]["inat_id"]] = {"object_id": "x"}
     mocker.patch("app.actions.handlers.save_events_state", side_effect=save_sent)
@@ -1236,7 +1164,7 @@ async def test_a_pull_stops_on_the_time_budget_with_its_progress_saved(mocker):
     chunk and the run logs info, since the route is catching up."""
     from app.actions import handlers
 
-    mocker.patch.object(handlers, "PHOTO_CHUNK_SIZE", 2)
+    mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 2)
     now = [1000.0]
     mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
     _, send, store, mock_log = _pull_setup(mocker, 5)
@@ -1457,3 +1385,260 @@ async def test_an_outage_notice_that_cant_be_published_doesnt_fail_the_pull(mock
     result = await action_pull_events(_lock_test_integration(), _config())
 
     assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
+
+
+# --- photos: pull_events hands them to a photo run ---
+
+
+def _photo_obs_for_pull(i, photos):
+    ob = _observation(i)
+    ob.photos = [MagicMock(id=i * 100 + n, large_url=f"https://photos/{i}-{n}.jpg") for n in range(photos)]
+    return ob
+
+
+@pytest.mark.asyncio
+async def test_new_events_are_recorded_with_their_photos_pending_and_a_photo_run_started(mocker, mock_trigger_action):
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, save_events_state
+
+    pages = [[_photo_obs_for_pull(1, 2), _photo_obs_for_pull(2, 0)]]
+    _, _, store, mock_log = _pull_setup(mocker, 0, pages=pages)
+    mocker.patch("app.actions.handlers.save_events_state", side_effect=save_events_state)
+
+    result = await action_pull_events(_lock_test_integration(), _config(include_photos=True))
+
+    assert result["result"] == {"events_extracted": 2, "events_updated": 0, "photos_attached": 0}
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == [[100, "https://photos/1-0.jpg"], [101, "https://photos/1-1.jpg"]]
+    assert STATE_PHOTOS_PENDING_KEY not in store["2"]
+    integration_id, action_id, config = mock_trigger_action.call_args.args
+    assert action_id == "add_photos" and config.observation_ids == ["1"]
+    finished = [t for t in _titles(mock_log) if t.startswith("Pull finished")][-1]
+    assert "and handed their 2 photos to a separate photo run" in finished
+
+
+@pytest.mark.asyncio
+async def test_without_photos_no_photo_run_is_started(mocker, mock_trigger_action):
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, save_events_state
+
+    _, _, store, _ = _pull_setup(mocker, 0, pages=[[_photo_obs_for_pull(1, 2)]])
+    mocker.patch("app.actions.handlers.save_events_state", side_effect=save_events_state)
+
+    await action_pull_events(_lock_test_integration(), _config(include_photos=False))
+
+    mock_trigger_action.assert_not_called()
+    assert STATE_PHOTOS_PENDING_KEY not in store["1"]
+
+
+@pytest.mark.asyncio
+async def test_an_update_keeps_the_photos_still_pending(mocker):
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, save_patched_events_state
+
+    pending = [[100, "https://photos/1-0.jpg"]]
+    saved = {"1": {"object_id": "g1", STATE_INAT_UPDATED_AT_KEY: "2026-10-29 07:00:00+0000",
+                   STATE_PHOTOS_PENDING_KEY: pending}}
+    _, _, store, _ = _pull_setup(mocker, 1, saved_state=saved)
+    mocker.patch("app.actions.handlers.save_patched_events_state", side_effect=save_patched_events_state)
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["events_updated"] == 1
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == pending
+    assert store["1"][STATE_INAT_UPDATED_AT_KEY] == "2026-10-29 08:01:00+0000"
+
+
+# --- photos: the add_photos run ---
+
+
+def _photo_run_setup(mocker, notes, statuses=None, upload_error=None, locked=()):
+    """A photo run over `notes` ({obs_id: [[photo_id, url], ...]}), with state in a dict.
+    statuses maps a url to the download's HTTP status (200 by default) or an exception."""
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, STATE_PHOTOS_LOCK_PREFIX
+
+    store = {obs_id: {"object_id": f"g{obs_id}", STATE_PHOTOS_PENDING_KEY: list(photos)}
+             for obs_id, photos in notes.items()}
+    for obs_id in locked:
+        store[STATE_PHOTOS_LOCK_PREFIX + obs_id] = "someone-else"
+    mock_state = AsyncMock()
+    mock_state.get_state.side_effect = lambda i, a, source_id="no-source": dict(store.get(source_id) or {})
+
+    async def set_state(i, a, state, source_id="no-source"):
+        store[source_id] = state
+    mock_state.set_state.side_effect = set_state
+
+    async def set_if_absent(i, a, ttl_seconds=None, source_id="no-source", value=None):
+        if source_id in store:
+            return False
+        store[source_id] = value
+        return True
+    mock_state.set_if_absent.side_effect = set_if_absent
+
+    async def delete_if_value(i, a, value, source_id="no-source"):
+        if store.get(source_id) == value:
+            store.pop(source_id)
+            return True
+        return False
+    mock_state.delete_state_if_value.side_effect = delete_if_value
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+
+    statuses = statuses or {}
+
+    async def get(url):
+        outcome = statuses.get(url, 200)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        response = MagicMock(status_code=outcome, content=b"\xff\xd8-raw-jpeg-bytes")
+        if outcome >= 400:
+            import httpx
+            response.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "error", request=MagicMock(), response=MagicMock(status_code=outcome))
+        return response
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    mocker.patch("app.actions.handlers.httpx.AsyncClient", return_value=client)
+    upload = mocker.patch("app.actions.handlers.send_event_attachments_to_gundi",
+                          AsyncMock(side_effect=upload_error, return_value=[{}]))
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    mocker.patch("app.actions.handlers.asyncio.sleep", AsyncMock())
+    return store, upload, mock_log
+
+
+def _photos_config(*ids, runs_without_progress=0):
+    from app.actions.configurations import AddPhotosConfig
+    return AddPhotosConfig(observation_ids=list(ids), runs_without_progress=runs_without_progress)
+
+
+@pytest.mark.asyncio
+async def test_a_photo_run_adds_each_pending_photo_once_and_empties_the_list(mocker, mock_trigger_action):
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, action_add_photos
+
+    store, upload, mock_log = _photo_run_setup(mocker, {
+        "1": [[100, "https://p/100.jpg"], [101, "https://p/101.jpg"]], "2": [[200, "https://p/200.jpg"]]})
+
+    result = await action_add_photos(_lock_test_integration(), _photos_config("1", "2"))
+
+    assert result["result"] == {"photos_attached": 3, "photos_not_available": 0, "observations_left": 0}
+    assert [c.kwargs["event_id"] for c in upload.call_args_list] == ["g1", "g1", "g2"]
+    assert [c.kwargs["attachments"][0][0] for c in upload.call_args_list] == ["100.jpg", "101.jpg", "200.jpg"]
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == [] and store["2"][STATE_PHOTOS_PENDING_KEY] == []
+    mock_trigger_action.assert_not_called()
+    assert _titles(mock_log, LogLevel.INFO)[-1].startswith("Added 3 photos to iNaturalist observations in Gundi in ")
+
+
+@pytest.mark.asyncio
+async def test_a_photo_run_that_runs_out_of_time_saves_its_place_and_starts_another(mocker, mock_trigger_action):
+    """The photos already added are off the list, so the next run doesn't add them twice."""
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, action_add_photos
+
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    store, upload, mock_log = _photo_run_setup(mocker, {
+        "1": [[100, "https://p/100.jpg"], [101, "https://p/101.jpg"]], "2": [[200, "https://p/200.jpg"]]})
+
+    async def slow_upload(**kwargs):
+        now[0] += 250  # the first photo uses up the 240 s budget
+        return [{}]
+    upload.side_effect = slow_upload
+
+    result = await action_add_photos(_lock_test_integration(), _photos_config("1", "2"))
+
+    assert result["result"]["photos_attached"] == 1
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == [[101, "https://p/101.jpg"]]
+    integration_id, action_id, config = mock_trigger_action.call_args.args
+    assert action_id == "add_photos"
+    assert config.observation_ids == ["1", "2"] and config.runs_without_progress == 0
+    info = _titles(mock_log, LogLevel.INFO)[-1]
+    assert info.endswith("Photos for 2 observations are still to add, and another photo run was started for them.")
+
+
+@pytest.mark.asyncio
+async def test_a_photo_iNaturalist_no_longer_has_is_dropped_with_a_note(mocker, mock_trigger_action):
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, action_add_photos
+
+    store, upload, mock_log = _photo_run_setup(
+        mocker, {"1": [[100, "https://p/100.jpg"], [101, "https://p/101.jpg"]]}, statuses={"https://p/100.jpg": 404})
+
+    result = await action_add_photos(_lock_test_integration(), _photos_config("1"))
+
+    assert result["result"] == {"photos_attached": 1, "photos_not_available": 1, "observations_left": 0}
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == []
+    mock_trigger_action.assert_not_called()
+    assert ("1 of the photos couldn't be added because iNaturalist no longer has them or their event is "
+            "no longer in Gundi.") in _titles(mock_log, LogLevel.INFO)[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_photo_that_fails_for_now_stays_pending_and_is_tried_again(mocker, mock_trigger_action):
+    """No photo lost: it stays on the list, the run waits and tries again while it
+    has time, and a new photo run carries it on."""
+    import httpx
+    from app.actions.handlers import STATE_PHOTOS_PENDING_KEY, action_add_photos
+
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    store, upload, mock_log = _photo_run_setup(
+        mocker, {"1": [[100, "https://p/100.jpg"]]}, statuses={"https://p/100.jpg": httpx.ConnectError("down")})
+    sleep = mocker.patch("app.actions.handlers.asyncio.sleep", AsyncMock(side_effect=lambda s: now.__setitem__(0, now[0] + 200)))
+
+    result = await action_add_photos(_lock_test_integration(), _photos_config("1", runs_without_progress=2))
+
+    assert sleep.call_args_list and all(c.args == (30,) for c in sleep.call_args_list)
+    assert result["result"]["photos_attached"] == 0
+    assert store["1"][STATE_PHOTOS_PENDING_KEY] == [[100, "https://p/100.jpg"]]
+    config = mock_trigger_action.call_args.args[2]
+    assert config.observation_ids == ["1"] and config.runs_without_progress == 3
+    assert _titles(mock_log, LogLevel.WARNING)[-1] == (
+        "No photos were added to iNaturalist observations in Gundi because the connection to iNaturalist's "
+        "photo server dropped. Photos for 1 observation is still to add, and another photo run was started for them.")
+
+
+@pytest.mark.asyncio
+async def test_photo_runs_that_keep_failing_turn_into_an_error(mocker, mock_trigger_action):
+    import httpx
+    from app.actions.handlers import PHOTO_RUNS_BEFORE_ERROR, action_add_photos
+
+    _photo_run_setup(mocker, {"1": [[100, "https://p/100.jpg"]]},
+                     statuses={"https://p/100.jpg": httpx.ConnectError("down")})
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", AsyncMock())
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    mocker.patch("app.actions.handlers.asyncio.sleep", AsyncMock(side_effect=lambda s: now.__setitem__(0, now[0] + 300)))
+
+    await action_add_photos(_lock_test_integration(),
+                            _photos_config("1", runs_without_progress=PHOTO_RUNS_BEFORE_ERROR - 1))
+
+    errors = _titles(mock_log, LogLevel.ERROR)
+    assert errors and errors[-1].endswith(f"This is photo run {PHOTO_RUNS_BEFORE_ERROR} in a row that couldn't add any.")
+    assert mock_trigger_action.called  # it keeps going until the photos are in
+
+
+@pytest.mark.asyncio
+async def test_a_photo_run_leaves_an_observation_another_run_is_working_on(mocker, mock_trigger_action):
+    """A repeated message can start two runs for the same photos; only one adds them."""
+    from app.actions.handlers import action_add_photos
+
+    store, upload, _ = _photo_run_setup(mocker, {"1": [[100, "https://p/100.jpg"]], "2": [[200, "https://p/200.jpg"]]},
+                                        locked=("1",))
+
+    result = await action_add_photos(_lock_test_integration(), _photos_config("1", "2"))
+
+    assert [c.kwargs["event_id"] for c in upload.call_args_list] == ["g2"]
+    assert result["result"]["observations_left"] == 0
+    mock_trigger_action.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_photo_run_never_logs_photo_bytes(mocker, caplog):
+    import logging
+    from app.actions.handlers import action_add_photos
+
+    _photo_run_setup(mocker, {"1": [[100, "https://p/100.jpg"]]}, upload_error=RuntimeError("upload failed"))
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    mocker.patch("app.actions.handlers.asyncio.sleep", AsyncMock(side_effect=lambda s: now.__setitem__(0, now[0] + 300)))
+
+    with caplog.at_level(logging.DEBUG):
+        await action_add_photos(_lock_test_integration(), _photos_config("1"))
+
+    assert "raw-jpeg-bytes" not in caplog.text

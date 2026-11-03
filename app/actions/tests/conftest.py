@@ -1,3 +1,4 @@
+from unittest.mock import AsyncMock
 from uuid import UUID
 from gundi_client_v2.client import IntegrationType
 from gundi_core.schemas.v2 import ConnectionRoute, Integration, IntegrationAction, IntegrationActionConfiguration, IntegrationActionSummary, Organization
@@ -476,3 +477,9 @@ def taxa_cache_off(mocker):
     """Reference-action tests exercise the legacy path unless they build a cache themselves."""
     from app.actions import taxa_cache
     mocker.patch.object(taxa_cache, "default_cache", return_value=None)
+
+
+@pytest.fixture(autouse=True)
+def mock_trigger_action(mocker):
+    """pull_events starts a photo run through PubSub; tests check the call instead."""
+    return mocker.patch("app.actions.handlers.trigger_action", AsyncMock())

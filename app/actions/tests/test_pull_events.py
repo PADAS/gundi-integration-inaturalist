@@ -13,7 +13,7 @@ from app.services.action_runner import execute_action
 async def test_execute_pull_observations_action(
         mocker, mock_gundi_client_v2, mock_state_manager, inaturalist_integration_v2,
         mock_get_gundi_api_key, mock_gundi_sensors_client_class, mock_config_manager,
-        mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class
+        mock_get_observations_v2, mock_publish_event, mock_gundi_client_v2_class, mock_trigger_action
 ):
     mock_config_manager.get_integration_details.return_value = async_return(inaturalist_integration_v2)
     mock_config_manager.get_action_configuration.return_value = async_return(inaturalist_integration_v2.configurations[0])
@@ -35,7 +35,11 @@ async def test_execute_pull_observations_action(
     assert "result" in response
     assert response["result"].get("events_extracted") == 2
     assert response["result"].get("events_updated") == 0
-    assert response["result"].get("photos_attached") == 5
+    # Photos are added by a separate photo run, started with the new observations that have photos.
+    assert response["result"].get("photos_attached") == 0
+    started = mock_trigger_action.call_args
+    assert started.args[1] == "add_photos"
+    assert started.args[2].observation_ids
     assert mock_get_observations_v2.called
     assert mock_get_observations_v2.call_count == 2
     # Support sees the counts in the title, not only in the "completed" details.
@@ -44,7 +48,8 @@ async def test_execute_pull_observations_action(
         if getattr(c.kwargs["event"].payload, "title", None)
     ]
     summary = next(t for t in titles if t.startswith("Pull finished in "))
-    assert "It sent 2 new iNaturalist observations to Gundi, updated 0 and added 5 photos" in summary
+    assert ("It sent 2 new iNaturalist observations to Gundi and updated 0, "
+            "and handed their 5 photos to a separate photo run") in summary
     assert "iNaturalist took " in summary
 
 
@@ -290,40 +295,6 @@ async def test_pull_events_does_not_log_integration_secrets(
 
 
 @pytest.mark.asyncio
-async def test_attachment_errors_do_not_log_photo_bytes(mocker, caplog, inaturalist_integration_v2):
-    import logging
-    from app.actions import handlers
-
-    photo_bytes = b"\xff\xd8\xff-raw-jpeg-bytes"
-    image_response = MagicMock()
-    image_response.raise_for_status.return_value = None
-    image_response.aread = mocker.AsyncMock(return_value=photo_bytes)
-    client = MagicMock()
-    client.get = mocker.AsyncMock(return_value=image_response)
-    client.__aenter__ = mocker.AsyncMock(return_value=client)
-    client.__aexit__ = mocker.AsyncMock(return_value=False)
-    mocker.patch.object(handlers.httpx, "AsyncClient", return_value=client)
-    mocker.patch.object(
-        handlers, "send_event_attachments_to_gundi", side_effect=RuntimeError("upload failed")
-    )
-    log_activity = mocker.patch.object(handlers, "log_action_activity", mocker.AsyncMock())
-
-    events = [{"event_details": {"inat_id": 7}}]
-    response = [{"object_id": "gundi-1"}]
-    photos = {7: [(101, "https://static.inaturalist.org/photos/101/large.jpg")]}
-
-    with caplog.at_level(logging.DEBUG):
-        processed = await handlers.process_attachments(events, response, photos, inaturalist_integration_v2)
-
-    assert processed == 0
-    assert "101.jpg" in caplog.text
-    assert repr(photo_bytes) not in caplog.text
-    activity = log_activity.call_args.kwargs
-    assert repr(photo_bytes) not in activity["title"]
-    assert repr(photo_bytes) not in str(activity["data"])
-
-
-@pytest.mark.asyncio
 async def test_pull_events_saves_updated_observations_per_chunk(
         mocker, mock_state_manager, inaturalist_integration_v2, mock_get_gundi_api_key,
         mock_get_observations_v2, mock_publish_event
@@ -337,7 +308,6 @@ async def test_pull_events_saves_updated_observations_per_chunk(
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch.object(handlers, "state_manager", mock_state_manager)
     mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 1)
-    mocker.patch.object(handlers, "PHOTO_CHUNK_SIZE", 1)
     mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
     update = mocker.patch.object(
         handlers, "update_event_in_gundi",
