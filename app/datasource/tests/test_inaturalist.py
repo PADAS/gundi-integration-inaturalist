@@ -10,6 +10,7 @@ from app.datasource.inaturalist import (
     OBSERVATION_FIELDS,
     INatRequestError,
     get_observations,
+    read_observations,
     _call_inat,
     _match_annotations_to_config,
     find_existing_projects,
@@ -753,3 +754,109 @@ def test_call_inat_reports_a_connection_lost_mid_answer(monkeypatch):
     monkeypatch.setattr("app.datasource.inaturalist.get_observations_v2", MagicMock(side_effect=error))
     with pytest.raises(INatUnavailableError, match="the connection dropped when asking for observations"):
         _call_inat(page=1, per_page=0)
+
+
+# --- get_observations: per-run cap ---
+
+
+def _paged_inat(mocker, all_obs):
+    """A fake iNat that pages all_obs by updated_since (inclusive), oldest first."""
+    calls = []
+
+    def side_effect(**kwargs):
+        calls.append(kwargs)
+        page, per_page = kwargs.get("page", 1), kwargs.get("per_page")
+        matching = [o for o in all_obs if datetime.fromisoformat(o["updated_at"]) >= kwargs["updated_since"]]
+        if "taxon_id" in kwargs:
+            matching = [o for o in matching if str(o["taxon"]) in kwargs["taxon_id"].split(",")]
+        if per_page == 0:
+            return {"total_results": len(matching), "results": []}
+        start = (page - 1) * per_page
+        return {"total_results": len(matching), "page": page, "per_page": per_page,
+                "results": matching[start:start + per_page]}
+
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=side_effect)
+    return calls
+
+
+def _obs(i, seconds, taxon=1):
+    from datetime import timedelta
+    base = datetime(2026, 6, 19, tzinfo=timezone.utc)
+    return {"id": i, "updated_at": (base + timedelta(seconds=seconds)).isoformat(),
+            "photos": [], "annotations": [], "taxon": taxon}
+
+
+
+def test_read_observations_stops_reading_at_max_results(mocker):
+    calls = _paged_inat(mocker, [_obs(i, i) for i in range(1, 1001)])
+
+    read = read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), max_results=300)
+
+    assert list(read.observations) == list(range(1, 301))
+    assert read.capped
+    assert read.resume_from == datetime(2026, 6, 19, 0, 5, 1, tzinfo=timezone.utc)  # second 300, plus one
+    # 300 fits in two pages of 200: the other three pages are never asked for.
+    assert [c["page"] for c in calls if c.get("per_page")] == [1, 2]
+
+
+def test_read_observations_under_the_cap_is_not_capped(mocker):
+    _paged_inat(mocker, [_obs(i, i) for i in range(1, 51)])
+
+    read = read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), max_results=300)
+
+    assert len(read.observations) == 50
+    assert not read.capped and read.resume_from is None
+
+
+def test_read_observations_cap_finishes_the_second_and_resumes_past_it(mocker):
+    """iNat reports updated_at to the second. With more observations in one
+    second than the cap, the read takes the whole second and the next one
+    starts after it, so a bulk change on iNaturalist can't hold a route at the
+    same cursor forever."""
+    all_obs = [_obs(1, 1)] + [_obs(i, 5) for i in range(2, 10)] + [_obs(10, 9)]
+    _paged_inat(mocker, all_obs)
+
+    first = read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), max_results=3)
+    assert sorted(first.observations) == list(range(1, 10))
+    assert first.resume_from == datetime(2026, 6, 19, 0, 0, 6, tzinfo=timezone.utc)
+
+    second = read_observations(first.resume_from, max_results=3)
+    assert list(second.observations) == [10]
+
+
+def test_read_observations_cap_counts_observations_the_filter_drops(mocker):
+    """A filter that rarely matches must not turn the cap into a read of the whole backlog."""
+    all_obs = [_obs(i, i) for i in range(1, 1001)]
+    calls = _paged_inat(mocker, all_obs)
+
+    read = read_observations(
+        datetime(2026, 6, 19, tzinfo=timezone.utc), annotations={"22": ["24"]}, max_results=150
+    )
+
+    assert read.observations == {}
+    assert read.capped
+    assert read.resume_from == datetime(2026, 6, 19, 0, 2, 31, tzinfo=timezone.utc)  # second 150, plus one
+    assert [c["page"] for c in calls if c.get("per_page")] == [1]
+
+
+def test_read_observations_cap_across_taxa_batches_keeps_what_every_batch_covers(mocker):
+    """Each taxa batch reads up to the cap on its own; only what every capped
+    batch has read through is kept, and the read resumes past that."""
+    from app.datasource import inaturalist
+    mocker.patch.object(inaturalist, "TAXA_BATCH_SIZE", 1)
+    all_obs = sorted([_obs(i, i * 2, taxon=1) for i in range(1, 6)] +
+                     [_obs(100 + i, i * 2 + 1, taxon=2) for i in range(1, 6)],
+                     key=lambda o: o["updated_at"])
+    _paged_inat(mocker, all_obs)
+
+    read = read_observations(datetime(2026, 6, 19, tzinfo=timezone.utc), taxa="1,2", max_results=2)
+
+    # Taxon 1 stops at second 4, taxon 2 at second 5: keep up to second 4.
+    assert sorted(read.observations) == [1, 2, 101]
+    assert read.resume_from == datetime(2026, 6, 19, 0, 0, 5, tzinfo=timezone.utc)
+
+
+def test_get_observations_reads_everything(mocker):
+    _paged_inat(mocker, [_obs(i, i) for i in range(1, 451)])
+
+    assert len(get_observations(datetime(2026, 6, 19, tzinfo=timezone.utc))) == 450

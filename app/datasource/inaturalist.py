@@ -349,13 +349,21 @@ def _get_observations_for_taxa_batch(
     taxa_batch: Optional[str],
     annotations: Optional[Dict],
     fields: str,
-) -> Dict[int, Observation]:
+    max_results: Optional[int] = None,
+) -> Tuple[Dict[int, Observation], Optional[datetime]]:
+    """The batch's observations, and the second the read stopped in when it
+    reached max_results (None when it read everything)."""
     params = {**base_params}
     if taxa_batch:
         params["taxon_id"] = taxa_batch
 
     observation_map = {}
     updated_since = params["updated_since"]
+    read = 0
+    # Set once max_results observations are read (matching or not): the read
+    # goes on to the end of that second, so the next pull can start just past
+    # it without skipping any.
+    stop_second = None
     while True:
         window_params = {**params, "updated_since": updated_since}
         count_params = {**window_params, "page": 1, "per_page": 0}
@@ -369,6 +377,9 @@ def _get_observations_for_taxa_batch(
             observations = Observation.from_json_list(response)
             logger.info("Loaded %s observations from iNaturalist before annotation filters.", len(observations))
             for o in observations:
+                if stop_second is not None and _whole_second(o.updated_at) != stop_second:
+                    return observation_map, stop_second
+                read += 1
                 if o.updated_at:
                     last_updated_at = o.updated_at
                 if annotations:
@@ -376,6 +387,8 @@ def _get_observations_for_taxa_batch(
                         observation_map[o.id] = o
                 else:
                     observation_map[o.id] = o
+                if max_results and stop_second is None and read >= max_results and o.updated_at:
+                    stop_second = _whole_second(o.updated_at)
 
         if inat_count <= INAT_MAX_RESULTS_PER_QUERY:
             break
@@ -406,7 +419,21 @@ def _get_observations_for_taxa_batch(
         )
         updated_since = last_updated_at
 
-    return observation_map
+    return observation_map, stop_second
+
+
+def _whole_second(dt: Optional[datetime]) -> Optional[datetime]:
+    # iNat reports updated_at to the second; the saved cursor keeps no more.
+    return dt.replace(microsecond=0) if dt else dt
+
+
+class ObservationRead(NamedTuple):
+    observations: Dict[int, Observation]
+    # The read stopped at max_results; more may be waiting on iNaturalist.
+    capped: bool
+    # With capped: where the next read starts, just past the last second read
+    # in full. None otherwise.
+    resume_from: Optional[datetime]
 
 
 def get_observations(
@@ -423,6 +450,28 @@ def get_observations(
 
     Returns a dict mapping observation id -> Observation for all observations
     that match the filters (and annotation filter when annotations is set).
+    """
+    return read_observations(
+        since, bounding_box=bounding_box, taxa=taxa, projects=projects,
+        quality_grade=quality_grade, annotations=annotations,
+    ).observations
+
+
+def read_observations(
+    since: datetime,
+    *,
+    bounding_box: Optional[List[float]] = None,
+    taxa: Optional[str] = None,
+    projects: Optional[List[str]] = None,
+    quality_grade: Optional[List[str]] = None,
+    annotations: Optional[Dict] = None,
+    max_results: Optional[int] = None,
+) -> ObservationRead:
+    """get_observations, stopping once about max_results observations are read.
+
+    The count includes observations the annotation filter drops, so a filter
+    that rarely matches still reads a bounded amount. The read always finishes
+    the second it stopped in, so resume_from skips nothing.
     """
     nelat = nelng = swlat = swlng = None
     if bounding_box and len(bounding_box) >= 4:
@@ -455,8 +504,21 @@ def get_observations(
         batches = [None]
 
     observation_map = {}
+    stop_seconds = []
     for batch in batches:
-        batch_results = _get_observations_for_taxa_batch(base_params, batch, annotations, fields)
+        batch_results, stop_second = _get_observations_for_taxa_batch(
+            base_params, batch, annotations, fields, max_results
+        )
         observation_map.update(batch_results)
+        if stop_second is not None:
+            stop_seconds.append(stop_second)
 
-    return observation_map
+    if not stop_seconds:
+        return ObservationRead(observation_map, capped=False, resume_from=None)
+    # Every batch has read all of its observations up to the earliest second a
+    # batch stopped in; keep only those, so resuming just past it skips none.
+    cut = min(stop_seconds)
+    observation_map = {
+        i: o for i, o in observation_map.items() if o.updated_at and _whole_second(o.updated_at) <= cut
+    }
+    return ObservationRead(observation_map, capped=True, resume_from=cut + timedelta(seconds=1))

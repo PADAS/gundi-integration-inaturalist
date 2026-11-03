@@ -337,6 +337,7 @@ async def test_pull_events_saves_updated_observations_per_chunk(
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch.object(handlers, "state_manager", mock_state_manager)
     mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 1)
+    mocker.patch.object(handlers, "PHOTO_CHUNK_SIZE", 1)
     mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
     update = mocker.patch.object(
         handlers, "update_event_in_gundi",
