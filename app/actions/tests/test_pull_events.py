@@ -328,8 +328,8 @@ async def test_pull_events_saves_updated_observations_per_chunk(
         mocker, mock_state_manager, inaturalist_integration_v2, mock_get_gundi_api_key,
         mock_get_observations_v2, mock_publish_event
 ):
-    """A run that stops partway through the updates keeps the chunks it finished,
-    so the next run doesn't send them again."""
+    """A run that stops partway through the updates keeps the chunks it
+    finished, cursor included, so the next run doesn't send them again."""
     from app.actions import handlers
 
     stale_state = {"object_id": "gundi-1", handlers.STATE_INAT_UPDATED_AT_KEY: "2000-01-01 00:00:00+0000"}
@@ -351,5 +351,7 @@ async def test_pull_events_saves_updated_observations_per_chunk(
     assert update.call_count == 2
     saved = [c.kwargs for c in mock_state_manager.set_state.call_args_list if c.kwargs.get("source_id")]
     assert len(saved) == 1
-    # The cursor stays put, so the unfinished observation is read again next run.
-    assert not [c for c in mock_state_manager.set_state.call_args_list if not c.kwargs.get("source_id")]
+    # The cursor moves past the finished chunk only, so the unfinished
+    # observation is read again next run.
+    cursors = [c for c in mock_state_manager.set_state.call_args_list if not c.kwargs.get("source_id")]
+    assert len(cursors) == 1

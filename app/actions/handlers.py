@@ -394,9 +394,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
             # bounding box (or the world), so skip until the config is fixed.
             return _pull_result(0, 0, 0)
 
-    progress.step = "reading observations from iNaturalist"
     progress.asked_inat = True
-    inat_started = time.monotonic()
     annotations = action_config.annotations_dict
     pages = iter_observation_pages(
         load_since,
@@ -407,35 +405,79 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         annotations=annotations,
     )
     max_new = settings.INAT_MAX_NEW_EVENTS_PER_PULL
-    # Everything read, oldest change first: the matching ones are sent or
-    # updated, the rest only move the cursor past them.
-    read = []
-    new_ids, patch_targets = set(), {}
-    read_all = False
+    # Photos are slow (about a second each), so a chunk stays small enough to
+    # finish inside the margin left by the time budget.
+    chunk_size = PHOTO_CHUNK_SIZE if action_config.include_photos else GUNDI_SUBMISSION_CHUNK_SIZE
+    # Page by page, oldest change first: each page is sent in chunks and the
+    # cursor saved after each one, until max_new new observations, the end of
+    # what changed, or the time budget.
+    seen = set()  # pages at iNat's 10,000-result window boundaries repeat observations
+    new_found = added_count = updated_count = attachment_count = 0
+    done_through = None
+    read_all = stopped_on_time = False
     try:
-        while len(new_ids) < max_new and time.monotonic() < deadline:
+        while new_found < max_new:
+            if time.monotonic() >= deadline:
+                stopped_on_time = True
+                break
+            progress.step = "reading observations from iNaturalist"
+            read_started = time.monotonic()
             # pyinaturalist is synchronous: a thread keeps the other runs on
             # this instance going, and lets a stop land while a page is read.
             page = await _wait_for_read(deadline, asyncio.to_thread(next, pages, None))
+            progress.inat_seconds = (progress.inat_seconds or 0) + time.monotonic() - read_started
             if page is None:
                 read_all = True
                 break
+
+            batch, new_ids, patch_targets = [], set(), {}
+            progress.step = "checking which observations are new or changed"
             for ob in page:
-                read.append(ob)
+                if ob.id in seen:
+                    continue
+                seen.add(ob.id)
+                batch.append(ob)
                 if not annotations or _match_annotations_to_config(ob.annotations, annotations):
                     progress.observations_read += 1
                     await _sort_observation(integration, ob, new_ids, patch_targets)
-                if len(new_ids) >= max_new:
+                if new_found + len(new_ids) >= max_new:
                     break
+            new_found += len(new_ids)
+
+            for chunk in chunk_list(batch, chunk_size):
+                to_add = [ob for ob in chunk if ob.id in new_ids]
+                to_patch = [(patch_targets[ob.id], ob) for ob in chunk if ob.id in patch_targets]
+                # A chunk with nothing to send only moves the cursor, so it never waits on the time.
+                if (to_add or to_patch) and time.monotonic() >= deadline:
+                    stopped_on_time = True
+                    break
+                if to_add:
+                    added, photos = await _send_new_observations(integration, action_config, to_add, progress)
+                    added_count += added
+                    attachment_count += photos
+                if to_patch:
+                    progress.step = "updating changed observations in Gundi"
+                    response = await patch_events(to_patch, action_config, integration, progress)
+                    updated_count += len(response)
+                    progress.step = "saving which observations were updated"
+                    await save_patched_events_state(to_patch, integration)
+                done_through = chunk[-1].updated_at
+                progress.chunks_done += 1
+                # Inclusive: the next pull reads from this time again and skips what was saved.
+                progress.step = "saving where the next pull starts"
+                await state_manager.set_state(
+                    str(integration.id), "pull_events", _build_pull_events_state(done_through)
+                )
+            if stopped_on_time:
+                break
     except (INatUnavailableError, INatRequestError) as e:
         if not _inat_is_down(e):
             raise
+        # What was sent before the read failed is saved, cursor included.
         await _handle_inat_down(integration, e)
-        return _pull_result(0, 0, 0)
+        return _pull_result(added_count, updated_count, attachment_count)
     await _clear_inat_down(integration)
-    # The time the read took is what tells iNaturalist's share apart.
-    progress.inat_seconds = time.monotonic() - inat_started
-    progress.step = "checking which observations are new or changed"
+    progress.finished = True
 
     if read_all and not progress.observations_read:
         since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -457,44 +499,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         )
         return _pull_result(0, 0, 0)
 
-    logger.info(f"Processing {len(read)} observations from iNaturalist.")
-
-    # Photos are slow (about a second each), so a chunk stays small enough to
-    # finish inside the margin left by the time budget.
-    chunk_size = PHOTO_CHUNK_SIZE if action_config.include_photos else GUNDI_SUBMISSION_CHUNK_SIZE
-    added_count = updated_count = attachment_count = 0
-    done_through = None
-    stopped_early = False
-    for chunk in chunk_list(read, chunk_size):
-        to_add = [ob for ob in chunk if ob.id in new_ids]
-        to_patch = [(patch_targets[ob.id], ob) for ob in chunk if ob.id in patch_targets]
-        # A chunk with nothing to send only moves the cursor, so it never waits on the time.
-        if (to_add or to_patch) and time.monotonic() >= deadline:
-            stopped_early = True
-            break
-        if to_add:
-            added, photos = await _send_new_observations(integration, action_config, to_add, progress)
-            added_count += added
-            attachment_count += photos
-        if to_patch:
-            progress.step = "updating changed observations in Gundi"
-            response = await patch_events(to_patch, action_config, integration, progress)
-            updated_count += len(response)
-            progress.step = "saving which observations were updated"
-            await save_patched_events_state(to_patch, integration)
-        done_through = chunk[-1].updated_at
-        progress.chunks_done += 1
-
-    # Inclusive: the next pull reads from this time again and skips what was saved.
-    if done_through is not None:
-        progress.step = "saving where the next pull starts"
-        await state_manager.set_state(
-            str(integration.id), "pull_events", _build_pull_events_state(done_through)
-        )
-    progress.finished = True
-
-    if stopped_early or not (read_all or len(new_ids) >= max_new):
-        # Out of time, while reading or sending.
+    if stopped_on_time:
         await _log_pull_paused(integration, progress, done_through)
     else:
         if not read_all:
@@ -615,12 +620,8 @@ async def _handle_inat_down(integration: Integration, error: Exception):
         level = LogLevel.WARNING
     log = logger.error if level == LogLevel.ERROR else logger.warning
     log(f"{msg} Integration ID: {integration.id}.")
-    await log_action_activity(
-        integration_id=integration.id,
-        action_id="pull_events",
-        level=level,
-        title=msg,
-        data={"reason": reason, "pulls_in_a_row": runs},
+    await _publish_progress_log(
+        integration, msg, level, {"reason": reason, "pulls_in_a_row": runs}, "iNaturalist outage notice"
     )
 
 

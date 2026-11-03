@@ -1389,3 +1389,65 @@ async def test_a_project_check_that_outlasts_the_time_budget_uses_the_saved_proj
         release.set()
 
     assert read.call_args.kwargs["projects"] == ["p"]
+
+
+
+@pytest.mark.asyncio
+async def test_each_page_is_sent_before_the_next_is_read(mocker):
+    """Updates don't count toward the limit, so a run sends each page as it
+    reads it and saves its place, rather than reading until time runs out."""
+    pages = [[_observation(1), _observation(2)], [_observation(3)]]
+    order = []
+    read, send, store, _ = _pull_setup(mocker, 0, pages=pages)
+    sent = send.side_effect
+
+    def record(events, integration_id):
+        order.append(("sent", [e["event_details"]["inat_id"] for e in events], len(read.pages_read)))
+        return sent(events, integration_id)
+    send.side_effect = record
+
+    await action_pull_events(_lock_test_integration(), _config())
+
+    assert order == [("sent", ["1", "2"], 1), ("sent", ["3"], 2)]
+
+
+@pytest.mark.asyncio
+async def test_an_observation_repeated_across_pages_is_sent_once(mocker):
+    """iNat's 10,000-result windows overlap at their boundary timestamp."""
+    boundary = _observation(2)
+    pages = [[_observation(1), boundary], [boundary, _observation(3)]]
+    _, send, _, _ = _pull_setup(mocker, 0, pages=pages)
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    sent = [e["event_details"]["inat_id"] for c in send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["1", "2", "3"]
+    assert result["result"]["events_extracted"] == 3
+
+
+@pytest.mark.asyncio
+async def test_inaturalist_failing_after_some_pages_keeps_what_was_sent(mocker):
+    from app.datasource.inaturalist import INatUnavailableError
+
+    def pages():
+        yield [_observation(1), _observation(2)]
+        raise INatUnavailableError("the connection dropped when asking for observations")
+    _, send, store, mock_log = _pull_setup(mocker, 0, pages=pages())
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["events_extracted"] == 2
+    assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
+    assert _titles(mock_log, LogLevel.WARNING)[-1].startswith(
+        "The pull didn't get observations from iNaturalist because iNaturalist had a problem: ")
+
+
+@pytest.mark.asyncio
+async def test_an_outage_notice_that_cant_be_published_doesnt_fail_the_pull(mocker):
+    _pull_setup(mocker, 0)
+    _mock_read(mocker, side_effect=_inat_down_error("unavailable"))
+    mocker.patch("app.actions.handlers.log_action_activity", AsyncMock(side_effect=RuntimeError("publisher down")))
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result == {"result": {"events_extracted": 0, "events_updated": 0, "photos_attached": 0}}
