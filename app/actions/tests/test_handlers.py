@@ -1642,3 +1642,17 @@ async def test_a_photo_run_never_logs_photo_bytes(mocker, caplog):
         await action_add_photos(_lock_test_integration(), _photos_config("1"))
 
     assert "raw-jpeg-bytes" not in caplog.text
+
+
+def test_photo_runs_go_to_the_actions_topic_the_infra_creates(monkeypatch):
+    """Deployed runners don't set INTEGRATION_COMMANDS_TOPIC; without a fallback,
+    starting a photo run would fail on every pull with new photos."""
+    import importlib
+    from app.settings import integration
+
+    monkeypatch.delenv("INTEGRATION_COMMANDS_TOPIC", raising=False)
+    assert importlib.reload(integration).INTEGRATION_COMMANDS_TOPIC == "inaturalist-actions-topic"
+    monkeypatch.setenv("INTEGRATION_COMMANDS_TOPIC", "another-topic")
+    assert importlib.reload(integration).INTEGRATION_COMMANDS_TOPIC == "another-topic"
+    monkeypatch.delenv("INTEGRATION_COMMANDS_TOPIC")
+    importlib.reload(integration)

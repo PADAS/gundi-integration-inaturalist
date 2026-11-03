@@ -20,3 +20,8 @@ INAT_MAX_NEW_EVENTS_PER_PULL = env.int("INAT_MAX_NEW_EVENTS_PER_PULL", 150, vali
 # timeout), so it ends with its progress saved instead of being cut off.
 INAT_PULL_TIME_LIMIT_SECONDS = env.int("INAT_PULL_TIME_LIMIT_SECONDS", 300, validate=lambda n: n > 0)
 INAT_PULL_TIME_MARGIN_SECONDS = env.int("INAT_PULL_TIME_MARGIN_SECONDS", 60, validate=lambda n: n >= 0)
+
+# pull_events starts add_photos through the runner's actions topic. The infra
+# module names it "<name>-actions-topic" and doesn't pass the name to the
+# service, so fall back to it here; an env var still overrides it.
+INTEGRATION_COMMANDS_TOPIC = env.str("INTEGRATION_COMMANDS_TOPIC", "inaturalist-actions-topic")
