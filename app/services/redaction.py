@@ -327,11 +327,14 @@ def redact_url(url: str) -> str:
     (``https://user:password@host/``, or a bare token before the ``@``) is
     masked whole rather than by part: a username alone is often the API key
     (HTTP basic auth with an empty password), and the mask still shows that
-    credentials were there. A URL that cannot be parsed
-    (``https://[broken]?token=abc`` raises in ``urlsplit``) is replaced
-    whole: redaction runs inside the runner's error handling, where raising
-    would lose the failure event and the response."""
-    url = str(url)
+    credentials were there. A URL that cannot be parsed (an unbalanced
+    bracket, ``https://[broken?token=abc``, raises in ``urlsplit``) is
+    replaced whole: redaction runs inside the runner's error handling, where
+    raising would lose the failure event and the response."""
+    return _redact_url(str(url), depth=0)
+
+
+def _redact_url(url: str, depth: int) -> str:
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -340,19 +343,42 @@ def redact_url(url: str) -> str:
     # delimiter, so everything before the last one is userinfo.
     userinfo, at, host = parts.netloc.rpartition("@")
     netloc = f"{REDACTED}@{host}" if at else parts.netloc
-    query = _redact_query(parts.query) if parts.query else parts.query
+    query = _redact_query(parts.query, depth) if parts.query else parts.query
     if netloc == parts.netloc and query == parts.query:
         return url
     return urlunsplit(parts._replace(netloc=netloc, query=query))
 
 
-def _redact_query(query: str) -> str:
+def _redact_query(query: str, depth: int = 0) -> str:
     """``query`` with secret-looking parameters masked, by the decoded
     parameter name (``api%5Fkey`` is ``api_key``), and re-encoded; returned
-    as given when nothing in it is secret."""
+    as given when nothing in it is secret. An innocent parameter whose value
+    is itself a URL (``?next=https://user:pw@host/``, encoded or not) has
+    that URL redacted too, userinfo and query alike. Past ``_RESCAN_DEPTH``
+    nested URLs the value is masked whole, so a pathological URL cannot
+    recurse without end inside the runner's error handling."""
     pairs = parse_qsl(query, keep_blank_values=True)
-    redacted = [(key, REDACTED if _is_sensitive_key(key) and value else value) for key, value in pairs]
+    redacted = [(key, _redact_query_value(key, value, depth)) for key, value in pairs]
     return query if redacted == pairs else urlencode(redacted, safe="*")
+
+
+def _redact_query_value(key: str, value: str, depth: int) -> str:
+    if not value:
+        return value
+    if _is_sensitive_key(key):
+        return REDACTED
+    if "://" in value or value.startswith("//"):
+        # A URL, absolute or scheme-relative ("//user:pw@host/").
+        return REDACTED if depth >= _RESCAN_DEPTH else _redact_url(value, depth + 1)
+    decoded = unquote(value)
+    if decoded == value:
+        return value
+    # Still percent-encoded after parse_qsl's own decoding (a URL encoded
+    # twice): look again at the decoded form, within the same depth budget.
+    if depth >= _RESCAN_DEPTH:
+        return REDACTED
+    redacted = _redact_query_value(key, decoded, depth + 1)
+    return value if redacted == decoded else redacted
 
 
 # Free text is scanned for two shapes, in one pass so that a pair inside a

@@ -549,17 +549,67 @@ def test_redact_text_masks_the_userinfo_of_a_url_quoted_in_free_text():
     )
 
 
+def test_redact_url_masks_a_url_nested_in_an_innocent_query_value():
+    # parse_qsl decodes the value first, so the encoded form is caught too.
+    for url in (
+        "https://host/cb?next=https://u:pw@x.test/&page=2",
+        "https://host/cb?next=https%3A%2F%2Fu%3Apw%40x.test%2F&page=2",
+    ):
+        redacted = redact_url(url)
+        assert "pw" not in redacted
+        assert "page=2" in redacted
+    assert "t123" not in redact_url("https://host/cb?next=https%3A%2F%2Fx.test%2F%3Ftoken%3Dt123")
+    # A nested URL with nothing secret in it is left exactly as given.
+    plain = "https://host/cb?next=https%3A%2F%2Fx.test%2Fhome"
+    assert redact_url(plain) == plain
+
+
+def test_redact_url_masks_scheme_relative_and_double_encoded_nested_urls():
+    for url in (
+        "https://host/cb?next=//u:pw@x.test/",
+        "https://host/cb?next=%2F%2Fu%3Apw%40x.test%2F",
+        "https://host/cb?next=https%253A%252F%252Fu%253Apw%2540x.test%252F",
+    ):
+        assert "pw" not in redact_url(url)
+        assert "pw" not in redact_text(f"Client error for url '{url}'")
+    double_encoded_token = "https://host/cb?next=https%253A%252F%252Fx.test%252F%253Ftoken%253Dt123"
+    assert "t123" not in redact_url(double_encoded_token)
+    # An encoded value with nothing secret in it is left exactly as given.
+    plain = "https://host/cb?q=caf%25C3%25A9&page=2"
+    assert redact_url(plain) == plain
+
+
+def test_redact_url_and_text_bound_deeply_nested_query_urls():
+    # Redaction runs inside the runner's error handling: a pathological URL
+    # must be masked, never raise RecursionError.
+    url = "https://h/?next=" * 400 + "https://x/?token=t123"
+
+    assert "t123" not in redact_url(url)
+    assert "t123" not in redact_text(f"Client error for url '{url}'")
+
+
+def test_redact_text_masks_the_userinfo_of_a_url_nested_in_a_query_value():
+    text = "Client error for url 'https://host/cb?next=https://u:pw@x.test/'"
+
+    assert "u:pw" not in redact_text(text)
+
+
 def test_redact_url_masks_a_url_it_cannot_parse_instead_of_raising():
-    assert redact_url("https://[broken]?token=abc") == REDACTED
+    # An unbalanced bracket is rejected by urlsplit on every supported
+    # Python. A balanced one around a non-address host ("[broken]") is
+    # rejected only by 3.11+ and 3.10's later security releases (CI's
+    # 3.10.22 yes, uv's 3.10.14 no); where it parses, only the query gets
+    # masked and the except branch is never reached.
+    assert redact_url("https://[broken?token=abc") == REDACTED
 
 
 def test_redact_text_masks_a_malformed_url_whole_and_never_raises():
     # Redaction runs inside the runner's error handling: raising there
     # would lose the failure event and the structured response.
-    assert redact_text("Client error for url 'https://[broken]?token=abc' (HTTP 403)") == (
+    assert redact_text("Client error for url 'https://[broken?token=abc' (HTTP 403)") == (
         f"Client error for url '{REDACTED}' (HTTP 403)"
     )
-    assert redact_text("https://[broken]?token=abc then page=2") == f"{REDACTED} then page=2"
+    assert redact_text("https://[broken?token=abc then page=2") == f"{REDACTED} then page=2"
 
 
 def test_redact_text_masks_the_whole_value_of_a_sensitive_key():
