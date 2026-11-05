@@ -195,13 +195,13 @@ A run that hands over to the next one logs at info level how many it created so 
 ## 9. Rollout
 
 1. Deploy; existing connections get the defaults (150 days, 3 photos, 150 per run).
-2. On Iberomab and Huatulco, read the first summaries: `cursor_lag_days` should drop under 1 within a few runs; `events_skipped_too_old` large at first, then small; `events_updated` at first includes the one-time hash seeding of rows synced before this change.
+2. On Iberomab and Huatulco, read the first summaries: `cursor_lag_days` should drop under 1 within a few runs; `events_skipped_too_old` large at first, then small; `events_updated` at first includes the one update per previously synced sighting on its first touch (at most what the old code sent), then falls as fingerprints are stored.
 3. Watch the ER dispatchers' dead-letter counts for a day. Photo lists recorded before the deploy, and photo runs already queued, still send all their photos, so the photo count falls once that backlog has cleared.
 4. Raise with the Iberomab site whether research-only or a smaller area is wanted; `max_new_events_per_run` is the throttle meanwhile.
 
 ## 10. Risks and open items
 
 - **Sightings uploaded during a site's gap are not backfilled** (D4). For Iberomab that is June–October; they are all older than the default `max_age_days` anyway. A site that wants them can set `max_age_days` higher and `days_to_load` to 7 and wait for touches.
-- **One-time patches for old rows** (D10): every sighting synced before this change is patched once on its next touch, within `max_age_days`. On a site that is current this is a trickle; on Iberomab the age floor removes most of it.
+- **First touch after deploy updates once** (D10): every sighting synced before this change is updated once on its next touch, within `max_age_days`, which stores its fingerprint. This is never more than today: the code before this change sends an update on every touch, so each of these is an update that touch would have sent anyway. Each sighting's later touches send nothing unless what we send changed, so update volume falls quickly over the first days as active sightings get their fingerprint. Nothing is missed: changes before the deploy already reached ER, and changes after it are caught by the fingerprint.
 - **A mapped field that flaps** (for example `place_guess` edited back and forth) sends an update each time. That is the rule working as stated; no special case.
 - **The iNaturalist user's feedback** (Slack, #gundi, 2026-11-04) asked to compare the taxon and the quality grade. Both are mapped fields, so every change to either is sent; so is any other mapped change (location, captive, obscured, place, user name).
