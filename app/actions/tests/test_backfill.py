@@ -700,13 +700,48 @@ async def test_a_duplicate_continuation_does_nothing_once_the_chain_moved_on(bac
 
 
 @pytest.mark.asyncio
-async def test_each_run_takes_over_the_chain_with_the_next_seq(backfill):
+async def test_the_seq_moves_on_only_when_a_run_hands_over(backfill, mocker):
+    clock = [1000.0]
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "_pull_time_budget", return_value=100)
+    real_send = backfill.send.side_effect
+
+    def slow_send(events, integration_id):
+        clock[0] += 150
+        return real_send(events, integration_id)
+    backfill.send.side_effect = slow_send
     job = _job(seq=2)
-    backfill.pages = [(0, 1, [_ob(1)])]
+    backfill.pages = [(0, 1, [_ob(1)]), (0, 1, [_ob(2)])]
 
     await handlers._backfill(_integration(), job)
 
-    assert backfill.store[handlers._backfill_key(job)]["seq"] == 3
+    handed = [c.args[2] for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"][-1]
+    assert handed.seq == 3 and backfill.store[handlers._backfill_key(job)]["seq"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_message_after_a_cut_off_run_picks_the_chain_up(backfill):
+    """The run with seq 2 was cut off after saving its position but before handing over:
+    the redelivered copy (seq 2) continues from the saved position."""
+    job = _job(seq=2)
+    backfill.store[handlers._backfill_key(job)] = {"seq": 2, "batch_index": 0, "after_id": 1, "created_so_far": 1}
+    backfill.pages = [(0, 1, [_ob(2)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    assert backfill.read_kwargs["after_id"] == 1
+    assert result["result"]["backfill_events_created"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_manual_restart_revives_the_chain_from_its_saved_position(backfill):
+    config = BackfillEventsConfig(days_back=365, max_events=50)
+    first = await handlers._backfill_job_for("i", config, "f", now=END)
+    backfill.store[handlers._backfill_key(first)] = {"seq": 4, "batch_index": 0, "after_id": 9, "created_so_far": 12}
+
+    again = await handlers._backfill_job_for("i", config, "f", now=END + timedelta(minutes=30))
+
+    assert (again.seq, again.after_id, again.created_so_far) == (4, 9, 12)
 
 
 @pytest.mark.asyncio
@@ -835,3 +870,103 @@ def test_empty_limits_in_saved_pull_settings_fall_back_to_defaults():
                                          "max_new_events_per_run": None})
     assert (config.max_photos, config.max_age_days) == (1, 90)
     assert config.max_new_events_per_run == min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000)
+
+
+# --- third Copilot round ---
+
+
+@pytest.mark.asyncio
+async def test_a_failed_note_write_clears_the_notes_already_written(backfill):
+    writes = []
+    real_set = backfill.state.set_state.side_effect
+
+    async def flaky_set(integration_id, action_id, state, source_id="no-source"):
+        if "sending_since" in state:
+            writes.append(source_id)
+            if len(writes) == 2:
+                raise RuntimeError("Redis hiccup")
+        return await real_set(integration_id, action_id, state, source_id)
+    backfill.state.set_state.side_effect = flaky_set
+
+    with pytest.raises(RuntimeError):
+        await handlers._send_marked("i", ["1", "2", "3"], [{}, {}, {}])
+
+    backfill.send.assert_not_called()
+    assert "1" not in backfill.store and "2" not in backfill.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut_off", ["cancelled", "timeout"])
+async def test_notes_stay_when_the_send_is_cut_off_or_times_out(backfill, cut_off):
+    import asyncio
+    import httpx
+
+    backfill.send.side_effect = asyncio.CancelledError() if cut_off == "cancelled" else httpx.ReadTimeout("slow")
+
+    with pytest.raises((asyncio.CancelledError, httpx.ReadTimeout)):
+        await handlers._send_marked("i", ["1", "2"], [{}, {}])
+
+    # Gundi may have created them: they stay marked and are never sent again.
+    assert "sending_since" in backfill.store["1"] and "sending_since" in backfill.store["2"]
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_never_gets_the_start_lock_stops(backfill, mocker):
+    async def sleep(seconds):
+        pass
+    _fake_asyncio(mocker, sleep=sleep)
+    backfill.lock_free = [False]
+
+    with pytest.raises(handlers.BackfillStartBusy):
+        await handlers._backfill_job_for("i", BackfillEventsConfig(), "f", now=END)
+    assert "backfill_current" not in backfill.store
+
+
+@pytest.mark.asyncio
+async def test_a_busy_start_lock_is_reported_to_the_user(backfill, mocker):
+    mocker.patch.object(handlers, "_backfill_job_for", AsyncMock(side_effect=handlers.BackfillStartBusy()))
+
+    result = await handlers.action_backfill_events(_integration(), BackfillEventsConfig())
+
+    assert result["result"]["events_extracted"] == 0
+    assert "another start of this connection's backfill was still being set up" in _titles(backfill, LogLevel.WARNING)[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_backfill_replaced_mid_run_stops_before_the_next_chunk(backfill, mocker):
+    mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 1)
+    job = _job()
+    backfill.store["backfill_current"] = {"created_to": END.isoformat()}
+    real_send = backfill.send.side_effect
+
+    def send_then_replace(events, integration_id):
+        # A user starts a different backfill while this one is sending.
+        backfill.store["backfill_current"] = {"created_to": (END + timedelta(hours=1)).isoformat()}
+        return real_send(events, integration_id)
+    backfill.send.side_effect = send_then_replace
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+
+    await handlers._backfill(_integration(), job)
+
+    assert backfill.send.call_count == 1
+    assert not [c for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"]
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_backfill_doesnt_hand_over(backfill, mocker):
+    clock = [1000.0]
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "_pull_time_budget", return_value=100)
+    backfill.store["backfill_current"] = {"created_to": END.isoformat()}
+    real_send = backfill.send.side_effect
+
+    def slow_send_then_replace(events, integration_id):
+        clock[0] += 150
+        backfill.store["backfill_current"] = {"created_to": (END + timedelta(hours=1)).isoformat()}
+        return real_send(events, integration_id)
+    backfill.send.side_effect = slow_send_then_replace
+    backfill.pages = [(0, 1, [_ob(1)]), (0, 1, [_ob(2)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    backfill.trigger.assert_not_called()

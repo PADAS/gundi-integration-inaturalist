@@ -769,11 +769,23 @@ async def _send_marked(integration_id: str, inat_ids: List[str], events: List[di
     Only a run cut off between the send and the save leaves a note behind, and that
     observation is then never sent again (spec: no duplicate events)."""
     since = datetime.now(tz=timezone.utc).strftime(STATE_DATETIME_FMT)
-    for inat_id in inat_ids:
-        await state_manager.set_state(integration_id, "pull_events", {STATE_SENDING_KEY: since}, source_id=inat_id)
+    marked = []
+    try:
+        for inat_id in inat_ids:
+            await state_manager.set_state(integration_id, "pull_events", {STATE_SENDING_KEY: since}, source_id=inat_id)
+            marked.append(inat_id)
+    except BaseException:
+        # Nothing was sent: the notes written so far must not hide these sightings.
+        await _clear_sending(integration_id, marked)
+        raise
     try:
         response = await send_events_to_gundi(events=events, integration_id=integration_id) or []
-    except BaseException:
+    except (asyncio.CancelledError, asyncio.TimeoutError, httpx.TimeoutException):
+        # Cut off or timed out waiting for Gundi's answer: Gundi may have created them,
+        # so the notes stay and these sightings are never sent again.
+        raise
+    except Exception:
+        # Gundi answered with an error, or the request never got through: nothing was created.
         await _clear_sending(integration_id, inat_ids)
         raise
     await _clear_sending(integration_id, inat_ids[len(response):])
@@ -1250,10 +1262,20 @@ async def action_backfill_events(integration: Integration, action_config: Backfi
     pull_config = await _pull_settings(integration, placeholder)
     if pull_config is None:
         return _backfill_result(0, placeholder, False, None)
-    job = await _backfill_job_for(str(integration.id), action_config, _filters_fingerprint(pull_config))
+    try:
+        job = await _backfill_job_for(str(integration.id), action_config, _filters_fingerprint(pull_config))
+    except BackfillStartBusy:
+        await _backfill_log(integration, LogLevel.WARNING,
+                            "The backfill didn't start because another start of this connection's backfill was "
+                            "still being set up. Run it again in a minute.", _backfill_data(placeholder))
+        return _backfill_result(0, placeholder, False, None)
     if job is None:
         return _backfill_result(0, placeholder, False, None)
     return await _backfill(integration, job, pull_config)
+
+
+class BackfillStartBusy(Exception):
+    """Another start of the same connection held the start lock the whole time."""
 
 
 async def _backfill_job_for(integration_id: str, action_config: BackfillEventsConfig, filters: str,
@@ -1273,6 +1295,9 @@ async def _backfill_job_for(integration_id: str, action_config: BackfillEventsCo
                                              source_id=STATE_BACKFILL_STARTING, value=token):
             break
         await asyncio.sleep(1)
+    else:
+        # Never choose a job without the lock: two starts could each open a window.
+        raise BackfillStartBusy()
     try:
         current = await state_manager.get_state(integration_id, "pull_events", STATE_BACKFILL_CURRENT) or {}
         same = (current.get("days_back"), current.get("max_events"), current.get("filters")) == (
@@ -1283,6 +1308,11 @@ async def _backfill_job_for(integration_id: str, action_config: BackfillEventsCo
                                              filters=current.get("filters") or "")
             marker = await state_manager.get_state(integration_id, "pull_events", _backfill_key(running)) or {}
             if same and not marker.get("done"):
+                # Pick up where the chain is, so this start can also revive a chain whose run was cut off.
+                running.seq = marker.get("seq", 0)
+                running.batch_index = marker.get("batch_index", 0)
+                running.after_id = marker.get("after_id", 0)
+                running.created_so_far = marker.get("created_so_far", 0)
                 return running
             if same and marker.get("ended_at"):
                 ended = datetime.fromisoformat(marker["ended_at"])
@@ -1319,6 +1349,16 @@ async def _backfill_job_for(integration_id: str, action_config: BackfillEventsCo
 async def action_backfill_events_continue(integration: Integration, action_config: BackfillContinueConfig):
     """Started by a backfill run that handed over (time budget, a waiting pull, a taken lock)."""
     return await _backfill(integration, action_config)
+
+
+async def _backfill_is_current(integration_id: str, job: BackfillContinueConfig) -> bool:
+    """False once a different backfill was started for this connection (its window replaced
+    this one in backfill_current). Kept apart from the position key, so checkpoint writes can't
+    undo a replacement. A connection with no record (a chain from before it existed) is current."""
+    current = await state_manager.get_state(integration_id, "pull_events", STATE_BACKFILL_CURRENT) or {}
+    if not current.get("created_to"):
+        return True
+    return datetime.fromisoformat(str(current["created_to"])) == job.created_to
 
 
 async def _backfill_is_stale(integration_id: str, job: BackfillContinueConfig) -> bool:
@@ -1439,9 +1479,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
     if (saved.get("batch_index", 0), saved.get("after_id", 0)) > (job.batch_index, job.after_id):
         job.batch_index, job.after_id = saved["batch_index"], saved["after_id"]
-    # This run takes over the chain: older copies of its message now see a higher seq and stop.
-    job.seq += 1
-    await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
+    # The seq moves on only when this run hands over (see below), so a copy of this message
+    # redelivered after a cut-off run can still pick the chain up from the saved position.
     start = (job.batch_index, job.after_id)
 
     projects = pull_config.projects
@@ -1489,6 +1528,9 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
             for chunk in chunk_list(page, GUNDI_SUBMISSION_CHUNK_SIZE):
                 if time.monotonic() >= deadline:
                     outcome = "handover"
+                    break
+                if not await _backfill_is_current(integration_id, job):
+                    outcome = "superseded"
                     break
                 to_add = []
                 recovered = []  # ids created by this backfill after its last saved position
@@ -1546,6 +1588,16 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
         return _backfill_result(created, job, False, uploaded_up_to)
 
     reached = _reached(job, uploaded_up_to, batch_count)
+    if outcome in ("pull", "handover") and not await _backfill_is_current(integration_id, job):
+        outcome = "superseded"
+    if outcome == "superseded":
+        # A different backfill was started: this one stops without a word, its position kept as is.
+        logger.info(f"Backfill {key} for integration ID: {integration_id} was replaced by a newer one; stopping.")
+        return _backfill_result(created, job, False, uploaded_up_to)
+    if outcome in ("pull", "handover"):
+        # This run hands the chain on: copies of its own message now see a higher seq and stop.
+        job.seq += 1
+        await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
     if outcome == "pull":
         # A pull found the lock taken and was skipped: start it again, and let it go first.
         try:
