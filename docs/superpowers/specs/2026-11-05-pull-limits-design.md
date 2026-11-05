@@ -161,7 +161,7 @@ A run that hands over to the next one logs at info level how many it created so 
 |---|---|---|
 | Iberomab creations | 900/h of mostly old sightings; cursor in June | Cursor jumps to last week; only uploads from the last 150 days; ~14,500 new uploads a day are in scope (its dispatcher delivers ~45,000 messages a day at best, so the site's scope still needs a look) |
 | Updates | one per touch; `Updated At` in every history line | only when a mapped field changed, within 150 days of upload; the 72 h diff of creation-vs-update payloads shows ~12% of updates changed nothing but `updated_at`, and no update at all goes out for sightings older than 90 days (36% of what was being touched) |
-| Photos per event | 1.6 (Huatulco 2.7) | at most 3 (Iberomab about 1.4: 56% of sightings have 1, 20% have 2) |
+| Photos per event | 1.6 (Huatulco 2.7) | at most 3 (about 1.7 on the 520 Iberomab sightings measured: 56% have 1, 20% have 2) |
 | Huatulco | cursor in July | current within a day; 30 uploads a day |
 
 ## 7. Changes from today
