@@ -103,8 +103,9 @@ Two distinct shapes stored under `(integration_id, "pull_events")`:
 | Key shape | What it is | Where written |
 |-----------|-----------|---------------|
 | no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | after each chunk of `action_pull_events`, and at the end when nothing matched |
-| `source_id=run_lock` / `pull_waiting` | the run lock a pull or backfill holds; the note a skipped pull leaves | `action_pull_events`, `_backfill` |
-| `source_id=backfill.<window end>` | a backfill's position, then a `done` marker once it ends (rows it creates carry `backfill_job` = this key and `backfill_batch`; patches keep them) | `_backfill_locked` |
+| `source_id=run_lock` / `pull_waiting` | the run lock a pull or backfill holds (a backfill's value names it: `{"backfill": key, "token": …}`); the note a skipped pull leaves |
+| `source_id=backfill_wait.<key>.<seq>.<n>` | one-shot claim, so only one copy of a waiting backfill message hands over | `action_pull_events`, `_backfill` |
+| `source_id=backfill.<window end>` | a backfill's position (`seq`, batch, last id, count, last upload date), then a `done` marker once it ends (rows it creates carry `backfill_job` = this key and `backfill_batch`; patches keep them) | `_backfill_locked` |
 | `source_id=backfill_current` | the last started backfill's settings, filter fingerprint and window, so a repeated start continues it | `_backfill_job_for` |
 | `source_id=backfill_starting` | short lock so backfill starts choose their job one at a time | `_backfill_job_for` |
 | `source_id=photos.<inat_id>` / `photos_lock.<inat_id>` | a new event's pending photos (`object_id`, `pending`); the lock held by the photo run adding them | `save_events_state`, `action_add_photos` |

@@ -53,9 +53,17 @@ def backfill(mocker):
     ns.pages = []
     mock_state = AsyncMock()
     ns.lock_free = [True]
+    ns.claims = set()
 
     async def set_if_absent(*args, **kwargs):
-        return ns.lock_free.pop(0) if len(ns.lock_free) > 1 else ns.lock_free[0]
+        # lock_free drives the run lock and the start lock; other one-shot claims always succeed once.
+        source_id = kwargs.get("source_id")
+        if source_id in ("run_lock", "backfill_starting"):
+            return ns.lock_free.pop(0) if len(ns.lock_free) > 1 else ns.lock_free[0]
+        if source_id in ns.claims:
+            return False
+        ns.claims.add(source_id)
+        return True
     mock_state.set_if_absent.side_effect = set_if_absent
     mock_state.get_state.side_effect = lambda integration_id, action_id, source_id="no-source": ns.store.get(source_id)
 
@@ -970,3 +978,74 @@ async def test_a_replaced_backfill_doesnt_hand_over(backfill, mocker):
     await handlers._backfill(_integration(), _job())
 
     backfill.trigger.assert_not_called()
+
+
+# --- Copilot round 4 / test finding 1 ---
+
+
+@pytest.mark.asyncio
+async def test_a_copy_of_a_running_backfill_exits_without_waiting_or_logging(backfill, mocker):
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+    _fake_asyncio(mocker, sleep=sleep)
+    job = _job(seq=2)
+    backfill.lock_free = [False]
+    backfill.store["run_lock"] = {"backfill": handlers._backfill_key(job), "token": "other-copy"}
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    assert not slept and not _titles(backfill)
+    backfill.trigger.assert_not_called()
+    backfill.send.assert_not_called()
+    assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_copies_that_waited_on_a_pull_hand_over_only_once(backfill, mocker):
+    clock = [1000.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "BACKFILL_LOCK_WAIT_SECONDS", 10)  # the fixture sets 0
+    _fake_asyncio(mocker, sleep=sleep)
+    backfill.lock_free = [False]
+    backfill.store["run_lock"] = "a-pull-token"  # a pull holds it (not JSON in Redis; a plain value here)
+
+    for _ in range(2):  # two deliveries of the same continuation message
+        clock[0] = 1000.0
+        await handlers._backfill(_integration(), _job(seq=2))
+
+    handed = [c for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"]
+    assert len(handed) == 1 and handed[0].args[2].lock_waits == 1
+    assert len([t for t in _titles(backfill, LogLevel.INFO) if t.startswith("The backfill is waiting")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_retry_at_the_limit_still_says_how_far_it_got(backfill):
+    """The run saved its last chunk at max_events and stopped before writing the done marker."""
+    job = _job(max_events=3)
+    up_to = START + timedelta(days=3)
+    backfill.store[handlers._backfill_key(job)] = {"seq": 0, "batch_index": 0, "after_id": 3, "created_so_far": 3,
+                                                   "uploaded_up_to": up_to.isoformat()}
+    backfill.pages = [(0, 1, [_ob(4)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    backfill.send.assert_not_called()
+    assert result["result"]["backfill_uploaded_up_to"] == up_to.isoformat()
+    assert "sightings uploaded up to 2024-01-04 00:00 UTC were sent" in _titles(backfill)[-1]
+    assert backfill.store[handlers._backfill_key(job)]["uploaded_up_to"] == up_to.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_the_saved_position_carries_the_last_upload_date(backfill):
+    job = _job()
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)])]
+
+    await handlers._backfill(_integration(), job)
+
+    assert backfill.store[handlers._backfill_key(job)]["uploaded_up_to"] == _ob(2).created_at.isoformat()

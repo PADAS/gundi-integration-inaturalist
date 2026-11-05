@@ -1351,6 +1351,16 @@ async def action_backfill_events_continue(integration: Integration, action_confi
     return await _backfill(integration, action_config)
 
 
+async def _lock_held_by_backfill(integration_id: str, key: str) -> bool:
+    """True when the connection's run lock is held by a run of this backfill. A pull's lock
+    value is a plain token, which doesn't read as JSON; that counts as someone else."""
+    try:
+        holder = await state_manager.get_state(integration_id, "pull_events", STATE_RUN_LOCK_SOURCE_ID)
+    except Exception:
+        return False
+    return isinstance(holder, dict) and holder.get("backfill") == key
+
+
 async def _backfill_is_current(integration_id: str, job: BackfillContinueConfig) -> bool:
     """False once a different backfill was started for this connection (its window replaced
     this one in backfill_current). Kept apart from the position key, so checkpoint writes can't
@@ -1420,15 +1430,29 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig,
         # The previous run started a pull and handed over: let that pull take the lock first.
         job.yield_to_pull = False
         await asyncio.sleep(BACKFILL_LOCK_WAIT_SECONDS)
-    lock_token = uuid4().hex
+    key = _backfill_key(job)
+    # The lock's value names the backfill holding it, so a copy of the same backfill can tell.
+    lock_token = json.dumps({"backfill": key, "token": uuid4().hex})
     while not await state_manager.set_if_absent(
             integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
             value=lock_token):
+        if await _lock_held_by_backfill(integration_id, key):
+            # Another delivery of this same backfill holds the lock (Pub/Sub delivers at least once):
+            # that run hands over or finishes, so this copy has nothing to do.
+            logger.info(f"Backfill {key} for integration ID: {integration_id} is already running in another run; "
+                        f"this copy does nothing.")
+            return _backfill_result(0, job, False, None)
         if time.monotonic() + BACKFILL_LOCK_WAIT_SECONDS < deadline:
             await asyncio.sleep(BACKFILL_LOCK_WAIT_SECONDS)
             continue
         if await _backfill_is_stale(integration_id, job):
             # The lock was held by this backfill's own other run, which has moved on.
+            return _backfill_result(0, job, False, None)
+        # Copies of the same message that all waited: only the first one to claim this wait
+        # hands over (or reports the stop), so they never start parallel chains.
+        if not await state_manager.set_if_absent(
+                integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS,
+                source_id=f"backfill_wait.{key}.{job.seq}.{job.lock_waits}"):
             return _backfill_result(0, job, False, None)
         if job.lock_waits + 1 < BACKFILL_MAX_LOCK_WAITS:
             job.lock_waits += 1
@@ -1459,9 +1483,12 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig,
     return result
 
 
-def _position(job: BackfillContinueConfig, **extra) -> dict:
-    return {"seq": job.seq, "batch_index": job.batch_index, "after_id": job.after_id,
-            "created_so_far": job.created_so_far, **extra}
+def _position(job: BackfillContinueConfig, uploaded_up_to: Optional[datetime] = None, **extra) -> dict:
+    position = {"seq": job.seq, "batch_index": job.batch_index, "after_id": job.after_id,
+                "created_so_far": job.created_so_far, **extra}
+    if uploaded_up_to is not None:
+        position["uploaded_up_to"] = uploaded_up_to.isoformat()
+    return position
 
 
 async def _backfill_locked(integration: Integration, pull_config: PullEventsConfig, job: BackfillContinueConfig,
@@ -1479,6 +1506,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
     if (saved.get("batch_index", 0), saved.get("after_id", 0)) > (job.batch_index, job.after_id):
         job.batch_index, job.after_id = saved["batch_index"], saved["after_id"]
+    # Where the saved position got to, so a retry that stops at once still says it.
+    saved_up_to = datetime.fromisoformat(saved["uploaded_up_to"]) if saved.get("uploaded_up_to") else None
     # The seq moves on only when this run hands over (see below), so a copy of this message
     # redelivered after a cut-off run can still pick the chain up from the saved position.
     start = (job.batch_index, job.after_id)
@@ -1497,7 +1526,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
         quality_grade=pull_config.quality_grade, annotations=annotations,
     )
     created = 0
-    uploaded_up_to = None
+    uploaded_up_to = saved_up_to
     batch_count = 1
     pages_read = 0
     outcome = None  # "limit", "finished", "handover" or "pull"
@@ -1573,7 +1602,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 if last_seen is not None:
                     job.after_id = last_seen.id
                     uploaded_up_to = last_seen.created_at
-                await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
+                await state_manager.set_state(integration_id, "pull_events", _position(job, uploaded_up_to),
+                                              source_id=key)
                 if outcome or job.created_so_far >= job.max_events:
                     break
     except (INatUnavailableError, INatRequestError) as e:
@@ -1597,7 +1627,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     if outcome in ("pull", "handover"):
         # This run hands the chain on: copies of its own message now see a higher seq and stop.
         job.seq += 1
-        await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
+        await state_manager.set_state(integration_id, "pull_events", _position(job, uploaded_up_to), source_id=key)
     if outcome == "pull":
         # A pull found the lock taken and was skipped: start it again, and let it go first.
         try:
@@ -1634,7 +1664,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     # Kept, not deleted: a late or repeated message for this backfill then does nothing.
     await state_manager.set_state(
         integration_id, "pull_events",
-        _position(job, done=True, finished=outcome == "finished", ended_at=datetime.now(tz=timezone.utc).isoformat()),
+        _position(job, uploaded_up_to, done=True, finished=outcome == "finished",
+                  ended_at=datetime.now(tz=timezone.utc).isoformat()),
         source_id=key,
     )
     if outcome == "limit":
