@@ -53,10 +53,10 @@ async def test_execute_pull_observations_action(
         if getattr(c.kwargs["event"].payload, "title", None)
     ]
     summary = next(t for t in titles if t.startswith("Pull finished in "))
-    # One photo per sighting by default; the rest are counted, not sent.
-    assert response["result"].get("photos_left_out") == 6
+    # Up to three photos per sighting by default; the rest are counted, not sent.
+    assert response["result"].get("photos_left_out") == 1
     assert ("It sent 7 new iNaturalist observations to Gundi and updated 0, "
-            "and handed their 7 photos to a separate photo run (6 left out by the photo limit)") in summary
+            "and handed their 12 photos to a separate photo run (1 left out by the photo limit)") in summary
     assert "iNaturalist took " in summary
 
 

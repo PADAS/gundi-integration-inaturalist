@@ -238,7 +238,7 @@ class _PullProgress:
     """How far a pull got, so a run that is stopped can say where it was and
     whether the time went to iNaturalist or to Gundi."""
 
-    def __init__(self, max_age_days: int = 90, max_new_events: Optional[int] = None):
+    def __init__(self, max_age_days: int = 150, max_new_events: Optional[int] = None):
         self.started = _run_started.get() or time.monotonic()
         self.max_age_days = max_age_days
         self.max_new_events = max_new_events or settings.INAT_MAX_NEW_EVENTS_PER_PULL

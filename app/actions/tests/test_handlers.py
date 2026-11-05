@@ -2000,7 +2000,7 @@ async def test_a_pull_skips_old_uploads_and_moves_the_cursor_past_them(mocker):
     assert "2" not in store and "photos.2" not in store
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
     finished = [t for t in _titles(mock_log) if t.startswith("Pull finished")][-1]
-    assert "and skipped 1 uploaded more than 90 days ago" in finished
+    assert "and skipped 1 uploaded more than 150 days ago" in finished
 
 
 @pytest.mark.asyncio

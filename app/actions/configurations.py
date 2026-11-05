@@ -148,18 +148,18 @@ class PullEventsConfig(PullActionConfiguration):
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
 
     max_photos: int = FieldWithUIOptions(
-        1,
+        3,
         title="Photos per sighting",
         ge=0,
         le=50,
-        description="How many of a sighting's photos to send, in iNaturalist order. 0 sends none. Default: 1")
+        description="How many of a sighting's photos to send, in iNaturalist order. 0 sends none. Default: 3")
 
     max_age_days: int = FieldWithUIOptions(
-        90,
+        150,
         title="Max age (days)",
         ge=1,
         le=3650,
-        description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 90")
+        description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 150 (about 5 months)")
 
     max_new_events_per_run: int = FieldWithUIOptions(
         min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000),

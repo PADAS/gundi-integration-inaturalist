@@ -32,7 +32,7 @@ Problems:
 
 - A site gets new sightings as they are uploaded, not months later, and not old sightings that were merely touched.
 - An event is updated only when something EarthRanger shows has changed, and the history line names only those fields.
-- Fewer messages per sighting to Gundi and EarthRanger: one event and one photo by default.
+- Fewer messages per sighting to Gundi and EarthRanger: one event and at most three photos by default.
 - Every limit is a setting on the Gundi connection with a default, so support can tune one site in the portal.
 - Each rule is one check that a reader can verify from a sighting's page and its upload date.
 - A user can load older sightings on demand, within a limit they choose, without changing the regular pull (§5).
@@ -49,9 +49,9 @@ Problems:
 |---|---|---|
 | D1 | **Upload date is the only age.** A sighting's age is `now − created_at` (iNaturalist upload time). `updated_at` decides nothing. | It is the one date a user can read on the sighting's page, and it never moves. |
 | D2 | **Update when what we send changed.** The event payload (D7: without `updated_at`) is built for every observation in state that iNaturalist returns; it is sent only when it differs from the payload last sent, which state records as a hash. | "We update when something we send to EarthRanger changed" is one sentence a reader can check against the sighting. A comment, a favourite or an agreement that changes no mapped field sends nothing. The whole payload goes (EarthRanger replaces `event_details` wholesale on PATCH), so the history shows exactly the fields that differ. |
-| D3 | **`max_age_days` (default 90), one check for creations and updates.** A sighting uploaded more than N days ago is skipped: not created, not updated, no photos. Nothing is stored for it. | Keeps old sightings that get touched out of EarthRanger, and stops updates to sightings nobody is watching any more. Skipping is free, so a run gets through backlog pages quickly. |
+| D3 | **`max_age_days` (default 150, about 5 months), one check for creations and updates.** A sighting uploaded more than N days ago is skipped: not created, not updated, no photos. Nothing is stored for it. | Keeps old sightings that get touched out of EarthRanger, and stops updates to sightings nobody is watching any more. Skipping is free, so a run gets through backlog pages quickly. |
 | D4 | **The cursor never starts further back than `days_to_load`.** `_get_load_since` returns `max(stored cursor, now − days_to_load)`. | One line. On Iberomab it moves the cursor from June to last week. Sightings uploaded in the gap are not backfilled (on a site this far behind they are older than the age floor anyway). |
-| D5 | **`max_photos` (default 1).** Only the first N of `ob.photos` are handed to the photo run. | Photos are 63% of the dead letters; the first photo is the one iNaturalist shows as the sighting's picture. |
+| D5 | **`max_photos` (default 3).** Only the first N of `ob.photos` are handed to the photo run. | Photos are 63% of the dead letters; three covers most sightings (56% have one, 20% two) while capping the long tail, and the first photo is the one iNaturalist shows as the sighting's picture. |
 | D6 | **`max_new_events_per_run` on the connection (default = `INAT_MAX_NEW_EVENTS_PER_PULL`, 150).** | A busy site can be throttled alone. The env var stays as the default so existing connections behave as today. Updates do not count against it, as today. |
 | D7 | **`updated_at` leaves the event payload.** | It changed on every send, made every payload differ, and showed up in EarthRanger's history as a changed field. `created_at` stays. |
 | D8 | **Counters, not a new log.** The existing run summary gains `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out` and `cursor_lag_days`; the summary title mentions skipped sightings and left-out photos. | The summary already exists (`_PullProgress`); four fields and two phrases add no logic path. |
@@ -77,8 +77,8 @@ What a user sees in EarthRanger: one history line per real change, naming the fi
 
 | Setting | Default | Range | New? |
 |---|---|---|---|
-| `max_age_days` | 90 | 1–3650 | new |
-| `max_photos` | 1 | 0–50 | new; 0 = no photos even when `include_photos` is on |
+| `max_age_days` | 150 (about 5 months) | 1–3650 | new |
+| `max_photos` | 3 | 0–50 | new; 0 = no photos even when `include_photos` is on |
 | `max_new_events_per_run` | `settings.INAT_MAX_NEW_EVENTS_PER_PULL` (150) | 1–1000 | new on the connection |
 | `days_to_load` | 3 | 1–7 | exists; now also the cursor floor |
 | `include_photos` | true | | exists |
@@ -100,7 +100,7 @@ Form order: the three new fields go after `include_photos`, before `run_on_sched
 
 Summary title (existing sentence, extended):
 
-> Pull finished in 14 seconds. It sent 150 new iNaturalist observations to Gundi and updated 12, and skipped 980 uploaded more than 90 days ago and 398 with nothing changed, and handed their 150 photos to a separate photo run (94 left out by the photo limit). Reading from iNaturalist took 9 seconds and found 1,540 observations that match the settings. …
+> Pull finished in 14 seconds. It sent 150 new iNaturalist observations to Gundi and updated 12, and skipped 980 uploaded more than 150 days ago and 398 with nothing changed, and handed their 150 photos to a separate photo run (94 left out by the photo limit). Reading from iNaturalist took 9 seconds and found 1,540 observations that match the settings. …
 
 The "skipped …" clause lists only the non-zero parts; the "(… left out …)" clause appears only when something was left out.
 
@@ -159,9 +159,9 @@ A run that hands over to the next one logs at info level how many it created so 
 
 | | Today | After |
 |---|---|---|
-| Iberomab creations | 900/h of mostly old sightings; cursor in June | Cursor jumps to last week; only uploads from the last 90 days; ~14,500 new uploads a day are in scope (its dispatcher delivers ~45,000 messages a day at best, so the site's scope still needs a look) |
-| Updates | one per touch; `Updated At` in every history line | only when a mapped field changed, within 90 days of upload; the 72 h diff of creation-vs-update payloads shows ~12% of updates changed nothing but `updated_at`, and no update at all goes out for sightings older than 90 days (36% of what was being touched) |
-| Photos per event | 1.6 (Huatulco 2.7) | 1 |
+| Iberomab creations | 900/h of mostly old sightings; cursor in June | Cursor jumps to last week; only uploads from the last 150 days; ~14,500 new uploads a day are in scope (its dispatcher delivers ~45,000 messages a day at best, so the site's scope still needs a look) |
+| Updates | one per touch; `Updated At` in every history line | only when a mapped field changed, within 150 days of upload; the 72 h diff of creation-vs-update payloads shows ~12% of updates changed nothing but `updated_at`, and no update at all goes out for sightings older than 90 days (36% of what was being touched) |
+| Photos per event | 1.6 (Huatulco 2.7) | at most 3 (Iberomab about 1.4: 56% of sightings have 1, 20% have 2) |
 | Huatulco | cursor in July | current within a day; 30 uploads a day |
 
 ## 7. Changes from today
@@ -194,7 +194,7 @@ A run that hands over to the next one logs at info level how many it created so 
 
 ## 9. Rollout
 
-1. Deploy; existing connections get the defaults (90 days, 1 photo, 150 per run).
+1. Deploy; existing connections get the defaults (150 days, 3 photos, 150 per run).
 2. On Iberomab and Huatulco, read the first summaries: `cursor_lag_days` should drop under 1 within a few runs; `events_skipped_too_old` large at first, then small; `events_updated` at first includes the one-time hash seeding of rows synced before this change.
 3. Watch the ER dispatchers' dead-letter counts for a day. Photo lists recorded before the deploy, and photo runs already queued, still send all their photos, so the photo count falls once that backlog has cleared.
 4. Raise with the Iberomab site whether research-only or a smaller area is wanted; `max_new_events_per_run` is the throttle meanwhile.

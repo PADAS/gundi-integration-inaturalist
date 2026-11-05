@@ -876,7 +876,7 @@ def test_empty_limits_in_saved_pull_settings_fall_back_to_defaults():
 
     config = PullEventsConfig.parse_obj({**PULL_SETTINGS, "max_photos": None, "max_age_days": "",
                                          "max_new_events_per_run": None})
-    assert (config.max_photos, config.max_age_days) == (1, 90)
+    assert (config.max_photos, config.max_age_days) == (3, 150)
     assert config.max_new_events_per_run == min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000)
 
 

@@ -124,7 +124,7 @@ When changing state, preserve backward-compat reads of the legacy `"updated_to"`
 - New per-observation state must continue to be addressed by `source_id=str(inat_id)` so existing rows are found.
 - Photo downloads use `verify=False` deliberately — iNat's photo CDN has had cert issues in the past. Do not "fix" without testing against production photo URLs.
 - The pull action returns `{"result": {"events_extracted": int, "events_updated": int, "photos_attached": int, ...}}` — these three numbers are used by Gundi monitoring; preserve them. It also returns `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out` and `cursor_lag_days`.
-- Pull limits live on the connection (`PullEventsConfig`): `max_age_days` (90), `max_photos` (1, first photos in iNaturalist order; 0 = none) and `max_new_events_per_run` (defaults to `INAT_MAX_NEW_EVENTS_PER_PULL`). Design: `docs/superpowers/specs/2026-11-05-pull-limits-design.md`.
+- Pull limits live on the connection (`PullEventsConfig`): `max_age_days` (150, about 5 months), `max_photos` (3, first photos in iNaturalist order; 0 = none) and `max_new_events_per_run` (defaults to `INAT_MAX_NEW_EVENTS_PER_PULL`). Design: `docs/superpowers/specs/2026-11-05-pull-limits-design.md`.
 - `gundi_core`, `gundi_client_v2`, and `pyinaturalist` are pinned via `requirements.in` / `requirements-base.in`. Run `pip-compile` after editing.
 
 ## Testing

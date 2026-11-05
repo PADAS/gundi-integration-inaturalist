@@ -419,8 +419,8 @@ def test_pull_limits_have_defaults():
     from app import settings
 
     config = _limits_config()
-    assert config.max_age_days == 90
-    assert config.max_photos == 1
+    assert config.max_age_days == 150
+    assert config.max_photos == 3
     assert config.max_new_events_per_run == settings.INAT_MAX_NEW_EVENTS_PER_PULL
 
 
@@ -428,7 +428,7 @@ def test_pull_limits_accept_a_stored_config_without_them():
     from app.actions.configurations import PullEventsConfig
 
     config = PullEventsConfig.parse_obj({"bounding_box": "[1, 1, 0, 0]", "event_prefix": "iNat: ", "days_to_load": 3})
-    assert (config.max_age_days, config.max_photos) == (90, 1)
+    assert (config.max_age_days, config.max_photos) == (150, 3)
 
 
 @pytest.mark.parametrize("field, bad", [
