@@ -2,6 +2,8 @@ import asyncio
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
+import hashlib
+import json
 import logging
 import time
 from typing import Dict, List, Optional
@@ -73,6 +75,8 @@ STATE_LAST_RUN_KEY = "last_run"
 STATE_DATETIME_FMT = "%Y-%m-%d %H:%M:%S%z"
 # Per-observation state: when we last synced this observation to Gundi (so we only patch when it changes)
 STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
+# Per-observation state: hash of the event payload last sent, so we only patch when what we send changed
+STATE_SENT_HASH_KEY = "sent_hash"
 # Per-integration run lock: held while a pull runs, expires if a run dies without releasing it.
 # Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
@@ -91,11 +95,17 @@ state_manager = IntegrationStateManager()
 
 
 def _get_load_since(state: dict, fallback_days: int) -> datetime:
-    """Return the datetime to use for updated_since. Uses stored cursor or now - fallback_days."""
+    """The datetime to use for updated_since: the stored cursor, but never
+    further back than fallback_days, so a connection that fell behind reads
+    recent changes instead of crawling months of old ones."""
+    floor = datetime.now(tz=timezone.utc) - timedelta(days=fallback_days)
     raw = state.get(STATE_LAST_RUN_KEY) or state.get("updated_to")
-    if raw:
-        return datetime.strptime(raw, STATE_DATETIME_FMT)
-    return datetime.now(tz=timezone.utc) - timedelta(days=fallback_days)
+    if not raw:
+        return floor
+    cursor = datetime.strptime(raw, STATE_DATETIME_FMT)
+    if cursor.tzinfo is None:
+        cursor = cursor.replace(tzinfo=timezone.utc)
+    return max(cursor, floor)
 
 
 def _build_pull_events_state(last_updated: datetime) -> dict:
@@ -201,8 +211,10 @@ class _PullProgress:
     """How far a pull got, so a run that is stopped can say where it was and
     whether the time went to iNaturalist or to Gundi."""
 
-    def __init__(self):
+    def __init__(self, max_age_days: int = 90, max_new_events: Optional[int] = None):
         self.started = _run_started.get() or time.monotonic()
+        self.max_age_days = max_age_days
+        self.max_new_events = max_new_events or settings.INAT_MAX_NEW_EVENTS_PER_PULL
         self.step = "getting ready to read from iNaturalist"
         self.asked_inat = False
         self.inat_seconds: Optional[float] = None
@@ -210,6 +222,9 @@ class _PullProgress:
         self.events_sent = 0
         self.events_updated = 0
         self.photos_handed_off = 0
+        self.photos_left_out = 0
+        self.skipped_too_old = 0
+        self.skipped_unchanged = 0
         # Set once the cursor for the next pull is saved: a stop after that
         # point (while publishing the summary) loses nothing.
         self.finished = False
@@ -225,8 +240,17 @@ class _PullProgress:
         prefix = "at least " if at_least else ""
         text = (f"it sent {prefix}{_count(self.events_sent, 'new iNaturalist observation', 'new iNaturalist observations')} "
                 f"to Gundi and updated {self.events_updated}")
+        skipped = []
+        if self.skipped_too_old:
+            skipped.append(f"{self.skipped_too_old} uploaded more than {self.max_age_days} days ago")
+        if self.skipped_unchanged:
+            skipped.append(f"{self.skipped_unchanged} with nothing changed")
+        if skipped:
+            text += ", and skipped " + " and ".join(skipped)
         if self.photos_handed_off:
             text += f", and handed their {_count(self.photos_handed_off, 'photo', 'photos')} to a separate photo run"
+            if self.photos_left_out:
+                text += f" ({self.photos_left_out} left out by the photo limit)"
         return text
 
     def inat_summary(self) -> str:
@@ -250,6 +274,9 @@ class _PullProgress:
             "events_sent": self.events_sent,
             "events_updated": self.events_updated,
             "photos_handed_off": self.photos_handed_off,
+            "photos_left_out": self.photos_left_out,
+            "events_skipped_too_old": self.skipped_too_old,
+            "events_skipped_unchanged": self.skipped_unchanged,
         }
 
 
@@ -293,7 +320,7 @@ async def _log_pull_finished(integration: Integration, progress: _PullProgress):
     msg = (f"Pull finished in {_plain_duration(progress.elapsed())}. {_capitalized(progress.counts())}. "
            f"{progress.inat_summary()}.")
     if progress.capped_at:
-        msg += (f" It stopped after {settings.INAT_MAX_NEW_EVENTS_PER_PULL} new observations, the most one pull "
+        msg += (f" It stopped after {progress.max_new_events} new observations, the most one pull "
                 f"sends. Observations changed on iNaturalist up to {_utc_minute(progress.capped_at)} UTC are in Gundi.")
     # Only the time left before the limit: the summary must never turn a pull
     # whose work is saved into a timeout that gets retried.
@@ -331,7 +358,7 @@ def _utc_minute(dt: datetime) -> str:
 
 
 async def _run_pull(integration: Integration, action_config: PullEventsConfig):
-    progress = _PullProgress()
+    progress = _PullProgress(action_config.max_age_days, action_config.max_new_events_per_run)
     try:
         return await _pull_events(integration, action_config, progress)
     except asyncio.CancelledError:
@@ -371,9 +398,7 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
             # Best-effort, like the runner's own skip: a publisher failure must not
             # turn the skip into an error that PubSub redelivers.
             logger.warning(f"Could not publish the skip notice for integration ID: {integration_id}: {log_error}")
-        return {'result': {'events_extracted': 0,
-                           'events_updated': 0,
-                           'photos_attached': 0}}
+        return _pull_result(0, 0, 0)
     try:
         return await _run_pull(integration, action_config)
     finally:
@@ -430,7 +455,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         quality_grade=action_config.quality_grade,
         annotations=annotations,
     )
-    max_new = settings.INAT_MAX_NEW_EVENTS_PER_PULL
+    max_new = action_config.max_new_events_per_run
+    now = datetime.now(tz=timezone.utc)
     # Photos are added by a separate photo run, so chunks only create and update events.
     chunk_size = GUNDI_SUBMISSION_CHUNK_SIZE
     # Page by page, oldest change first: each page is sent in chunks and the
@@ -470,7 +496,12 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 batch.append(ob)
                 if not annotations or _match_annotations_to_config(ob.annotations, annotations):
                     progress.observations_read += 1
-                    await _sort_observation(integration, ob, new_ids, patch_targets, photos_left_behind)
+                    outcome = await _sort_observation(integration, action_config, ob, new_ids, patch_targets,
+                                                      photos_left_behind, now=now)
+                    if outcome == "too_old":
+                        progress.skipped_too_old += 1
+                    elif outcome == "unchanged":
+                        progress.skipped_unchanged += 1
                 if new_found + len(new_ids) >= max_new:
                     break
             new_found += len(new_ids)
@@ -495,7 +526,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                     response = await patch_events([item], action_config, integration, progress)
                     updated_count += len(response)
                     progress.step = "saving which observations were updated"
-                    await save_patched_events_state([item], integration)
+                    await save_patched_events_state([item], integration, action_config)
                 if stopped_on_time:
                     break
                 to_resume = [ob.id for ob in chunk if ob.id in photos_left_behind]
@@ -518,7 +549,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
             raise
         # What was sent before the read failed is saved, cursor included.
         await _handle_inat_down(integration, e)
-        return _pull_result(added_count, updated_count, attachment_count)
+        return _pull_result(added_count, updated_count, attachment_count, progress, done_through)
     await _clear_inat_down(integration)
     progress.finished = True
 
@@ -540,7 +571,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         await state_manager.set_state(
             str(integration.id), "pull_events", _build_pull_events_state(now)
         )
-        return _pull_result(0, 0, 0)
+        return _pull_result(0, 0, 0, progress, now)
 
     if stopped_on_time:
         await _log_pull_paused(integration, progress, done_through)
@@ -549,14 +580,24 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
             progress.capped_at = done_through
         await _log_pull_finished(integration, progress)
 
-    return _pull_result(added_count, updated_count, attachment_count)
+    return _pull_result(added_count, updated_count, attachment_count, progress, done_through)
 
 
-def _pull_result(added: int, updated: int, photos: int) -> dict:
-    # Gundi monitoring reads these numbers.
+def _pull_result(added: int, updated: int, photos: int, progress: Optional["_PullProgress"] = None,
+                 cursor: Optional[datetime] = None) -> dict:
+    # Gundi monitoring reads the first three numbers.
+    lag = None
+    if cursor is not None:
+        if cursor.tzinfo is None:
+            cursor = cursor.replace(tzinfo=timezone.utc)
+        lag = round((datetime.now(tz=timezone.utc) - cursor).total_seconds() / 86400, 1)
     return {'result': {'events_extracted': added,
                        'events_updated': updated,
-                       'photos_attached': photos}}
+                       'photos_attached': photos,
+                       'events_skipped_too_old': progress.skipped_too_old if progress else 0,
+                       'events_skipped_unchanged': progress.skipped_unchanged if progress else 0,
+                       'photos_left_out': progress.photos_left_out if progress else 0,
+                       'cursor_lag_days': lag}}
 
 
 def _time_left(deadline: float) -> float:
@@ -571,35 +612,41 @@ def _pull_time_budget() -> float:
     return limit - settings.INAT_PULL_TIME_MARGIN_SECONDS
 
 
-async def _sort_observation(integration: Integration, observation: Observation, new_ids: set, patch_targets: dict,
-                            photos_left_behind: set):
-    """Add the observation's id to new_ids when it isn't in Gundi yet, or to
-    patch_targets ({id: Gundi object_id}) when it changed since it was last
-    synced. An observation already in sync goes in neither. An observation in
-    Gundi whose photos are still pending also goes in photos_left_behind."""
+def _payload_hash(event: dict) -> str:
+    """What was sent, as one string: equal payloads hash equal across runs."""
+    return hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()
+
+
+async def _sort_observation(integration: Integration, action_config: PullEventsConfig, observation: Observation,
+                            new_ids: set, patch_targets: dict, photos_left_behind: set, *, now: datetime) -> str:
+    """Sort one observation by what to do with it, and say which:
+
+    - "too_old": uploaded more than max_age_days ago; nothing is stored for it.
+    - "new": not in Gundi yet; its id goes in new_ids.
+    - "update": in Gundi, and what we would send differs from what was last
+      sent (or no hash was stored yet); goes in patch_targets ({id: object_id}).
+    - "unchanged": in Gundi and nothing we send changed.
+
+    An observation in Gundi whose photos are still pending also goes in
+    photos_left_behind."""
+    created = observation.created_at
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < now - timedelta(days=action_config.max_age_days):
+            return "too_old"
     saved_event = await state_manager.get_state(str(integration.id), "pull_events", str(observation.id))
     if not saved_event:
         new_ids.add(observation.id)
-        return
+        return "new"
     photos = await state_manager.get_state(str(integration.id), "pull_events", STATE_PHOTOS_PREFIX + str(observation.id))
     if (photos or {}).get("pending"):
         photos_left_behind.add(observation.id)
-    # Only patch when the observation has changed since we last synced it (avoids updating every run)
-    last_synced_at = saved_event.get(STATE_INAT_UPDATED_AT_KEY)
-    if last_synced_at:
-        try:
-            if isinstance(last_synced_at, str):
-                last_synced_at = datetime.strptime(last_synced_at, STATE_DATETIME_FMT)
-            ob_updated = observation.updated_at
-            if ob_updated.tzinfo is None:
-                ob_updated = ob_updated.replace(tzinfo=timezone.utc)
-            if last_synced_at.tzinfo is None:
-                last_synced_at = last_synced_at.replace(tzinfo=timezone.utc)
-            if ob_updated <= last_synced_at:
-                return  # Already in sync, skip patch
-        except (ValueError, TypeError):
-            pass  # Bad or legacy value, patch to be safe
+    payload = _transform_inat_to_gundi_event(observation, action_config)
+    if saved_event.get(STATE_SENT_HASH_KEY) == _payload_hash(payload):
+        return "unchanged"
     patch_targets[observation.id] = saved_event.get("object_id")
+    return "update"
 
 
 async def _send_new_observations(integration, action_config, observations, progress: _PullProgress):
@@ -609,15 +656,20 @@ async def _send_new_observations(integration, action_config, observations, progr
     events = []
     pending_photos = {}  # inat_id -> [[photo_id, url], ...]
     inat_updated_at_map = {}  # inat_id -> updated_at for state we persist after create
+    left_out = {}  # inat_id -> photos not handed off because of max_photos
     for ob in observations:
         e = _transform_inat_to_gundi_event(ob, action_config)
         events.append(e)
         inat_id = e['event_details']['inat_id']
         inat_updated_at_map[inat_id] = ob.updated_at
         if action_config.include_photos:
-            pending_photos[inat_id] = [
-                [photo.id, photo.large_url if photo.large_url else photo.url] for photo in ob.photos
-            ]
+            photos = list(ob.photos or [])
+            kept = photos[:action_config.max_photos]
+            if kept:
+                pending_photos[inat_id] = [
+                    [photo.id, photo.large_url if photo.large_url else photo.url] for photo in kept
+                ]
+            left_out[inat_id] = len(photos) - len(kept)
 
     logger.info(f"Submitting {len(events)} iNaturalist observations to Gundi")
     progress.step = "sending new observations to Gundi"
@@ -625,6 +677,7 @@ async def _send_new_observations(integration, action_config, observations, progr
     progress.events_sent += len(response)
     if not response:
         return 0, 0
+    progress.photos_left_out += sum(left_out.get(e['event_details']['inat_id'], 0) for e in events[:len(response)])
     progress.step = "saving which observations were sent"
     await save_events_state(response, events, integration, inat_updated_at_map, pending_photos)
     with_photos = [e['event_details']['inat_id'] for e in events[:len(response)]
@@ -870,6 +923,7 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
         try:
             event_id = event["event_details"]["inat_id"]
             state = dict(saved_event)
+            state[STATE_SENT_HASH_KEY] = _payload_hash(event)
             updated_at = inat_updated_at_map.get(event_id)
             if updated_at is not None:
                 state[STATE_INAT_UPDATED_AT_KEY] = (
@@ -899,8 +953,8 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
             raise e
 
 
-async def save_patched_events_state(events_to_patch, integration):
-    """After patching, update per-observation state so we don't patch again until the observation changes."""
+async def save_patched_events_state(events_to_patch, integration, action_config: PullEventsConfig):
+    """After patching, update per-observation state so we don't patch again until what we send changes."""
     for gundi_object_id, observation in events_to_patch:
         try:
             updated_at = observation.updated_at
@@ -910,6 +964,7 @@ async def save_patched_events_state(events_to_patch, integration):
                     updated_at.strftime(STATE_DATETIME_FMT)
                     if hasattr(updated_at, "strftime") else str(updated_at)
                 ),
+                STATE_SENT_HASH_KEY: _payload_hash(_transform_inat_to_gundi_event(observation, action_config)),
             }
             await state_manager.set_state(
                 integration_id=str(integration.id),
@@ -951,7 +1006,6 @@ def _transform_inat_to_gundi_event(ob: Observation, config: PullEventsConfig):
             "place_guess": ob.place_guess,
             "quality_grade": ob.quality_grade,
             "species_guess": ob.species_guess,
-            "updated_at": ob.updated_at,
             "inat_url": ob.uri
         }
     }

@@ -11,9 +11,10 @@ INAT_TAXA_CACHE_TTL_SECONDS = env.int("INAT_TAXA_CACHE_TTL_SECONDS", 86400, vali
 INAT_TAXA_CACHE_MISSING_TTL_SECONDS = env.int("INAT_TAXA_CACHE_MISSING_TTL_SECONDS", 300, validate=lambda n: n > 0)
 INAT_TAXA_CACHE_TIMEOUT_SECONDS = env.float("INAT_TAXA_CACHE_TIMEOUT_SECONDS", 0.5, validate=lambda s: s > 0)
 
-# Most new events one pull_events run sends to Gundi: the run reads from
-# iNaturalist only until it has found this many, so a large backlog drains over
-# several scheduled runs. Updates found on the way are sent too and don't count.
+# Default of the connection's max_new_events_per_run: the most new events one
+# pull_events run sends to Gundi. The run reads from iNaturalist only until it
+# has found that many, so a large backlog drains over several scheduled runs.
+# Updates found on the way are sent too and don't count.
 INAT_MAX_NEW_EVENTS_PER_PULL = env.int("INAT_MAX_NEW_EVENTS_PER_PULL", 150, validate=lambda n: n > 0)
 # A pull stops taking new work this many seconds before the tighter of
 # MAX_ACTION_EXECUTION_TIME and INAT_PULL_TIME_LIMIT_SECONDS (Cloud Run's request

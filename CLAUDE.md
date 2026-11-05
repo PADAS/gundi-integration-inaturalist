@@ -38,13 +38,13 @@ PubSub message → `POST /` (`app/main.py`) → `app/services/action_runner.py::
 
 `action_pull_events` is the single entry point and does:
 
-1. Loads cursor from `IntegrationStateManager` under key `STATE_LAST_RUN_KEY="last_run"` (falls back to legacy `"updated_to"`). If absent, uses `now - days_to_load`.
+1. Loads cursor from `IntegrationStateManager` under key `STATE_LAST_RUN_KEY="last_run"` (falls back to legacy `"updated_to"`), but never further back than `now - days_to_load`; if absent, uses `now - days_to_load`.
 2. Calls `app/datasource/inaturalist.py::get_observations` (synchronous, uses `pyinaturalist.get_observations_v2`).
-3. Splits observations into **new** (create in Gundi) vs **existing** (patch only if `observation.updated_at > last_synced_at`), by reading per-observation state keyed by `source_id=inat_id`.
+3. Sorts each observation (`_sort_observation`), reading per-observation state keyed by `source_id=inat_id`: **too old** (uploaded more than `max_age_days` ago by `created_at`; skipped, nothing stored), **new** (create in Gundi), **update** (in state and the payload hash differs from the stored `sent_hash`, or none is stored) or **unchanged** (skipped). `updated_at` never decides anything and is not in the payload.
 4. Transforms via `_transform_inat_to_gundi_event` and submits in chunks of `GUNDI_SUBMISSION_CHUNK_SIZE = 100` via `send_events_to_gundi`.
 5. If `include_photos`, downloads each photo URL with `httpx.AsyncClient(verify=False)` and uploads as Gundi attachments.
 6. Patches changed observations via `update_event_in_gundi`.
-7. Writes the new cursor (max `updated_at` across all observations seen) and per-observation `STATE_INAT_UPDATED_AT_KEY` so the next run doesn't re-patch unchanged observations.
+7. Writes the new cursor (max `updated_at` across all observations seen) and per-observation `STATE_INAT_UPDATED_AT_KEY` and `STATE_SENT_HASH_KEY` so the next run doesn't re-patch observations whose payload didn't change.
 
 If the iNat query returns nothing, the cursor is still advanced to `now()` so the next run does not re-query the same heavy window.
 
@@ -98,7 +98,7 @@ Two distinct shapes stored under `(integration_id, "pull_events")`:
 | Key shape | What it is | Where written |
 |-----------|-----------|---------------|
 | no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | end of `action_pull_events` |
-| `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` | `save_events_state`, `save_patched_events_state` |
+| `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` and `sent_hash` (SHA-256 of the payload last sent) | `save_events_state`, `save_patched_events_state` |
 
 When changing state, preserve backward-compat reads of the legacy `"updated_to"` key (`_get_load_since`).
 
@@ -111,7 +111,8 @@ When changing state, preserve backward-compat reads of the legacy `"updated_to"`
 - **`taxa` is a list in the config model and a comma-separated string at the datasource.** Downstream code uses `action_config.taxa_str`; coerce at the config boundary, do not branch on shape downstream.
 - New per-observation state must continue to be addressed by `source_id=str(inat_id)` so existing rows are found.
 - Photo downloads use `verify=False` deliberately — iNat's photo CDN has had cert issues in the past. Do not "fix" without testing against production photo URLs.
-- The pull action returns `{"result": {"events_extracted": int, "events_updated": int, "photos_attached": int}}` — these numbers are used by Gundi monitoring; preserve them.
+- The pull action returns `{"result": {"events_extracted": int, "events_updated": int, "photos_attached": int, ...}}` — these three numbers are used by Gundi monitoring; preserve them. It also returns `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out` and `cursor_lag_days`.
+- Pull limits live on the connection (`PullEventsConfig`): `max_age_days` (90), `max_photos` (1, first photos in iNaturalist order; 0 = none) and `max_new_events_per_run` (defaults to `INAT_MAX_NEW_EVENTS_PER_PULL`). Design: `docs/superpowers/specs/2026-11-05-pull-limits-design.md`.
 - `gundi_core`, `gundi_client_v2`, and `pyinaturalist` are pinned via `requirements.in` / `requirements-base.in`. Run `pip-compile` after editing.
 
 ## Testing
@@ -121,4 +122,4 @@ When changing state, preserve backward-compat reads of the legacy `"updated_to"`
 
 ## Key env vars (in addition to the standard Gundi template ones)
 
-The iNat API key is per-integration config, not per-service env. `pull_events` has three: `INAT_MAX_NEW_EVENTS_PER_PULL` (150 new events sent per run; reading stops once that many are found, updates don't count), `INAT_PULL_TIME_LIMIT_SECONDS` (300, Cloud Run's request timeout) and `INAT_PULL_TIME_MARGIN_SECONDS` (60; a run stops taking new chunks this long before the tighter of that limit and `MAX_ACTION_EXECUTION_TIME`). `INTEGRATION_COMMANDS_TOPIC` defaults to `inaturalist-actions-topic` (the topic the infra module creates; deployed runners don't set it), which `pull_events` uses to start `add_photos`. The rest belong to the saved-taxa reference cache in `app/actions/taxa_cache.py`: `REDIS_REFERENCE_CACHE_DB` (default 3, never the state DB), `INAT_TAXA_CACHE_ENABLED` (default true; `false` is the rollback switch), `INAT_TAXA_CACHE_TTL_SECONDS` (86400), `INAT_TAXA_CACHE_MISSING_TTL_SECONDS` (300) and `INAT_TAXA_CACHE_TIMEOUT_SECONDS` (0.5, Redis connect/socket timeout). Standard Gundi template variables (`GUNDI_API_BASE_URL`, `KEYCLOAK_*`, `REDIS_*`, `INTEGRATION_TYPE_SLUG`, `REGISTER_ON_START`) apply; see `.env.example` and `app/settings/base.py`.
+The iNat API key is per-integration config, not per-service env. `pull_events` has three: `INAT_MAX_NEW_EVENTS_PER_PULL` (150; the default of each connection's `max_new_events_per_run`: reading stops once that many new events are found, updates don't count), `INAT_PULL_TIME_LIMIT_SECONDS` (300, Cloud Run's request timeout) and `INAT_PULL_TIME_MARGIN_SECONDS` (60; a run stops taking new chunks this long before the tighter of that limit and `MAX_ACTION_EXECUTION_TIME`). `INTEGRATION_COMMANDS_TOPIC` defaults to `inaturalist-actions-topic` (the topic the infra module creates; deployed runners don't set it), which `pull_events` uses to start `add_photos`. The rest belong to the saved-taxa reference cache in `app/actions/taxa_cache.py`: `REDIS_REFERENCE_CACHE_DB` (default 3, never the state DB), `INAT_TAXA_CACHE_ENABLED` (default true; `false` is the rollback switch), `INAT_TAXA_CACHE_TTL_SECONDS` (86400), `INAT_TAXA_CACHE_MISSING_TTL_SECONDS` (300) and `INAT_TAXA_CACHE_TIMEOUT_SECONDS` (0.5, Redis connect/socket timeout). Standard Gundi template variables (`GUNDI_API_BASE_URL`, `KEYCLOAK_*`, `REDIS_*`, `INTEGRATION_TYPE_SLUG`, `REGISTER_ON_START`) apply; see `.env.example` and `app/settings/base.py`.

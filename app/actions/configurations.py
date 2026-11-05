@@ -6,6 +6,7 @@ from .core import (
     PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration,
     InternalActionConfiguration,
 )
+from app import settings
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
@@ -110,7 +111,7 @@ class PullEventsConfig(PullActionConfiguration):
         ui_options=UIOptions(
             widget="range",  # This will be rendered ad a range slider
         ),
-        description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
+        description="The number of days of data to load from iNaturalist. If the integration state contains a last_run value, data is loaded since that value, but never from further back than this many days.")
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
         description="Required when no project is selected. Draw a box on the map or enter its coordinates.")
@@ -145,6 +146,30 @@ class PullEventsConfig(PullActionConfiguration):
     include_photos: Optional[bool] = pydantic.Field(True, title="Include photos",
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
 
+    max_photos: int = FieldWithUIOptions(
+        1,
+        title="Photos per sighting",
+        ge=0,
+        le=50,
+        description="How many of a sighting's photos to send, in iNaturalist order. 0 sends none. Default: 1")
+
+    max_age_days: int = FieldWithUIOptions(
+        90,
+        title="Max age (days)",
+        ge=1,
+        le=3650,
+        ui_options=UIOptions(
+            widget="range",
+        ),
+        description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 90")
+
+    max_new_events_per_run: int = FieldWithUIOptions(
+        settings.INAT_MAX_NEW_EVENTS_PER_PULL,
+        title="New events per run",
+        ge=1,
+        le=1000,
+        description="Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: 150")
+
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
             "taxa",
@@ -156,6 +181,9 @@ class PullEventsConfig(PullActionConfiguration):
             "event_type",
             "event_prefix",
             "include_photos",
+            "max_photos",
+            "max_age_days",
+            "max_new_events_per_run",
             "run_on_schedule",
         ],
     )
