@@ -954,15 +954,18 @@ async def patch_events(events, updated_config_data, integration, progress: Optio
     return responses
 
 
-async def save_events_state(response, events, integration, inat_updated_at_map=None, pending_photos=None):
+async def save_events_state(response, events, integration, inat_updated_at_map=None, pending_photos=None,
+                            extra: Optional[dict] = None):
     """Persist Gundi event state per observation so we know what we created and when we last synced,
-    and which of its photos are still to add."""
+    and which of its photos are still to add. `extra` is merged into each row (the backfill tags
+    the rows it creates with its job key)."""
     inat_updated_at_map = inat_updated_at_map or {}
     pending_photos = pending_photos or {}
     for saved_event, event in zip(response, events):
         try:
             event_id = event["event_details"]["inat_id"]
             state = dict(saved_event)
+            state.update(extra or {})
             state[STATE_SENT_HASH_KEY] = _payload_hash(event)
             updated_at = inat_updated_at_map.get(event_id)
             if updated_at is not None:
@@ -1181,6 +1184,10 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig) -> di
                             f"Fix them and run it again.", _backfill_data(job))
         return _backfill_result(0, job, False, None)
 
+    if job.yield_to_pull:
+        # The previous run started a pull and handed over: let that pull take the lock first.
+        job.yield_to_pull = False
+        await asyncio.sleep(BACKFILL_LOCK_WAIT_SECONDS)
     lock_token = uuid4().hex
     while not await state_manager.set_if_absent(
             integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
@@ -1221,9 +1228,13 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
 
     # A redelivered or repeated run carries an older position: the saved one wins.
     saved = await state_manager.get_state(integration_id, "pull_events", key) or {}
+    job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
+    if saved.get("done"):
+        # This backfill already ended (a late or repeated message): nothing more to do.
+        logger.info(f"Backfill {key} already ended; ignoring a later run. Integration ID: {integration_id}.")
+        return _backfill_result(0, job, bool(saved.get("finished")), None)
     if (saved.get("batch_index", 0), saved.get("after_id", 0)) > (job.batch_index, job.after_id):
         job.batch_index, job.after_id = saved["batch_index"], saved["after_id"]
-    job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
     start = (job.batch_index, job.after_id)
 
     projects = pull_config.projects
@@ -1242,14 +1253,19 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     created = 0
     uploaded_up_to = None
     batch_count = 1
-    outcome = None  # "limit", "finished" or "handover"
+    pages_read = 0
+    outcome = None  # "limit", "finished", "handover" or "pull"
     try:
         while outcome is None:
             if job.created_so_far >= job.max_events:
                 outcome = "limit"
                 break
-            if time.monotonic() >= deadline or await _pull_is_waiting(integration_id):
+            if time.monotonic() >= deadline:
                 outcome = "handover"
+                break
+            # Checked once this run has read a page, so yielding to pulls never stalls the backfill.
+            if pages_read and await _pull_is_waiting(integration_id):
+                outcome = "pull"
                 break
             try:
                 item = await asyncio.wait_for(asyncio.to_thread(next, pages, None), _time_left(deadline))
@@ -1260,22 +1276,27 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 outcome = "finished"
                 break
             batch_index, batch_count, page = item
+            pages_read += 1
             if batch_index != job.batch_index:
                 job.batch_index, job.after_id = batch_index, 0
             for chunk in chunk_list(page, GUNDI_SUBMISSION_CHUNK_SIZE):
                 if time.monotonic() >= deadline:
                     outcome = "handover"
                     break
-                room = job.max_events - job.created_so_far
                 to_add = []
                 last_seen = None
                 for ob in chunk:
-                    if len(to_add) >= room:
+                    if job.created_so_far + len(to_add) >= job.max_events:
                         break
                     last_seen = ob
                     if annotations and not _match_annotations_to_config(ob.annotations, annotations):
                         continue
-                    if await state_manager.get_state(integration_id, "pull_events", str(ob.id)):
+                    row = await state_manager.get_state(integration_id, "pull_events", str(ob.id))
+                    if row:
+                        if row.get("backfill_job") == key and (job.batch_index, ob.id) > start:
+                            # Created by this backfill after its last saved position (a run that stopped
+                            # between saving the event and saving its count): count it now.
+                            job.created_so_far += 1
                         continue
                     to_add.append(ob)
                 if to_add:
@@ -1287,6 +1308,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                             response, events[:accepted], integration,
                             {e['event_details']['inat_id']: ob.updated_at
                              for e, ob in zip(events[:accepted], to_add[:accepted])},
+                            extra={"backfill_job": key},
                         )
                     created += accepted
                     job.created_so_far += accepted
@@ -1316,6 +1338,22 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
         return _backfill_result(created, job, False, uploaded_up_to)
 
     reached = _reached(job, uploaded_up_to, batch_count)
+    if outcome == "pull":
+        # A pull found the lock taken and was skipped: start it again, and let it go first.
+        try:
+            await state_manager.delete_state(integration_id, "pull_events", source_id=STATE_PULL_WAITING_SOURCE_ID)
+        except Exception:
+            logger.exception(f"Could not clear the pull-waiting note for integration ID: {integration_id}.")
+        await trigger_action(integration_id, "pull_events")
+        job.runs_without_progress = 0
+        job.yield_to_pull = True
+        await trigger_action(integration_id, "backfill_events_continue", job)
+        await _backfill_log(
+            integration, LogLevel.INFO,
+            f"Backfill paused for a pull and continues in a new run: {job.created_so_far:,} events created so far "
+            f"for sightings uploaded {window}" + (f"; {reached}." if reached else "."),
+            _backfill_data(job, uploaded_up_to))
+        return _backfill_result(created, job, False, uploaded_up_to)
     if outcome == "handover":
         if (job.batch_index, job.after_id) == start and not created:
             job.runs_without_progress += 1
@@ -1335,10 +1373,13 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
             f"uploaded {window}" + (f"; {reached}." if reached else "."), _backfill_data(job, uploaded_up_to))
         return _backfill_result(created, job, False, uploaded_up_to)
 
-    try:
-        await state_manager.delete_state(integration_id, "pull_events", source_id=key)
-    except Exception:
-        logger.exception(f"Could not clear the backfill progress for integration ID: {integration_id}.")
+    # Kept, not deleted: a late or repeated message for this backfill then does nothing.
+    await state_manager.set_state(
+        integration_id, "pull_events",
+        {"done": True, "finished": outcome == "finished", "created_so_far": job.created_so_far,
+         "batch_index": job.batch_index, "after_id": job.after_id},
+        source_id=key,
+    )
     if outcome == "limit":
         await _backfill_log(
             integration, LogLevel.INFO,

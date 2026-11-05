@@ -318,16 +318,37 @@ async def test_the_integration_type_registers_with_that_name(mocker):
 
 
 @pytest.mark.asyncio
-async def test_backfill_hands_over_when_a_pull_is_waiting(backfill):
+async def test_backfill_yields_to_a_waiting_pull_after_reading_a_page(backfill):
     backfill.store["pull_waiting"] = 1
-    backfill.pages = [(0, 1, [_ob(1)])]
+    backfill.pages = [(0, 1, [_ob(1)]), (0, 1, [_ob(2)])]
 
     result = await handlers._backfill(_integration(), _job())
 
-    backfill.send.assert_not_called()
-    assert backfill.trigger.call_args.args[1] == "backfill_events_continue"
+    # The first page is always read, so yielding never stalls the backfill.
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["1"]
+    started = [c.args[1] for c in backfill.trigger.call_args_list]
+    assert started == ["pull_events", "backfill_events_continue"]
+    job = backfill.trigger.call_args.args[2]
+    assert job.yield_to_pull is True and job.runs_without_progress == 0 and job.after_id == 1
+    assert [c for c in backfill.state.delete_state.call_args_list if c.kwargs.get("source_id") == "pull_waiting"]
     assert result["result"]["backfill_finished"] is False
-    backfill.state.delete_state_if_value.assert_called_once()  # the lock goes back to the pull
+    backfill.state.delete_state_if_value.assert_called_once()  # the lock goes back for the pull
+
+
+@pytest.mark.asyncio
+async def test_a_continuation_that_yielded_waits_before_taking_the_lock(backfill, mocker):
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+    _fake_asyncio(mocker, sleep=sleep)
+    mocker.patch.object(handlers, "BACKFILL_LOCK_WAIT_SECONDS", 10)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), _job(yield_to_pull=True))
+
+    assert slept == [10]
 
 
 @pytest.mark.asyncio
@@ -367,14 +388,62 @@ async def test_backfill_resumes_from_saved_progress_when_a_message_is_redelivere
 
 
 @pytest.mark.asyncio
-async def test_backfill_clears_its_progress_when_it_finishes(backfill):
+async def test_a_finished_backfill_leaves_a_done_marker_and_ignores_later_messages(backfill):
     job = _job()
     backfill.pages = [(0, 1, [_ob(1)])]
 
     await handlers._backfill(_integration(), job)
 
-    cleared = [c for c in backfill.state.delete_state.call_args_list if c.kwargs.get("source_id") == handlers._backfill_key(job)]
-    assert cleared
+    marker = backfill.store[handlers._backfill_key(job)]
+    assert marker["done"] is True and marker["finished"] is True and marker["created_so_far"] == 1
+
+    # A late copy of an earlier continuation, with an older count, does nothing.
+    backfill.send.reset_mock()
+    backfill.pages = [(0, 1, [_ob(5)])]
+    result = await handlers._backfill(_integration(), _job(created_so_far=0))
+    backfill.send.assert_not_called()
+    assert result["result"]["backfill_events_created"] == 1 and result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_backfill_at_its_limit_also_ignores_later_messages(backfill):
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+    await handlers._backfill(_integration(), _job(max_events=2))
+
+    backfill.send.reset_mock()
+    backfill.pages = [(0, 1, [_ob(3), _ob(4)])]
+    await handlers._backfill(_integration(), _job(max_events=2, created_so_far=0))
+
+    backfill.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_retry_counts_sightings_saved_after_the_last_saved_position(backfill):
+    """A run stopped between saving events and saving its count: the retry counts them, so the
+    chain never goes past max_events."""
+    job = _job(max_events=3)
+    key = handlers._backfill_key(job)
+    backfill.store[key] = {"batch_index": 0, "after_id": 0, "created_so_far": 0}
+    backfill.store["1"] = {"object_id": "g1", "backfill_job": key}
+    backfill.store["2"] = {"object_id": "g2", "backfill_job": key}
+    backfill.store["3"] = {"object_id": "g3"}  # sent by the pull: not this backfill's
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3), _ob(4), _ob(5)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["4"]
+    assert result["result"]["backfill_events_created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_backfilled_rows_are_tagged_with_their_job(backfill):
+    job = _job()
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), job)
+
+    assert backfill.store["1"]["backfill_job"] == handlers._backfill_key(job)
 
 
 @pytest.mark.asyncio

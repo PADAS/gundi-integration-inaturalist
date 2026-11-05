@@ -104,7 +104,7 @@ Two distinct shapes stored under `(integration_id, "pull_events")`:
 |-----------|-----------|---------------|
 | no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | after each chunk of `action_pull_events`, and at the end when nothing matched |
 | `source_id=run_lock` / `pull_waiting` | the run lock a pull or backfill holds; the note a skipped pull leaves | `action_pull_events`, `_backfill` |
-| `source_id=backfill.<window end>` | a running backfill's position | `_backfill_locked` |
+| `source_id=backfill.<window end>` | a backfill's position, then a `done` marker once it ends (rows it creates carry `backfill_job` = this key) | `_backfill_locked` |
 | `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` and `sent_hash` (SHA-256 of the payload last sent) | `save_events_state`, `save_patched_events_state` |
 
 When changing state, preserve backward-compat reads of the legacy `"updated_to"` key (`_get_load_since`).

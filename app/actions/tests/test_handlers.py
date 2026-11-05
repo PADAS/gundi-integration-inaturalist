@@ -2090,8 +2090,12 @@ async def test_a_pull_never_reads_from_further_back_than_days_to_load(mocker):
     assert abs((since - floor).total_seconds()) < 60
 
 
+_ROUND_TRIP_CREATED = (datetime.now(tz=timezone.utc) - timedelta(days=3)).replace(microsecond=0)
+
+
 def _inat_json(updated_at, taxon_id=41944, comments=0):
-    created = (datetime.now(tz=timezone.utc) - timedelta(days=3)).replace(microsecond=0)
+    """Same upload time on every call, so only the touch fields and the taxon vary."""
+    created = _ROUND_TRIP_CREATED
     return {
         "id": 777, "observed_on": created.date().isoformat(), "created_at": created.isoformat(),
         "updated_at": updated_at.isoformat(), "captive": False, "obscured": False, "quality_grade": "needs_id",

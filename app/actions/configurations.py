@@ -434,6 +434,8 @@ class BackfillContinueConfig(InternalActionConfiguration):
     lock_waits: int = 0
     # Runs in a row that ended where they started, for the stop on no progress.
     runs_without_progress: int = 0
+    # Set when this run handed over so a waiting pull could go first: the next run waits a moment.
+    yield_to_pull: bool = False
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):
