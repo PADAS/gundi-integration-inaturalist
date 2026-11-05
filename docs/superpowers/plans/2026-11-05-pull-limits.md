@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `pull_events` creates events only for sightings uploaded recently, updates an event only when what it sends has changed, sends at most a few photos per sighting, and keeps its cursor within `days_to_load` of now. Every limit is a connection setting with a default.
+**Goal:** `pull_events` creates events only for sightings uploaded recently, updates an event only when what it sends has changed, sends at most a few photos per sighting, and keeps its cursor within `days_to_load` of now. Every limit is a connection setting with a default. A manual `backfill_events` action loads older sightings, creations only, up to `max_events`.
 
 **Architecture:** All changes are in the connector's own code: `app/actions/configurations.py` (three settings), `app/actions/handlers.py` (one age check and one hash comparison in `_sort_observation`, one `max()` in `_get_load_since`, one slice in `_send_new_observations`, `sent_hash` in the two state writers, four counters) and `app/settings/integration.py` (comment only). Template code under `app/services/` is not touched. The iNaturalist query, the chunk-and-cursor loop, the patch call and the photo run are unchanged.
 
@@ -21,7 +21,7 @@
 - **Defaults:** `max_age_days=90`, `max_photos=1`, `max_new_events_per_run=settings.INAT_MAX_NEW_EVENTS_PER_PULL`. Ranges: `max_age_days` 1–3650, `max_photos` 0–50, `max_new_events_per_run` 1–1000. `days_to_load` keeps 1–7.
 - **`max_photos=0`** hands no photos and starts no photo run, even with `include_photos=True`. `include_photos=False` still wins over any `max_photos`.
 - **`event_details.updated_at` is gone** from `_transform_inat_to_gundi_event`; `created_at` stays.
-- **Result keys** (`_pull_result`): `events_extracted`, `events_updated`, `photos_attached` (unchanged, read by Gundi monitoring) plus `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out`, `cursor_lag_days`. `cursor_lag_days` is `round((now − cursor).total_seconds() / 86400, 1)` using the last cursor the run wrote; `None` when none was written.
+- **Result keys** (`_pull_result`): `events_extracted`, `events_updated`, `photos_attached` (unchanged, read by Gundi monitoring) plus `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out`, `cursor_lag_days`. `cursor_lag_days` is `round((now − cursor).total_seconds() / 86400, 1)` using the last cursor the run wrote, or the stored cursor when the run wrote none (iNaturalist down, out of time before the first chunk); `None` only when there is neither.
 - **Summary wording** (spec §4.2): "It sent N new iNaturalist observations to Gundi and updated M, and skipped K uploaded more than D days ago and U with nothing changed, and handed their P photos to a separate photo run (L left out by the photo limit)". The "skipped" clause lists only its non-zero parts and is omitted when both are zero; the "(L left out …)" clause only when L > 0.
 - **Log lines never list observation ids, hashes or photo URLs**; counts only (existing rule in this repo).
 
@@ -46,7 +46,11 @@
 | `app/actions/tests/test_configurations.py` | Defaults and ranges of the new fields |
 | `app/actions/tests/test_handlers.py` | Unit tests of the changed helpers |
 | `app/actions/tests/test_pull_events.py` | End-to-end pull: result keys, summary, cursor floor, unchanged skip |
-| `CLAUDE.md` | Architecture step 3 and the state table: the hash trigger, `sent_hash`, the new settings |
+| `CLAUDE.md` | Architecture step 3 and the state table: the hash trigger, `sent_hash`, the new settings; the backfill action |
+| `app/datasource/inaturalist.py` | `iter_upload_pages`: one upload window, id ascending, resumable by taxa batch and id |
+| `app/actions/configurations.py` | `BackfillEventsConfig` (generic, executable), `BackfillContinueConfig` (internal) |
+| `app/actions/handlers.py` | `action_backfill_events`, `action_backfill_events_continue`, shared `_backfill` |
+| `app/actions/tests/test_backfill.py` | Backfill behaviour |
 
 ---
 
@@ -422,7 +426,7 @@ git commit -m "Pull limits: sent_hash in state; first max_photos photos only"
 
 - [ ] **Step 1: Write the failing tests**
 
-In `test_execute_pull_observations_action` (`test_pull_events.py:13`): assert `events_skipped_too_old == 0`, `events_skipped_unchanged == 0`, `photos_left_out == 3` (the fixture's two observations carry 5 photos; with `max_photos=1` two are handed, three left out) and `cursor_lag_days` is a float `< 1`; change the summary assertion to:
+In `test_execute_pull_observations_action` (`test_pull_events.py:13`): assert `events_skipped_too_old == 0`, `events_skipped_unchanged == 0`, `photos_left_out == 3` (the fixture's two observations carry 5 photos; with `max_photos=1` two are handed, three left out) and `cursor_lag_days` is a float (the recorded fixture observations are from 2024, so its value is large); change the summary assertion to:
 
 ```python
     assert ("It sent 2 new iNaturalist observations to Gundi and updated 0, "
@@ -483,6 +487,55 @@ git commit -m "Pull limits: skipped and left-out counters, cursor lag in the run
 
 ---
 
+### Task 6: Manual backfill (spec §5)
+
+**Files:**
+- Modify: `app/datasource/inaturalist.py` (after `iter_observation_pages`)
+- Modify: `app/actions/configurations.py` (after `AddPhotosConfig`)
+- Modify: `app/actions/handlers.py` (after `action_add_photos`); the pull's "lock taken" message names a backfill too
+- Test: `app/datasource/tests/test_inaturalist.py` (append), `app/actions/tests/test_backfill.py` (new), `app/actions/tests/test_configurations.py` (append)
+
+**Interfaces:**
+- ```python
+  def iter_upload_pages(created_from: datetime, created_to: datetime, *, batch_index: int = 0, after_id: int = 0,
+                        bounding_box=None, taxa=None, projects=None, quality_grade=None, annotations=None
+                        ) -> Iterator[Tuple[int, List[Observation]]]
+  ```
+  Same base query as `_observation_query` minus `updated_since`/`order`, plus `created_d1`, `created_d2` (ISO), `order_by="id"`, `order="asc"`, `id_above`, `per_page=INAT_PAGE_SIZE`, `fields`. Yields `(batch_index, batch_count, page)` until a page comes back short or empty, batch by batch, starting at `batch_index` with `after_id` and later batches from 0.
+- ```python
+  class BackfillEventsConfig(GenericActionConfiguration, ExecutableActionMixin):
+      days_back: int = 30      # ge=1, le=3650
+      max_events: int = 1000   # ge=1, le=100_000
+  class BackfillContinueConfig(InternalActionConfiguration):
+      created_from: datetime; created_to: datetime; max_events: int
+      created_so_far: int = 0; batch_index: int = 0; after_id: int = 0
+      lock_waits: int = 0; runs_without_progress: int = 0
+  ```
+- `action_backfill_events` (title "Backfill iNaturalist Observations") builds a `BackfillContinueConfig` with `created_to = now`, `created_from = now − days_back` and calls `_backfill`. `action_backfill_events_continue` (title "Continue iNaturalist Backfill") calls `_backfill` with its config. Both `@_clock_run @activity_logger()`.
+- `_backfill(integration, job) -> dict`:
+  1. Parse the connection's `pull_events` row (`find_config_for_action(integration.configurations, "pull_events")`); none → error log "The backfill needs the connection's pull settings…", return.
+  2. Parse the pull row; a `ValidationError` → error log naming the invalid fields, return. Take the run lock (`STATE_RUN_LOCK_SOURCE_ID`, same TTL); taken → retry every `BACKFILL_LOCK_WAIT_SECONDS = 10` until the time budget; still taken → hand over with `lock_waits + 1`, or after `BACKFILL_MAX_LOCK_WAITS = 3` an error log, return. A pull that finds the lock taken sets `pull_waiting` (TTL = lock TTL) and clears it when it runs.
+  3. Take the saved position under `backfill.<window end>` when it is further along. Walk `iter_upload_pages` in a thread (as the pull does); before each page check the time and `pull_waiting`, before each chunk the time. Annotation-filter, keep sightings not in state, cut at `max_events − created_so_far`, send in chunks of `GUNDI_SUBMISSION_CHUNK_SIZE` with `send_events_to_gundi`, save the accepted ones with `save_events_state` (no pending photos). After each chunk set `after_id` to the last sighting examined (or the last one Gundi accepted, then hand over), `uploaded_up_to` to its `created_at`, and save the position. Unknown projects go through `_drop_unknown_projects(..., activity="backfill", action_id="backfill_events")`.
+  4. Stop at `max_events` (summary "stopped at its limit") or the end of the window (summary "finished"), deleting the saved position; hand over at the time budget, a waiting pull, a read that outlasts the budget or a partial Gundi answer (`trigger_action(..., "backfill_events_continue", job)`, info log), counting `runs_without_progress` and stopping with an error at `BACKFILL_MAX_RUNS_WITHOUT_PROGRESS = 3`; stop with an error when iNaturalist is down. Release the lock in `finally`.
+  5. Return the result of spec §5.3.
+
+- [ ] **Step 1: Tests** — `test_backfill.py`: query arguments (window, id order, filters); skip in-state; no `update_event_in_gundi`, no `trigger_action("add_photos")`, no `photos.` rows; state has `sent_hash`; stop at `max_events` with the "limit" summary and `backfill_finished False`; end of window with the "finished" summary; time budget hands over with `batch_index`/`after_id`/`created_so_far` and the continuation resumes from them; lock taken then free → runs; lock never free → error, nothing sent; iNat down → error; no pull row → error. Registration: `backfill_events` registered with `is_periodic_action False` and `is_executable`; `backfill_events_continue` not registered.
+- [ ] **Step 2: Implement** per the interfaces above.
+- [ ] **Step 3: Run the suite**
+
+```bash
+pytest -q
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add app/datasource/inaturalist.py app/actions/configurations.py app/actions/handlers.py app/actions/tests app/datasource/tests CLAUDE.md
+git commit -m "Pull limits: manual backfill, creations only, up to max_events"
+```
+
+---
+
 ## Verification before merge (manual)
 
 1. `pytest -q` green.
@@ -490,3 +543,4 @@ git commit -m "Pull limits: skipped and left-out counters, cursor lag in the run
 3. Run `pull_events` on a dev connection whose state has an old `last_run`: the first summary shows the cursor floor (reads from `days_to_load` days ago), `events_skipped_too_old` > 0 for old touched sightings, `cursor_lag_days` under 1 after the run.
 4. In the destination EarthRanger, open one new event: one photo, no `Updated At` in the details.
 5. Add a comment to that sighting on iNaturalist, run again: `events_skipped_unchanged` counts it, the EarthRanger history has no new line. Add an identification that changes the taxon, run again: one history line naming the taxon fields and the title.
+6. Run "Backfill iNaturalist Observations" with `days_back=365`, `max_events=20`: 20 events created, no photos, the summary says it stopped at its limit and up to which upload date; run it again: 20 more, the first 20 are skipped. Confirm the portal shows a Run button for the action and that every action has its friendly name.

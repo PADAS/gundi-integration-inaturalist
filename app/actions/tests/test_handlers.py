@@ -658,7 +658,7 @@ async def test_action_pull_events_skip_says_the_previous_pull_is_still_running(m
 
     await action_pull_events(_lock_test_integration(), PullEventsConfig(days_to_load=3, taxa="1", bounding_box="[1, 1, 0, 0]"))
 
-    assert mock_log.call_args.kwargs["title"] == "The pull didn't run because the previous pull for this connection is still running."
+    assert mock_log.call_args.kwargs["title"] == "The pull didn't run because the previous pull or a backfill for this connection is still running."
     assert mock_log.call_args.kwargs["level"] == LogLevel.INFO
 
 
@@ -688,7 +688,7 @@ async def test_a_stopped_pull_says_where_it_was(mocker):
     observation = MagicMock()
     observation.id = 1
     observation.photos = []
-    observation.created_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    observation.created_at = datetime.now(tz=timezone.utc) - timedelta(days=1)
     observation.updated_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
     mock_state = AsyncMock()
     mock_state.set_if_absent.return_value = True
@@ -799,7 +799,7 @@ async def test_a_pull_stopped_after_saving_its_cursor_is_not_reported_as_stopped
     observation = MagicMock()
     observation.id = 1
     observation.photos = []
-    observation.created_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
+    observation.created_at = datetime.now(tz=timezone.utc) - timedelta(days=1)
     observation.updated_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
     mock_state = AsyncMock()
     mock_state.set_if_absent.return_value = True
@@ -831,7 +831,7 @@ async def test_a_pull_stopped_after_saving_its_cursor_is_not_reported_as_stopped
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert not any(t.startswith("The pull was stopped") for t in titles)
+    assert not any(t.startswith("The pull was cut off") for t in titles)
 
 
 @pytest.mark.parametrize("seconds, text", [
@@ -1144,7 +1144,7 @@ async def test_a_pull_stops_reading_once_it_has_the_limit_of_new_events(mocker):
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:03:00+0000"
     finished = [t for t in _titles(mock_log) if t.startswith("Pull finished")][-1]
     assert finished.endswith("It stopped after 3 new observations, the most one pull sends. "
-                             "Observations changed on iNaturalist up to 2026-10-29 08:03 UTC are in Gundi.")
+                             "Observations changed on iNaturalist up to 2026-10-29 08:03 UTC were checked.")
 
 
 @pytest.mark.asyncio
@@ -1214,7 +1214,7 @@ async def test_a_pull_stops_on_the_time_budget_with_its_progress_saved(mocker):
     assert result["result"]["events_extracted"] == 2
     assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
     paused = [t for t in _titles(mock_log, LogLevel.INFO) if t.startswith("Pull stopped after")]
-    assert paused and ("Observations changed on iNaturalist up to 2026-10-29 08:02 UTC are in Gundi: "
+    assert paused and ("Observations changed on iNaturalist up to 2026-10-29 08:02 UTC were checked: "
                        "it sent 2 new iNaturalist observations to Gundi") in paused[0]
     assert not _titles(mock_log, LogLevel.ERROR)
 
@@ -1955,8 +1955,10 @@ async def test_a_pull_hands_the_first_max_photos_to_the_photo_run(
     finished = [t for t in _titles(mock_log) if t.startswith("Pull finished")][-1]
     if handed and left_out:
         assert f"({left_out} left out by the photo limit)" in finished
+    elif left_out:
+        assert f"and left out their {left_out} photos because of the photo limit" in finished
     else:
-        assert "left out by the photo limit" not in finished
+        assert "left out" not in finished
 
 
 @pytest.mark.asyncio
@@ -2044,3 +2046,126 @@ def test_progress_counts_mention_only_what_happened():
         "(5 left out by the photo limit)")
     assert {"events_skipped_too_old": 3, "events_skipped_unchanged": 4, "photos_left_out": 5}.items() \
         <= progress.data().items()
+
+
+def test_progress_counts_mention_photos_left_out_when_none_were_handed_off():
+    progress = _PullProgress(max_age_days=90)
+    progress.events_sent = 1
+    progress.photos_left_out = 1
+    assert progress.counts().endswith("and left out their 1 photo because of the photo limit")
+
+
+@pytest.mark.asyncio
+async def test_skips_are_counted_only_for_chunks_whose_cursor_was_saved(mocker):
+    """A chunk cut off by the time budget is read again next run, so its skips
+    are counted then, not twice."""
+    now = [1000.0]
+    mocker.patch("app.actions.handlers.time.monotonic", side_effect=lambda: now[0])
+    mocker.patch("app.actions.handlers.GUNDI_SUBMISSION_CHUNK_SIZE", 2)
+    page = [_observation(1), _observation(2), _observation(3), _observation(4)]
+    _, _, store, _ = _pull_setup(mocker, 0, pages=[page], saved_state={**_synced(1, 3), **_synced(2, 4, changed=True)})
+
+    async def slow_patch(chunk, *args, **kwargs):
+        now[0] += 250  # the first update uses up the 240 s budget
+        return [{}] * len(chunk)
+    mocker.patch("app.actions.handlers.patch_events", AsyncMock(side_effect=slow_patch))
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    # Chunk [1, 2]: 1 unchanged, 2 updated, cursor saved. Chunk [3, 4] never finished.
+    assert result["result"]["events_skipped_unchanged"] == 1
+    assert store["no-source"][STATE_LAST_RUN_KEY] == "2026-10-29 08:02:00+0000"
+
+
+@pytest.mark.asyncio
+async def test_a_pull_never_reads_from_further_back_than_days_to_load(mocker):
+    _, _, _, _ = _pull_setup(mocker, 1, saved_state={"no-source": {STATE_LAST_RUN_KEY: "2026-06-22 18:52:00+0000"}})
+    read = mocker.patch("app.actions.handlers.iter_observation_pages", side_effect=lambda *a, **k: iter([]))
+
+    await action_pull_events(_lock_test_integration(),
+                             PullEventsConfig(days_to_load=7, bounding_box="[1, 1, 0, 0]"))
+
+    since = read.call_args.args[0]
+    floor = datetime.now(tz=timezone.utc) - timedelta(days=7)
+    assert abs((since - floor).total_seconds()) < 60
+
+
+def _inat_json(updated_at, taxon_id=41944, comments=0):
+    created = (datetime.now(tz=timezone.utc) - timedelta(days=3)).replace(microsecond=0)
+    return {
+        "id": 777, "observed_on": created.date().isoformat(), "created_at": created.isoformat(),
+        "updated_at": updated_at.isoformat(), "captive": False, "obscured": False, "quality_grade": "needs_id",
+        "species_guess": "Puma", "uri": "https://www.inaturalist.org/observations/777", "photos": [],
+        "user": {"id": 5, "login": "obs", "name": "Observer"}, "location": [19.4, -99.1],
+        "place_ids": [1, 6793, 9853], "comments_count": comments, "annotations": [],
+        "taxon": {"id": taxon_id, "name": "Puma concolor", "rank": "species", "preferred_common_name": "Puma",
+                  "ancestor_ids": [48460, 1, 2, 355675, 40151, 848317, 41573, 41944]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_created_then_touched_without_changes_is_not_updated(mocker):
+    """Round trip with real observations: the hash stored at creation matches
+    the payload rebuilt next run from the same data with a newer updated_at."""
+    from pyinaturalist import Observation
+    from app.actions.handlers import save_events_state
+
+    store = {}
+    mock_state = AsyncMock()
+
+    async def set_state(integration_id, action_id, state, source_id="no-source"):
+        store[source_id] = state
+    mock_state.set_state.side_effect = set_state
+    mock_state.get_state.side_effect = lambda integration_id, action_id, source_id="no-source": store.get(source_id)
+    mocker.patch("app.actions.handlers.state_manager", mock_state)
+    config = _config(event_prefix="iNat: ")
+    first = Observation.from_json(_inat_json(datetime.now(tz=timezone.utc) - timedelta(hours=2)))
+    event = _transform_inat_to_gundi_event(first, config)
+    await save_events_state([{"object_id": "g777"}], [event], _lock_test_integration())
+
+    now = datetime.now(tz=timezone.utc)
+    touched = Observation.from_json(_inat_json(now, comments=1))
+    targets = {}
+    outcome = await _sort_observation(_lock_test_integration(), config, touched, set(), targets, set(), now=now)
+    assert outcome == "unchanged" and not targets
+
+    reidentified = Observation.from_json(_inat_json(now, taxon_id=42007))
+    outcome = await _sort_observation(_lock_test_integration(), config, reidentified, set(), targets, set(), now=now)
+    assert outcome == "update" and targets == {777: "g777"}
+
+
+@pytest.mark.asyncio
+async def test_sort_observation_without_created_at_is_not_treated_as_old(mocker):
+    _sort_state(mocker)
+    ob, payload = _sortable(0, NOW)
+    ob.created_at = None
+
+    outcome, new_ids, _, _ = await _sort(mocker, ob, payload, NOW)
+
+    assert outcome == "new" and new_ids == {1}
+
+
+def test_transform_accepts_an_any_prefix():
+    """"any" in the portal arrives as None; the title is then the species alone."""
+    config = PullEventsConfig(bounding_box="[1, 1, 0, 0]", event_prefix="any")
+    assert config.event_prefix is None
+    event = _transform_inat_to_gundi_event(_make_observation(), config)
+    assert not event["title"].startswith("None")
+
+
+@pytest.mark.asyncio
+async def test_cursor_lag_uses_the_stored_cursor_when_a_run_saves_none(mocker):
+    """iNaturalist down before the first chunk: the lag still says how far behind the connection is."""
+    from app.datasource.inaturalist import INatUnavailableError
+
+    stored = datetime.now(tz=timezone.utc) - timedelta(days=10)
+    _pull_setup(mocker, 0, saved_state={"no-source": {STATE_LAST_RUN_KEY: stored.strftime(STATE_DATETIME_FMT)}})
+
+    def down(*args, **kwargs):
+        raise INatUnavailableError("iNaturalist didn't answer in time")
+        yield  # pragma: no cover
+    mocker.patch("app.actions.handlers.iter_observation_pages", side_effect=down)
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["cursor_lag_days"] == pytest.approx(10.0, abs=0.1)

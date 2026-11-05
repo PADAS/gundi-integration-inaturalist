@@ -252,6 +252,10 @@ def test_actions_register_with_inaturalist_titles():
     assert titles["list_projects"] == "List Nearby iNaturalist Projects"
     assert titles["list_annotation_terms"] == "List iNaturalist Annotation Terms"
     assert titles["list_annotation_values"] == "List iNaturalist Annotation Values"
+    assert titles["list_taxa"] == "Search iNaturalist Taxa"
+    assert titles["backfill_events"] == "Backfill iNaturalist Observations"
+    # Every action shown in the portal has a friendly name, not one derived from its id.
+    assert all(titles.values()), [a for a, t in titles.items() if not t]
 
 
 SECRET_API_KEY = "inat-secret-api-key-do-not-log"

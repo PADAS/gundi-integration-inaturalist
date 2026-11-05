@@ -35,6 +35,7 @@ Problems:
 - Fewer messages per sighting to Gundi and EarthRanger: one event and one photo by default.
 - Every limit is a setting on the Gundi connection with a default, so support can tune one site in the portal.
 - Each rule is one check that a reader can verify from a sighting's page and its upload date.
+- A user can load older sightings on demand, within a limit they choose, without changing the regular pull (§5).
 
 ### Non-goals
 
@@ -95,7 +96,7 @@ Form order: the three new fields go after `include_photos`, before `run_on_sched
             "photos_left_out": 94, "cursor_lag_days": 0.3}}
 ```
 
-`cursor_lag_days` is `(now − saved cursor)` in days, one decimal, taken after the last cursor save.
+`cursor_lag_days` is `(now − cursor)` in days, one decimal: the last cursor this run saved, or the stored one when it saved none (iNaturalist down, out of time before the first chunk).
 
 Summary title (existing sentence, extended):
 
@@ -103,7 +104,51 @@ Summary title (existing sentence, extended):
 
 The "skipped …" clause lists only the non-zero parts; the "(… left out …)" clause appears only when something was left out.
 
-## 5. Expected effect
+## 5. Backfill (`backfill_events`)
+
+The regular pull only looks `days_to_load` back and only creates sightings uploaded within `max_age_days`. Loading older sightings is a separate action that a user starts by hand.
+
+### 5.1 Decisions
+
+| # | Decision | Why |
+|---|---|---|
+| B1 | **Manual only.** `backfill_events` is a generic, executable action (`GenericActionConfiguration` + `ExecutableActionMixin`). Only pull actions are scheduled, so it never runs on its own. | A backfill is a one-off decision by a person. |
+| B2 | **Creations only, from the sighting's current data.** Each sighting in the window that is not in state is created with what iNaturalist shows now. Sightings already in state are skipped. No updates, no photos. | Simplest useful backfill; photos are most of the load (§1). |
+| B3 | **Window by upload date, oldest first.** `days_back` (default 30, 1–3650) sets the window: sightings uploaded from `now − days_back` to the moment the backfill started. They are read in upload order (iNaturalist id ascending, `created_d1`/`created_d2`). | The same reference date as everything else (D1). Upload order never changes, so the walk is exact and resumable by id. |
+| B4 | **`max_events` (default 1000, 1–100,000) stops the backfill.** When that many events have been created, the backfill ends, even if the window is not finished. The final log says how far it got. | The user decides the cost up front. A 3-year window that holds 800 sightings finishes; one that holds 50,000 stops at 1,000 and says up to which upload date it reached. |
+| B5 | **Same filters as the pull.** Projects, bounding box, taxa, quality grade, annotations, event type and prefix come from the connection's `pull_events` settings. `max_age_days`, `max_photos` and `max_new_events_per_run` do not apply. | One place to describe what a connection is about. The backfill's own two settings are its limits. |
+| B6 | **Same run lock as the pull, and pulls go first.** A backfill run holds the connection's run lock, so a pull and a backfill never create the same sighting twice. A pull that finds the lock taken skips, as today, and leaves a short-lived `pull_waiting` note; a backfill checks the note before each page and, if set, hands over to a new run and releases the lock, so the next scheduled pull runs. A backfill run that finds the lock taken waits for it (every 10 s) within its time budget, then hands over to a new run; after 3 runs in a row without the lock it stops with an error. | Reuses the existing guarantee, and a long backfill never holds back new sightings for more than one pull interval. |
+| B7 | **Asynchronous chain of runs.** Each run stops before the pull's time budget (well under Cloud Run's request timeout), checking the time before each page and each chunk, and starts `backfill_events_continue` (internal, through the actions topic) with where it is: window, taxa batch, last id, events created so far. The same position is saved after each chunk under `backfill.<window end>`, and a run takes whichever is further along, so a redelivered message never re-counts or exceeds `max_events`. The key is deleted when the backfill finishes or reaches its limit. After 3 runs in a row that end where they started (nothing read in time), it stops with an error. | Long windows need many runs, and GCP times out long requests. |
+| B8 | **Running it again is safe.** Sightings already in state are skipped, so re-running the same window only re-reads. | The answer to "it stopped, now what": run it again, with a later `days_back` or a higher `max_events`. |
+| B9 | **State as if the pull created it.** A backfilled sighting gets the same state row (`object_id`, `inat_updated_at`, `sent_hash`) and no pending photos. | The regular pull then treats it like any other: an update only when its payload changes and only within `max_age_days`; never photos. |
+
+### 5.2 Settings (`BackfillEventsConfig`)
+
+| Setting | Default | Range |
+|---|---|---|
+| `days_back` | 30 | 1–3650 |
+| `max_events` | 1000 | 1–100,000 |
+
+### 5.3 Logs and result
+
+Each run returns `{"result": {"events_extracted": <created this run>, "events_updated": 0, "photos_attached": 0, "backfill_events_created": <total so far>, "backfill_finished": <bool>, "backfill_uploaded_up_to": <ISO time or null>}}`.
+
+The last run logs one summary:
+
+> Backfill finished: created 640 events for sightings uploaded between 2023-11-05 and 2026-11-05.
+
+> Backfill stopped at its limit of 1,000 events: sightings uploaded up to 2024-03-18 14:02 UTC were sent. Run it again to continue; sightings already sent are skipped.
+
+With more than one taxa group (more than 100 saved taxa, each group read from the start of the window), the position adds "(taxa group 1 of 2)".
+
+A run that hands over to the next one logs at info level how many it created so far and up to which upload time. A run that can't get the lock in time logs at info level that it tries again in a new run. A backfill that stops early (the lock taken for 3 runs, no progress for 3 runs, iNaturalist down, no or invalid pull settings, none of the saved projects on iNaturalist) logs an error saying why and, where it applies, that running it again is safe. Log data holds counts and dates only.
+
+### 5.4 How a user runs it
+
+1. On the connection, open the "Backfill iNaturalist Observations" action, set `days_back` and `max_events`, save.
+2. Run it. Read the activity log for the summary.
+
+## 6. Expected effect
 
 | | Today | After |
 |---|---|---|
@@ -112,7 +157,7 @@ The "skipped …" clause lists only the non-zero parts; the "(… left out …)"
 | Photos per event | 1.6 (Huatulco 2.7) | 1 |
 | Huatulco | cursor in July | current within a day; 30 uploads a day |
 
-## 6. Changes from today
+## 7. Changes from today
 
 | Today | After |
 |---|---|
@@ -124,8 +169,9 @@ The "skipped …" clause lists only the non-zero parts; the "(… left out …)"
 | Cap from the env var only | Per connection, env var as default |
 | State row: `object_id`, `inat_updated_at` | plus `sent_hash` |
 | Summary: "sent N … and updated M" | plus skipped counts and photos left out |
+| No way to load older sightings | `backfill_events`, manual, creations only, bounded by `max_events` |
 
-## 7. Testing
+## 8. Testing
 
 - **Unit** (`app/actions/tests/test_handlers.py`):
   - `_get_load_since`: stored cursor older than the floor → floor; newer → cursor; no cursor → floor.
@@ -136,16 +182,17 @@ The "skipped …" clause lists only the non-zero parts; the "(… left out …)"
   - `save_patched_events_state`: stores the new `sent_hash` and `inat_updated_at`, keeps `object_id`.
   - `_PullProgress.counts()` and `data()` with the new counters.
 - **Action** (`app/actions/tests/test_pull_events.py`): the end-to-end pull asserts the new result keys and summary wording; the chunked-updates test keeps its purpose (a run that stops partway through updates keeps the finished chunks and the cursor) with observations whose hash differs.
-- **Config** (`test_configurations.py`): defaults and ranges of the three new fields; `max_new_events_per_run` defaults to the env value.
+- **Config** (`test_configurations.py`): defaults and ranges of the three new fields; `max_new_events_per_run` defaults to the env value; backfill defaults and ranges.
+- **Backfill** (`test_backfill.py`): the query is by upload window, id ascending, with the pull's filters; sightings in state are skipped; no updates, no photos, state written with `sent_hash`; stops at `max_events` and says up to which upload time; finishes at the end of the window; hands over to `backfill_events_continue` at the time budget with its progress, and the continuation resumes from it; waits for and respects the run lock; iNaturalist down stops with an error; missing pull settings stop with an error; registered as a non-periodic action.
 
-## 8. Rollout
+## 9. Rollout
 
 1. Deploy; existing connections get the defaults (90 days, 1 photo, 150 per run).
 2. On Iberomab and Huatulco, read the first summaries: `cursor_lag_days` should drop under 1 within a few runs; `events_skipped_too_old` large at first, then small; `events_updated` at first includes the one-time hash seeding of rows synced before this change.
-3. Watch the ER dispatchers' dead-letter counts for a day.
+3. Watch the ER dispatchers' dead-letter counts for a day. Photo lists recorded before the deploy, and photo runs already queued, still send all their photos, so the photo count falls once that backlog has cleared.
 4. Raise with the Iberomab site whether research-only or a smaller area is wanted; `max_new_events_per_run` is the throttle meanwhile.
 
-## 9. Risks and open items
+## 10. Risks and open items
 
 - **Sightings uploaded during a site's gap are not backfilled** (D4). For Iberomab that is June–October; they are all older than the default `max_age_days` anyway. A site that wants them can set `max_age_days` higher and `days_to_load` to 7 and wait for touches.
 - **One-time patches for old rows** (D10): every sighting synced before this change is patched once on its next touch, within `max_age_days`. On a site that is current this is a trickle; on Iberomab the age floor removes most of it.

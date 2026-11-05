@@ -1,10 +1,11 @@
+from datetime import datetime
 from typing import Optional, List, Dict, Literal
 import json
 import pydantic
 from pyinaturalist.constants import QUALITY_GRADES
 from .core import (
     PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration,
-    InternalActionConfiguration,
+    InternalActionConfiguration, GenericActionConfiguration,
 )
 from app import settings
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
@@ -158,9 +159,6 @@ class PullEventsConfig(PullActionConfiguration):
         title="Max age (days)",
         ge=1,
         le=3650,
-        ui_options=UIOptions(
-            widget="range",
-        ),
         description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 90")
 
     max_new_events_per_run: int = FieldWithUIOptions(
@@ -168,7 +166,7 @@ class PullEventsConfig(PullActionConfiguration):
         title="New events per run",
         ge=1,
         le=1000,
-        description="Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: 150")
+        description=f"Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: {settings.INAT_MAX_NEW_EVENTS_PER_PULL}")
 
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
@@ -399,6 +397,42 @@ class AddPhotosConfig(InternalActionConfiguration):
     observation's saved state."""
     observation_ids: List[str] = pydantic.Field(default_factory=list)
     # Photo runs in a row that couldn't add any photo, for the warning/error choice.
+    runs_without_progress: int = 0
+
+
+class BackfillEventsConfig(GenericActionConfiguration, ExecutableActionMixin):
+    """Run by hand only (generic actions are never scheduled): create events
+    for older sightings, with the connection's pull settings. No updates, no
+    photos. Spec: docs/superpowers/specs/2026-11-05-pull-limits-design.md §5."""
+    days_back: int = FieldWithUIOptions(
+        30,
+        title="Days to backfill",
+        ge=1,
+        le=3650,
+        description="Sightings uploaded to iNaturalist in this many days before the backfill starts are loaded, "
+                    "oldest first. Default: 30")
+    max_events: int = FieldWithUIOptions(
+        1000,
+        title="Most events to create",
+        ge=1,
+        le=100_000,
+        description="The backfill stops once it has created this many events, even if it hasn't reached the end "
+                    "of the window. Running it again continues; sightings already sent are skipped. Default: 1000")
+
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(order=["days_back", "max_events"])
+
+
+class BackfillContinueConfig(InternalActionConfiguration):
+    """Started by a backfill run that reached its time budget: where it is."""
+    created_from: datetime
+    created_to: datetime
+    max_events: int
+    created_so_far: int = 0
+    batch_index: int = 0
+    after_id: int = 0
+    # Runs in a row that handed over because another run held the lock.
+    lock_waits: int = 0
+    # Runs in a row that ended where they started, for the stop on no progress.
     runs_without_progress: int = 0
 
 

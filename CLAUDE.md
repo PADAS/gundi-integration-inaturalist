@@ -42,15 +42,20 @@ PubSub message → `POST /` (`app/main.py`) → `app/services/action_runner.py::
 2. Calls `app/datasource/inaturalist.py::get_observations` (synchronous, uses `pyinaturalist.get_observations_v2`).
 3. Sorts each observation (`_sort_observation`), reading per-observation state keyed by `source_id=inat_id`: **too old** (uploaded more than `max_age_days` ago by `created_at`; skipped, nothing stored), **new** (create in Gundi), **update** (in state and the payload hash differs from the stored `sent_hash`, or none is stored) or **unchanged** (skipped). `updated_at` never decides anything and is not in the payload.
 4. Transforms via `_transform_inat_to_gundi_event` and submits in chunks of `GUNDI_SUBMISSION_CHUNK_SIZE = 100` via `send_events_to_gundi`.
-5. If `include_photos`, downloads each photo URL with `httpx.AsyncClient(verify=False)` and uploads as Gundi attachments.
+5. If `include_photos`, records the first `max_photos` photos of each new event as pending and starts the separate `add_photos` action, which downloads each photo URL with `httpx.AsyncClient(verify=False)` and uploads it as a Gundi attachment.
 6. Patches changed observations via `update_event_in_gundi`.
-7. Writes the new cursor (max `updated_at` across all observations seen) and per-observation `STATE_INAT_UPDATED_AT_KEY` and `STATE_SENT_HASH_KEY` so the next run doesn't re-patch observations whose payload didn't change.
+7. After each chunk, writes the cursor (the chunk's last `updated_at`) and per-observation `STATE_INAT_UPDATED_AT_KEY` and `STATE_SENT_HASH_KEY` so the next run doesn't re-patch observations whose payload didn't change.
 
 If the iNat query returns nothing, the cursor is still advanced to `now()` so the next run does not re-query the same heavy window.
+
+### Manual backfill (`backfill_events`)
+
+A generic, executable action (never scheduled) that a user runs from the portal: it creates events for sightings uploaded in the last `days_back` days (default 30), oldest first, using the connection's `pull_events` settings, until `max_events` (default 1000). Creations only: sightings already in state are skipped, nothing is updated, no photos are sent, and state is written like the pull's (with `sent_hash`). It reads with `iter_upload_pages` (upload window, id ascending, resumable by taxa batch and id), holds the same run lock as the pull (a pull that finds it taken leaves a `pull_waiting` note and the backfill hands over), and runs as an asynchronous chain: each run stops before the time budget and starts the internal `backfill_events_continue` action with its position, also saved under `backfill.<window end>`. Running it again is safe. Design: spec §5.
 
 ### iNaturalist client (`app/datasource/inaturalist.py`)
 
 - Pagination: counts results with `per_page=0`, then walks pages of `INAT_PAGE_SIZE = 200`, ordered by `updated_at asc`. The iNat API rejects pagination past 10,000 results (`page * per_page > 10,000` returns a 500), so fetching is windowed: at most `MAX_PAGES_PER_WINDOW = 50` pages per query, then the query is re-issued with `updated_since` advanced to the last fetched observation's `updated_at` (results are id-deduped across windows).
+- `iter_upload_pages` (backfill only): one upload window (`created_d1`/`created_d2`), `order_by=id asc`, paged with `id_above`, so it has no 10,000-result limit and resumes exactly from a taxa batch and an id.
 - **Taxa batching**: `taxa` is a comma-separated string. The iNat API limits how many taxon IDs fit in a single request, so IDs are split into batches of `TAXA_BATCH_SIZE = 100` and each batch is queried independently; results are merged in a `dict[int, Observation]` (id-deduped). If `taxa` is empty/whitespace, a single batch of `None` is used (no taxon filter).
 - Annotation filtering happens **client-side** after fetch in `_match_annotations_to_config` — `annotations` is `{term: [allowed_values...]}`; all terms in the dict must be present on the observation (AND across terms), and within a term all listed values must be present (AND across values).
 
@@ -97,7 +102,9 @@ Two distinct shapes stored under `(integration_id, "pull_events")`:
 
 | Key shape | What it is | Where written |
 |-----------|-----------|---------------|
-| no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | end of `action_pull_events` |
+| no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | after each chunk of `action_pull_events`, and at the end when nothing matched |
+| `source_id=run_lock` / `pull_waiting` | the run lock a pull or backfill holds; the note a skipped pull leaves | `action_pull_events`, `_backfill` |
+| `source_id=backfill.<window end>` | a running backfill's position | `_backfill_locked` |
 | `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` and `sent_hash` (SHA-256 of the payload last sent) | `save_events_state`, `save_patched_events_state` |
 
 When changing state, preserve backward-compat reads of the legacy `"updated_to"` key (`_get_load_since`).

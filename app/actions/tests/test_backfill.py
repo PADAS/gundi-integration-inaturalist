@@ -1,0 +1,515 @@
+"""Manual backfill: creations only, by upload window, up to max_events (spec §5)."""
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from gundi_core.schemas.v2 import LogLevel
+
+from app.actions import handlers
+from app.actions.configurations import BackfillContinueConfig, BackfillEventsConfig
+from app.actions.handlers import STATE_SENT_HASH_KEY, _payload_hash
+from app.datasource.inaturalist import INatUnavailableError
+
+START = datetime(2024, 1, 1, tzinfo=timezone.utc)
+END = datetime(2026, 11, 5, tzinfo=timezone.utc)
+PULL_SETTINGS = {"bounding_box": "[1, 1, 0, 0]", "event_prefix": "iNat: ", "quality_grade": ["research"],
+                 "taxa": ["41944"], "days_to_load": 3}
+
+
+def _integration(pull_settings=PULL_SETTINGS):
+    integration = MagicMock()
+    integration.id = "f03ec73e-f3fe-41b6-8597-3eb89dde5ae1"
+    rows = []
+    if pull_settings is not None:
+        row = MagicMock()
+        row.action.value = "pull_events"
+        row.data = dict(pull_settings)
+        rows.append(row)
+    integration.configurations = rows
+    return integration
+
+
+def _ob(i):
+    ob = MagicMock()
+    ob.id = i
+    ob.annotations = []
+    ob.photos = [MagicMock()]
+    ob.created_at = START + timedelta(days=i)
+    ob.updated_at = END
+    return ob
+
+
+def _job(**kwargs):
+    return BackfillContinueConfig(created_from=START, created_to=END, max_events=kwargs.pop("max_events", 1000),
+                                  **kwargs)
+
+
+@pytest.fixture
+def backfill(mocker):
+    """State in a dict, pages from `pages` [(batch_index, batch_count, [obs])], sends that
+    always succeed. Returns a namespace with everything to assert on."""
+    ns = MagicMock()
+    ns.store = {}
+    ns.pages = []
+    mock_state = AsyncMock()
+    ns.lock_free = [True]
+
+    async def set_if_absent(*args, **kwargs):
+        return ns.lock_free.pop(0) if len(ns.lock_free) > 1 else ns.lock_free[0]
+    mock_state.set_if_absent.side_effect = set_if_absent
+    mock_state.get_state.side_effect = lambda integration_id, action_id, source_id="no-source": ns.store.get(source_id)
+
+    async def set_state(integration_id, action_id, state, source_id="no-source"):
+        ns.store[source_id] = state
+    mock_state.set_state.side_effect = set_state
+    mocker.patch.object(handlers, "state_manager", mock_state)
+    ns.state = mock_state
+
+    def read(*args, **kwargs):
+        ns.read_args, ns.read_kwargs = args, kwargs
+        yield from ns.pages
+    ns.read = mocker.patch.object(handlers, "iter_upload_pages", side_effect=read)
+    mocker.patch.object(handlers, "_transform_inat_to_gundi_event",
+                        side_effect=lambda ob, config: {"event_details": {"inat_id": str(ob.id)}})
+    ns.send = mocker.patch.object(
+        handlers, "send_events_to_gundi",
+        side_effect=lambda events, integration_id: [{"object_id": f"g{e['event_details']['inat_id']}"} for e in events])
+    ns.update = mocker.patch.object(handlers, "update_event_in_gundi", AsyncMock())
+    ns.trigger = mocker.patch.object(handlers, "trigger_action", AsyncMock())
+    ns.log = mocker.patch.object(handlers, "log_action_activity", AsyncMock())
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+    mocker.patch.object(handlers, "BACKFILL_LOCK_WAIT_SECONDS", 0)
+    return ns
+
+
+def _fake_asyncio(mocker, **overrides):
+    """Replace only the handlers module's view of asyncio, never the real module the event loop uses."""
+    import asyncio
+    import types
+
+    fake = types.SimpleNamespace(**{name: getattr(asyncio, name) for name in dir(asyncio) if not name.startswith("_")})
+    for name, value in overrides.items():
+        setattr(fake, name, value)
+    mocker.patch.object(handlers, "asyncio", fake)
+
+
+def _titles(ns, level=None):
+    return [c.kwargs["title"] for c in ns.log.call_args_list if level is None or c.kwargs["level"] == level]
+
+
+@pytest.mark.asyncio
+async def test_backfill_reads_the_upload_window_with_the_pull_filters(backfill):
+    await handlers._backfill(_integration(), _job())
+
+    args, kwargs = backfill.read_args, backfill.read_kwargs
+    assert args == (START, END)
+    assert kwargs["batch_index"] == 0 and kwargs["after_id"] == 0
+    assert kwargs["quality_grade"] == ["research"]
+    assert kwargs["taxa"] == "41944"
+    assert kwargs["bounding_box"] == [1.0, 1.0, 0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_backfill_window_comes_from_days_back(backfill):
+    before = datetime.now(tz=timezone.utc)
+
+    result = await handlers.action_backfill_events(_integration(), BackfillEventsConfig(days_back=1095))
+
+    created_from, created_to = backfill.read_args
+    assert before <= created_to <= datetime.now(tz=timezone.utc)
+    assert created_to - created_from == timedelta(days=1095)
+    assert result["result"]["backfill_finished"] is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_creates_only_new_sightings_without_updates_or_photos(backfill):
+    backfill.store["2"] = {"object_id": "g2"}
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["1", "3"]
+    backfill.update.assert_not_called()
+    assert not [c for c in backfill.trigger.call_args_list if c.args[1] == "add_photos"]
+    assert not [k for k in backfill.store if k.startswith("photos.")]
+    assert backfill.store["1"][STATE_SENT_HASH_KEY] == _payload_hash({"event_details": {"inat_id": "1"}})
+    r = result["result"]
+    assert (r["events_extracted"], r["events_updated"], r["photos_attached"]) == (2, 0, 0)
+    assert r["backfill_finished"] is True and r["backfill_events_created"] == 2
+    assert _titles(backfill)[-1] == ("Backfill finished: created 2 events for sightings uploaded "
+                                     "between 2024-01-01 and 2026-11-05.")
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_sightings_the_annotation_filter_rejects(backfill, mocker):
+    settings = {**PULL_SETTINGS, "annotations": [{"term": "22", "values": ["24"]}]}
+    mocker.patch.object(handlers, "_match_annotations_to_config", side_effect=lambda annotations, wanted: False)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(settings), _job())
+
+    backfill.send.assert_not_called()
+    assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_at_max_events_and_says_how_far_it_got(backfill):
+    backfill.pages = [(0, 1, [_ob(i) for i in range(1, 6)])]
+
+    result = await handlers._backfill(_integration(), _job(max_events=3))
+
+    assert backfill.send.call_args.kwargs["events"] == [{"event_details": {"inat_id": str(i)}} for i in (1, 2, 3)]
+    r = result["result"]
+    assert (r["events_extracted"], r["backfill_finished"]) == (3, False)
+    assert r["backfill_uploaded_up_to"] == _ob(3).created_at.isoformat()
+    assert _titles(backfill)[-1] == ("Backfill stopped at its limit of 3 events: sightings uploaded up to "
+                                     "2024-01-04 00:00 UTC were sent. Run it again to continue; "
+                                     "sightings already sent are skipped.")
+
+
+@pytest.mark.asyncio
+async def test_backfill_counts_events_created_by_earlier_runs_toward_the_limit(backfill):
+    backfill.pages = [(0, 1, [_ob(i) for i in range(1, 6)])]
+
+    result = await handlers._backfill(_integration(), _job(max_events=3, created_so_far=2))
+
+    assert result["result"]["events_extracted"] == 1
+    assert result["result"]["backfill_events_created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_backfill_hands_over_at_the_time_budget_and_the_next_run_resumes(backfill, mocker):
+    clock = [1000.0]
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "_pull_time_budget", return_value=100)
+    real_send = backfill.send.side_effect
+
+    def slow_send(events, integration_id):
+        clock[0] += 150  # the first chunk uses up the budget
+        return real_send(events, integration_id)
+    backfill.send.side_effect = slow_send
+    backfill.pages = [(0, 2, [_ob(1), _ob(2)]), (1, 2, [_ob(7)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    handed = backfill.trigger.call_args
+    assert handed.args[1] == "backfill_events_continue"
+    job = handed.args[2]
+    assert (job.batch_index, job.after_id, job.created_so_far) == (0, 2, 2)
+    assert result["result"]["backfill_finished"] is False
+    assert _titles(backfill, LogLevel.INFO)[-1].startswith("Backfill continues in a new run: 2 events created so far")
+
+    # The continuation starts where the first run stopped.
+    clock[0] = 5000.0
+    backfill.send.side_effect = real_send
+    backfill.pages = [(1, 2, [_ob(7)])]
+    result = await handlers.action_backfill_events_continue(_integration(), job)
+    assert (backfill.read_kwargs["batch_index"], backfill.read_kwargs["after_id"]) == (0, 2)
+    assert result["result"]["backfill_events_created"] == 3 and result["result"]["backfill_finished"] is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_waits_for_a_running_pull(backfill):
+    backfill.lock_free = [False, False, True]
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    assert result["result"]["events_extracted"] == 1
+    backfill.state.delete_state_if_value.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_backfill_gives_up_when_a_pull_keeps_running(backfill, mocker):
+    clock = [1000.0]
+
+    async def no_sleep(seconds):
+        clock[0] += 60
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    _fake_asyncio(mocker, sleep=no_sleep)
+    mocker.patch.object(handlers, "BACKFILL_LOCK_WAIT_SECONDS", 10)
+    backfill.lock_free = [False]
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    backfill.send.assert_not_called()
+    assert result["result"]["events_extracted"] == 0
+    handed = backfill.trigger.call_args
+    assert handed.args[1] == "backfill_events_continue" and handed.args[2].lock_waits == 1
+    assert "waiting for another run of this connection" in _titles(backfill, LogLevel.INFO)[-1]
+    backfill.state.delete_state_if_value.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_with_an_error_when_inaturalist_is_down(backfill):
+    def down(*args, **kwargs):
+        raise INatUnavailableError("iNaturalist didn't answer in time")
+        yield  # pragma: no cover
+    backfill.read.side_effect = down
+
+    result = await handlers._backfill(_integration(), _job())
+
+    assert result["result"]["backfill_finished"] is False
+    error = _titles(backfill, LogLevel.ERROR)[-1]
+    assert error.startswith("The backfill stopped after creating 0 events because iNaturalist didn't answer in time")
+    backfill.state.delete_state_if_value.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_backfill_needs_the_pull_settings(backfill):
+    result = await handlers._backfill(_integration(pull_settings=None), _job())
+
+    backfill.read.assert_not_called()
+    assert result["result"]["events_extracted"] == 0
+    assert _titles(backfill, LogLevel.ERROR)[-1].startswith("The backfill didn't run because the connection has no "
+                                                            "pull settings")
+
+
+def test_backfill_settings_defaults_and_ranges():
+    import pydantic
+
+    config = BackfillEventsConfig()
+    assert (config.days_back, config.max_events) == (30, 1000)
+    for field, bad in (("days_back", 0), ("days_back", 3651), ("max_events", 0), ("max_events", 100_001)):
+        with pytest.raises(pydantic.ValidationError):
+            BackfillEventsConfig(**{field: bad})
+
+
+@pytest.mark.asyncio
+async def test_backfill_registers_as_a_manual_action_and_its_continuation_not_at_all(mocker):
+    from app.services import self_registration
+
+    gundi = MagicMock()
+    gundi.register_integration_type = AsyncMock()
+    await self_registration.register_integration_in_gundi(gundi, type_slug="inaturalist", type_name="iNaturalist")
+
+    actions = {a["value"]: a for a in gundi.register_integration_type.call_args.args[0]["actions"]}
+    assert actions["backfill_events"]["is_periodic_action"] is False
+    assert actions["backfill_events"]["schema"].get("is_executable") is True
+    assert "crontab_schedule" not in actions["backfill_events"]
+    assert "backfill_events_continue" not in actions
+
+
+def test_the_integration_type_name_is_iNaturalist_for_this_runner():
+    from app.settings.integration import _type_name
+
+    assert _type_name("inaturalist", None) == "iNaturalist"
+    assert _type_name(" iNaturalist ", None) == "iNaturalist"
+    assert _type_name("inaturalist", "Custom") == "Custom"  # the env var still wins
+    assert _type_name("x_tracker", None) is None  # other slugs keep the template's derived name
+
+
+@pytest.mark.asyncio
+async def test_the_integration_type_registers_with_that_name(mocker):
+    from app.services import self_registration
+
+    mocker.patch.object(self_registration, "INTEGRATION_TYPE_NAME", "iNaturalist")
+    gundi = MagicMock()
+    gundi.register_integration_type = AsyncMock()
+    await self_registration.register_integration_in_gundi(gundi, type_slug="inaturalist")
+
+    data = gundi.register_integration_type.call_args.args[0]
+    assert (data["name"], data["value"]) == ("iNaturalist", "inaturalist")
+
+
+# --- round-3 cases ---
+
+
+@pytest.mark.asyncio
+async def test_backfill_hands_over_when_a_pull_is_waiting(backfill):
+    backfill.store["pull_waiting"] = 1
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    backfill.send.assert_not_called()
+    assert backfill.trigger.call_args.args[1] == "backfill_events_continue"
+    assert result["result"]["backfill_finished"] is False
+    backfill.state.delete_state_if_value.assert_called_once()  # the lock goes back to the pull
+
+
+@pytest.mark.asyncio
+async def test_a_pull_that_finds_the_lock_taken_leaves_a_note_and_clears_it_when_it_runs(mocker):
+    from uuid import UUID
+    from app.actions.configurations import PullEventsConfig
+
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.side_effect = [False, True, True]  # lock taken, note left; then lock free
+    mocker.patch.object(handlers, "state_manager", mock_state)
+    mocker.patch.object(handlers, "log_action_activity", AsyncMock())
+    mocker.patch.object(handlers, "_run_pull", AsyncMock(return_value={"result": {}}))
+    integration = MagicMock()
+    integration.id = UUID("f03ec73e-f3fe-41b6-8597-3eb89dde5ae1")
+    config = PullEventsConfig(bounding_box="[1, 1, 0, 0]")
+
+    mocker.patch("app.services.activity_logger.publish_event", AsyncMock())
+
+    await handlers.action_pull_events(integration, config)
+    noted = [c for c in mock_state.set_if_absent.call_args_list if c.kwargs.get("source_id") == "pull_waiting"]
+    assert noted, "the skipped pull leaves the pull-waiting note"
+
+    await handlers.action_pull_events(integration, config)
+    cleared = [c for c in mock_state.delete_state.call_args_list if c.kwargs.get("source_id") == "pull_waiting"]
+    assert cleared, "a pull that runs clears the note"
+
+
+@pytest.mark.asyncio
+async def test_backfill_resumes_from_saved_progress_when_a_message_is_redelivered(backfill):
+    job = _job()
+    backfill.store[handlers._backfill_key(job)] = {"batch_index": 0, "after_id": 5, "created_so_far": 300}
+
+    result = await handlers._backfill(_integration(), job)
+
+    assert backfill.read_kwargs["after_id"] == 5
+    assert result["result"]["backfill_events_created"] == 300
+
+
+@pytest.mark.asyncio
+async def test_backfill_clears_its_progress_when_it_finishes(backfill):
+    job = _job()
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), job)
+
+    cleared = [c for c in backfill.state.delete_state.call_args_list if c.kwargs.get("source_id") == handlers._backfill_key(job)]
+    assert cleared
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_after_runs_without_progress(backfill, mocker):
+    import asyncio
+
+    async def never(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError
+    _fake_asyncio(mocker, wait_for=never)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), _job(runs_without_progress=2))
+
+    backfill.trigger.assert_not_called()
+    assert result["result"]["backfill_finished"] is False
+    assert "3 runs in a row couldn't read anything new" in _titles(backfill, LogLevel.ERROR)[-1]
+
+
+@pytest.mark.asyncio
+async def test_backfill_hands_over_when_a_read_outlasts_the_budget(backfill, mocker):
+    import asyncio
+
+    async def slow(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError
+    _fake_asyncio(mocker, wait_for=slow)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    job = backfill.trigger.call_args.args[2]
+    assert job.runs_without_progress == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_checks_the_time_before_each_chunk(backfill, mocker):
+    clock = [1000.0]
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "_pull_time_budget", return_value=100)
+    mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 2)
+    real_send = backfill.send.side_effect
+
+    def slow_send(events, integration_id):
+        clock[0] += 150
+        return real_send(events, integration_id)
+    backfill.send.side_effect = slow_send
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3), _ob(4)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    assert backfill.send.call_count == 1  # the second chunk waits for the next run
+    job = backfill.trigger.call_args.args[2]
+    assert (job.after_id, job.created_so_far) == (2, 2)
+
+
+@pytest.mark.asyncio
+async def test_backfill_limit_reached_in_the_second_chunk_of_a_page(backfill, mocker):
+    mocker.patch.object(handlers, "GUNDI_SUBMISSION_CHUNK_SIZE", 2)
+    backfill.pages = [(0, 1, [_ob(i) for i in range(1, 6)])]
+
+    result = await handlers._backfill(_integration(), _job(max_events=3))
+
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["1", "2", "3"]
+    assert result["result"]["backfill_uploaded_up_to"] == _ob(3).created_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_backfill_resumes_after_the_last_sighting_gundi_took(backfill):
+    backfill.send.side_effect = lambda events, integration_id: [{"object_id": "g1"}]
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+
+    result = await handlers._backfill(_integration(), _job())
+
+    job = backfill.trigger.call_args.args[2]
+    assert (job.after_id, job.created_so_far) == (1, 1)
+    assert "2" not in backfill.store and result["result"]["events_extracted"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_with_only_unknown_projects_says_so(backfill, mocker):
+    mocker.patch.object(handlers, "find_existing_projects", return_value=[])
+    settings = {**PULL_SETTINGS, "projects": ["gone-project"]}
+
+    result = await handlers._backfill(_integration(settings), _job())
+
+    backfill.read.assert_not_called()
+    warning = [c.kwargs for c in backfill.log.call_args_list if c.kwargs["level"] == LogLevel.WARNING][-1]
+    assert warning["action_id"] == "backfill_events"
+    assert warning["title"].startswith("The backfill didn't run because none of the saved projects exist")
+    assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_with_invalid_pull_settings_explains(backfill):
+    result = await handlers._backfill(_integration({"bounding_box": "", "projects": []}), _job())
+
+    backfill.read.assert_not_called()
+    assert _titles(backfill, LogLevel.ERROR)[-1].startswith("The backfill didn't run because the pull settings "
+                                                            "aren't valid")
+    assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_backfilled_sighting_is_unchanged_for_the_next_pull(backfill, mocker):
+    """B9 with the real transform: the backfill's stored hash is the one the pull computes."""
+    from pyinaturalist import Observation
+    from app.actions.configurations import PullEventsConfig
+
+    mocker.stopall()
+    store = {}
+    mock_state = AsyncMock()
+    mock_state.set_if_absent.return_value = True
+    mock_state.get_state.side_effect = lambda integration_id, action_id, source_id="no-source": store.get(source_id)
+
+    async def set_state(integration_id, action_id, state, source_id="no-source"):
+        store[source_id] = state
+    mock_state.set_state.side_effect = set_state
+    mocker.patch.object(handlers, "state_manager", mock_state)
+    mocker.patch.object(handlers, "log_action_activity", AsyncMock())
+    mocker.patch.object(handlers, "trigger_action", AsyncMock())
+    mocker.patch.object(handlers, "send_events_to_gundi",
+                        side_effect=lambda events, integration_id: [{"object_id": "g777"} for _ in events])
+    created = datetime.now(tz=timezone.utc) - timedelta(days=2)
+    data = {"id": 777, "observed_on": created.date().isoformat(), "created_at": created.isoformat(),
+            "updated_at": created.isoformat(), "quality_grade": "needs_id", "species_guess": "Puma",
+            "uri": "https://www.inaturalist.org/observations/777", "photos": [], "annotations": [],
+            "taxon": {"id": 41944, "name": "Puma concolor", "rank": "species", "preferred_common_name": "Puma"}}
+    mocker.patch.object(handlers, "iter_upload_pages",
+                        side_effect=lambda *a, **k: iter([(0, 1, [Observation.from_json(data)])]))
+
+    await handlers._backfill(_integration(), _job())
+
+    touched = Observation.from_json({**data, "updated_at": datetime.now(tz=timezone.utc).isoformat()})
+    outcome = await handlers._sort_observation(_integration(), PullEventsConfig.parse_obj(PULL_SETTINGS), touched,
+                                               set(), {}, set(), now=datetime.now(tz=timezone.utc))
+    assert outcome == "unchanged"
