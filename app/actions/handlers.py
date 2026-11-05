@@ -87,6 +87,8 @@ STATE_SENT_HASH_KEY = "sent_hash"
 STATE_PULL_WAITING_SOURCE_ID = "pull_waiting"
 # Per-backfill progress, keyed by the backfill's window end: {"batch_index", "after_id", "created_so_far"}.
 STATE_BACKFILL_PREFIX = "backfill."
+# The most recently started backfill's settings and window, so a repeated start continues it.
+STATE_BACKFILL_CURRENT = "backfill_current"
 # Per-integration run lock: held while a pull runs, expires if a run dies without releasing it.
 # Each run writes its own token, so a run that outlives its lock can't release the next run's.
 STATE_RUN_LOCK_SOURCE_ID = "run_lock"
@@ -1001,7 +1003,10 @@ async def save_patched_events_state(events_to_patch, integration, action_config:
     for gundi_object_id, observation in events_to_patch:
         try:
             updated_at = observation.updated_at
+            # Merged into the saved row, so fields other writers keep there (the backfill's tags) survive.
+            saved = await state_manager.get_state(str(integration.id), "pull_events", str(observation.id)) or {}
             state = {
+                **saved,
                 "object_id": gundi_object_id,
                 STATE_INAT_UPDATED_AT_KEY: (
                     updated_at.strftime(STATE_DATETIME_FMT)
@@ -1146,13 +1151,34 @@ def _reached(job: BackfillContinueConfig, uploaded_up_to: Optional[datetime], ba
 async def action_backfill_events(integration: Integration, action_config: BackfillEventsConfig):
     """Run by hand only: create events for sightings uploaded in the last
     days_back days, oldest first, until max_events. No updates, no photos."""
+    job = await _backfill_job_for(str(integration.id), action_config)
+    return await _backfill(integration, job)
+
+
+async def _backfill_job_for(integration_id: str, action_config: BackfillEventsConfig) -> BackfillContinueConfig:
+    """The job this start belongs to. While a backfill with the same settings hasn't ended,
+    a start (a redelivered message, or the user pressing Run again) continues it with the
+    same window instead of opening a second one with its own max_events."""
+    current = await state_manager.get_state(integration_id, "pull_events", STATE_BACKFILL_CURRENT) or {}
+    if (current.get("days_back"), current.get("max_events")) == (action_config.days_back, action_config.max_events):
+        job = BackfillContinueConfig(created_from=current["created_from"], created_to=current["created_to"],
+                                     max_events=action_config.max_events)
+        marker = await state_manager.get_state(integration_id, "pull_events", _backfill_key(job)) or {}
+        if not marker.get("done"):
+            return job
     created_to = datetime.now(tz=timezone.utc)
     job = BackfillContinueConfig(
         created_from=created_to - timedelta(days=action_config.days_back),
         created_to=created_to,
         max_events=action_config.max_events,
     )
-    return await _backfill(integration, job)
+    await state_manager.set_state(
+        integration_id, "pull_events",
+        {"days_back": action_config.days_back, "max_events": action_config.max_events,
+         "created_from": job.created_from.isoformat(), "created_to": job.created_to.isoformat()},
+        source_id=STATE_BACKFILL_CURRENT,
+    )
+    return job
 
 
 @action_title("Continue iNaturalist Backfill")
@@ -1208,8 +1234,9 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig) -> di
                                 f"to continue; sightings already sent are skipped.", _backfill_data(job))
         return _backfill_result(0, job, False, None)
     job.lock_waits = 0
+    followups = []  # (action_id, config) to start once the lock is released
     try:
-        return await _backfill_locked(integration, pull_config, job, deadline)
+        result = await _backfill_locked(integration, pull_config, job, deadline, followups)
     finally:
         try:
             await state_manager.delete_state_if_value(
@@ -1218,10 +1245,14 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig) -> di
         except Exception:
             # The lock expires on its own; don't mask the run's own outcome.
             logger.exception(f"Error releasing the run lock after a backfill for integration ID: {integration_id}.")
+    # After the release: a pull started here must find the lock free.
+    for action_id, config in followups:
+        await trigger_action(integration_id, action_id, config)
+    return result
 
 
 async def _backfill_locked(integration: Integration, pull_config: PullEventsConfig, job: BackfillContinueConfig,
-                           deadline: float) -> dict:
+                           deadline: float, followups: list) -> dict:
     integration_id = str(integration.id)
     window = f"between {_day(job.created_from)} and {_day(job.created_to)}"
     key = _backfill_key(job)
@@ -1284,19 +1315,21 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                     outcome = "handover"
                     break
                 to_add = []
+                recovered = []  # ids created by this backfill after its last saved position
                 last_seen = None
                 for ob in chunk:
-                    if job.created_so_far + len(to_add) >= job.max_events:
+                    if job.created_so_far + len(recovered) + len(to_add) >= job.max_events:
                         break
                     last_seen = ob
                     if annotations and not _match_annotations_to_config(ob.annotations, annotations):
                         continue
                     row = await state_manager.get_state(integration_id, "pull_events", str(ob.id))
                     if row:
-                        if row.get("backfill_job") == key and (job.batch_index, ob.id) > start:
-                            # Created by this backfill after its last saved position (a run that stopped
-                            # between saving the event and saving its count): count it now.
-                            job.created_so_far += 1
+                        # Created by this backfill, in this taxa group, after its last saved position (a run
+                        # that stopped between saving the event and saving its count): counted below.
+                        if (row.get("backfill_job") == key and row.get("backfill_batch") == job.batch_index
+                                and (job.batch_index, ob.id) > (job.batch_index, job.after_id)):
+                            recovered.append(ob.id)
                         continue
                     to_add.append(ob)
                 if to_add:
@@ -1308,7 +1341,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                             response, events[:accepted], integration,
                             {e['event_details']['inat_id']: ob.updated_at
                              for e, ob in zip(events[:accepted], to_add[:accepted])},
-                            extra={"backfill_job": key},
+                            extra={"backfill_job": key, "backfill_batch": job.batch_index},
                         )
                     created += accepted
                     job.created_so_far += accepted
@@ -1316,6 +1349,9 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                         # Gundi took part of the chunk: resume right after the last one it took.
                         last_seen = to_add[accepted - 1] if accepted else None
                         outcome = "handover"
+                # Only recovered sightings up to where the next run resumes: the rest are met again then.
+                resume_id = last_seen.id if last_seen is not None else job.after_id
+                job.created_so_far += sum(1 for i in recovered if i <= resume_id)
                 if last_seen is not None:
                     job.after_id = last_seen.id
                     uploaded_up_to = last_seen.created_at
@@ -1344,10 +1380,10 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
             await state_manager.delete_state(integration_id, "pull_events", source_id=STATE_PULL_WAITING_SOURCE_ID)
         except Exception:
             logger.exception(f"Could not clear the pull-waiting note for integration ID: {integration_id}.")
-        await trigger_action(integration_id, "pull_events")
         job.runs_without_progress = 0
         job.yield_to_pull = True
-        await trigger_action(integration_id, "backfill_events_continue", job)
+        followups.append(("pull_events", None))
+        followups.append(("backfill_events_continue", job))
         await _backfill_log(
             integration, LogLevel.INFO,
             f"Backfill paused for a pull and continues in a new run: {job.created_so_far:,} events created so far "
@@ -1366,7 +1402,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 f"{job.runs_without_progress} runs in a row couldn't read anything new from iNaturalist in time. "
                 f"Run it again later; sightings already sent are skipped.", _backfill_data(job, uploaded_up_to))
             return _backfill_result(created, job, False, uploaded_up_to)
-        await trigger_action(integration_id, "backfill_events_continue", job)
+        followups.append(("backfill_events_continue", job))
         await _backfill_log(
             integration, LogLevel.INFO,
             f"Backfill continues in a new run: {job.created_so_far:,} events created so far for sightings "

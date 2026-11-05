@@ -424,8 +424,8 @@ async def test_a_retry_counts_sightings_saved_after_the_last_saved_position(back
     job = _job(max_events=3)
     key = handlers._backfill_key(job)
     backfill.store[key] = {"batch_index": 0, "after_id": 0, "created_so_far": 0}
-    backfill.store["1"] = {"object_id": "g1", "backfill_job": key}
-    backfill.store["2"] = {"object_id": "g2", "backfill_job": key}
+    backfill.store["1"] = {"object_id": "g1", "backfill_job": key, "backfill_batch": 0}
+    backfill.store["2"] = {"object_id": "g2", "backfill_job": key, "backfill_batch": 0}
     backfill.store["3"] = {"object_id": "g3"}  # sent by the pull: not this backfill's
     backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3), _ob(4), _ob(5)])]
 
@@ -444,6 +444,7 @@ async def test_backfilled_rows_are_tagged_with_their_job(backfill):
     await handlers._backfill(_integration(), job)
 
     assert backfill.store["1"]["backfill_job"] == handlers._backfill_key(job)
+    assert backfill.store["1"]["backfill_batch"] == 0
 
 
 @pytest.mark.asyncio
@@ -582,3 +583,92 @@ async def test_a_backfilled_sighting_is_unchanged_for_the_next_pull(backfill, mo
     outcome = await handlers._sort_observation(_integration(), PullEventsConfig.parse_obj(PULL_SETTINGS), touched,
                                                set(), {}, set(), now=datetime.now(tz=timezone.utc))
     assert outcome == "unchanged"
+
+
+# --- second Copilot round ---
+
+
+@pytest.mark.asyncio
+async def test_a_pull_update_keeps_the_backfill_tags(backfill):
+    from app.actions.configurations import PullEventsConfig
+
+    backfill.store["7"] = {"object_id": "g7", "backfill_job": "backfill.x", "backfill_batch": 0, "sent_hash": "old"}
+
+    await handlers.save_patched_events_state([("g7", _ob(7))], _integration(), PullEventsConfig.parse_obj(PULL_SETTINGS))
+
+    row = backfill.store["7"]
+    assert (row["backfill_job"], row["backfill_batch"]) == ("backfill.x", 0)
+    assert row["sent_hash"] != "old" and row["object_id"] == "g7"
+
+
+@pytest.mark.asyncio
+async def test_a_redelivered_start_continues_the_same_backfill(backfill):
+    config = BackfillEventsConfig(days_back=365, max_events=2)
+    backfill.pages = [(0, 1, [_ob(1)])]
+    first = await handlers._backfill_job_for("i", config)
+    key = handlers._backfill_key(first)
+    backfill.store[key] = {"batch_index": 0, "after_id": 1, "created_so_far": 1}
+
+    again = await handlers._backfill_job_for("i", config)
+
+    assert (again.created_from, again.created_to) == (first.created_from, first.created_to)
+
+
+@pytest.mark.asyncio
+async def test_a_start_after_the_backfill_ended_opens_a_new_window(backfill):
+    config = BackfillEventsConfig(days_back=365, max_events=2)
+    first = await handlers._backfill_job_for("i", config)
+    backfill.store[handlers._backfill_key(first)] = {"done": True, "created_so_far": 2}
+
+    again = await handlers._backfill_job_for("i", config)
+
+    assert again.created_to > first.created_to
+
+
+@pytest.mark.asyncio
+async def test_a_start_with_other_settings_opens_a_new_window(backfill):
+    first = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=365, max_events=2))
+
+    again = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=30, max_events=2))
+
+    assert again.created_to > first.created_to and again.created_to - again.created_from == timedelta(days=30)
+
+
+@pytest.mark.asyncio
+async def test_a_sighting_in_two_taxa_groups_is_counted_once(backfill):
+    """Taxa groups can overlap (an ancestor in one, a descendant in another)."""
+    backfill.pages = [(0, 2, [_ob(1)]), (1, 2, [_ob(1), _ob(2), _ob(3)])]
+
+    result = await handlers._backfill(_integration(), _job(max_events=3))
+
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["1", "2", "3"]
+    assert result["result"]["backfill_events_created"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_partial_answer_counts_recovered_sightings_only_up_to_the_resume_point(backfill):
+    job = _job()
+    key = handlers._backfill_key(job)
+    backfill.store["2"] = {"object_id": "g2", "backfill_job": key, "backfill_batch": 0}
+    backfill.send.side_effect = lambda events, integration_id: [{"object_id": "g1"}]  # takes only the first
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+
+    await handlers._backfill(_integration(), job)
+
+    handed = [c.args[2] for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"][-1]
+    # Resumes after 1, so 2 is met (and counted) again by the next run, not now.
+    assert (handed.after_id, handed.created_so_far) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_runs_start_after_the_lock_is_released(backfill):
+    order = []
+    backfill.state.delete_state_if_value.side_effect = lambda *a, **k: order.append("release")
+    backfill.trigger.side_effect = lambda integration_id, action_id, config=None: order.append(action_id)
+    backfill.store["pull_waiting"] = 1
+    backfill.pages = [(0, 1, [_ob(1)]), (0, 1, [_ob(2)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    assert order == ["release", "pull_events", "backfill_events_continue"]
