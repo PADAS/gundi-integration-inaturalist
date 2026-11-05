@@ -27,13 +27,18 @@ async def test_execute_pull_observations_action(
     mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
     mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
     mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
+    # Gundi answers one created event per event sent.
+    mock_gundi_sensors_client_class.return_value.post_events.side_effect = lambda data: async_return(
+        [{"object_id": f"event-{i}", "created_at": "2024-07-04T13:15:26Z", "updated_at": None}
+         for i, _ in enumerate(data)])
+    mock_state_manager.delete_state.return_value = async_return(None)
 
     response = await execute_action(
         integration_id=str(inaturalist_integration_v2.id),
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted") == 2
+    assert response["result"].get("events_extracted") == 7
     assert response["result"].get("events_updated") == 0
     # Photos are added by a separate photo run, started with the new observations that have photos.
     assert response["result"].get("photos_attached") == 0
@@ -49,9 +54,9 @@ async def test_execute_pull_observations_action(
     ]
     summary = next(t for t in titles if t.startswith("Pull finished in "))
     # One photo per sighting by default; the rest are counted, not sent.
-    assert response["result"].get("photos_left_out") == 3
-    assert ("It sent 2 new iNaturalist observations to Gundi and updated 0, "
-            "and handed their 2 photos to a separate photo run (3 left out by the photo limit)") in summary
+    assert response["result"].get("photos_left_out") == 6
+    assert ("It sent 7 new iNaturalist observations to Gundi and updated 0, "
+            "and handed their 7 photos to a separate photo run (6 left out by the photo limit)") in summary
     assert "iNaturalist took " in summary
 
 

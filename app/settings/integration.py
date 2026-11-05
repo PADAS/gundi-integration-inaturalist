@@ -31,8 +31,9 @@ INAT_TAXA_CACHE_TIMEOUT_SECONDS = env.float("INAT_TAXA_CACHE_TIMEOUT_SECONDS", 0
 # pull_events run sends to Gundi. The run reads from iNaturalist only until it
 # has found that many, so a large backlog drains over several scheduled runs.
 # Updates found on the way are sent too and don't count.
-# Kept within the form's range (1-1000): pydantic doesn't check a field's default.
-INAT_MAX_NEW_EVENTS_PER_PULL = env.int("INAT_MAX_NEW_EVENTS_PER_PULL", 150, validate=lambda n: 1 <= n <= 1000)
+# The connection form caps it at 1000 (configurations.py); a higher env value is capped there,
+# never a failed start.
+INAT_MAX_NEW_EVENTS_PER_PULL = env.int("INAT_MAX_NEW_EVENTS_PER_PULL", 150, validate=lambda n: n > 0)
 # A pull stops taking new work this many seconds before the tighter of
 # MAX_ACTION_EXECUTION_TIME and INAT_PULL_TIME_LIMIT_SECONDS (Cloud Run's request
 # timeout), so it ends with its progress saved instead of being cut off.

@@ -62,6 +62,10 @@ def backfill(mocker):
     async def set_state(integration_id, action_id, state, source_id="no-source"):
         ns.store[source_id] = state
     mock_state.set_state.side_effect = set_state
+
+    async def delete_state(integration_id, action_id, source_id="no-source"):
+        ns.store.pop(source_id, None)
+    mock_state.delete_state.side_effect = delete_state
     mocker.patch.object(handlers, "state_manager", mock_state)
     ns.state = mock_state
 
@@ -328,8 +332,9 @@ async def test_backfill_yields_to_a_waiting_pull_after_reading_a_page(backfill):
     sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
     assert sent == ["1"]
     started = [c.args[1] for c in backfill.trigger.call_args_list]
-    assert started == ["pull_events", "backfill_events_continue"]
-    job = backfill.trigger.call_args.args[2]
+    # The continuation is started first (it waits before taking the lock), then the pull.
+    assert started == ["backfill_events_continue", "pull_events"]
+    job = [c.args[2] for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"][-1]
     assert job.yield_to_pull is True and job.runs_without_progress == 0 and job.after_id == 1
     assert [c for c in backfill.state.delete_state.call_args_list if c.kwargs.get("source_id") == "pull_waiting"]
     assert result["result"]["backfill_finished"] is False
@@ -604,12 +609,11 @@ async def test_a_pull_update_keeps_the_backfill_tags(backfill):
 @pytest.mark.asyncio
 async def test_a_redelivered_start_continues_the_same_backfill(backfill):
     config = BackfillEventsConfig(days_back=365, max_events=2)
-    backfill.pages = [(0, 1, [_ob(1)])]
-    first = await handlers._backfill_job_for("i", config)
+    first = await handlers._backfill_job_for("i", config, "f", now=END)
     key = handlers._backfill_key(first)
     backfill.store[key] = {"batch_index": 0, "after_id": 1, "created_so_far": 1}
 
-    again = await handlers._backfill_job_for("i", config)
+    again = await handlers._backfill_job_for("i", config, "f", now=END + timedelta(minutes=5))
 
     assert (again.created_from, again.created_to) == (first.created_from, first.created_to)
 
@@ -617,21 +621,25 @@ async def test_a_redelivered_start_continues_the_same_backfill(backfill):
 @pytest.mark.asyncio
 async def test_a_start_after_the_backfill_ended_opens_a_new_window(backfill):
     config = BackfillEventsConfig(days_back=365, max_events=2)
-    first = await handlers._backfill_job_for("i", config)
-    backfill.store[handlers._backfill_key(first)] = {"done": True, "created_so_far": 2}
+    first = await handlers._backfill_job_for("i", config, "f", now=END)
+    backfill.store[handlers._backfill_key(first)] = {"done": True, "created_so_far": 2,
+                                                     "ended_at": END.isoformat()}
 
-    again = await handlers._backfill_job_for("i", config)
+    again = await handlers._backfill_job_for("i", config, "f", now=END + timedelta(hours=1))
 
-    assert again.created_to > first.created_to
+    assert again.created_to == END + timedelta(hours=1)
 
 
 @pytest.mark.asyncio
 async def test_a_start_with_other_settings_opens_a_new_window(backfill):
-    first = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=365, max_events=2))
+    first = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=365, max_events=2), "f", now=END)
 
-    again = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=30, max_events=2))
+    later = END + timedelta(minutes=1)
+    again = await handlers._backfill_job_for("i", BackfillEventsConfig(days_back=30, max_events=2), "f", now=later)
 
-    assert again.created_to > first.created_to and again.created_to - again.created_from == timedelta(days=30)
+    assert again.created_to == later and again.created_to - again.created_from == timedelta(days=30)
+    # The first backfill is closed, so its runs stop.
+    assert backfill.store[handlers._backfill_key(first)]["superseded"] is True
 
 
 @pytest.mark.asyncio
@@ -671,4 +679,159 @@ async def test_follow_up_runs_start_after_the_lock_is_released(backfill):
 
     await handlers._backfill(_integration(), _job())
 
-    assert order == ["release", "pull_events", "backfill_events_continue"]
+    assert order == ["release", "backfill_events_continue", "pull_events"]
+
+
+# --- round 4: duplicates, settings changes, repeats, interrupted sends ---
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_continuation_does_nothing_once_the_chain_moved_on(backfill):
+    job = _job(seq=3)
+    backfill.store[handlers._backfill_key(job)] = {"seq": 4, "batch_index": 0, "after_id": 9, "created_so_far": 5}
+    backfill.pages = [(0, 1, [_ob(10)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    backfill.send.assert_not_called()
+    backfill.trigger.assert_not_called()
+    assert not _titles(backfill, LogLevel.ERROR)
+    assert result["result"]["backfill_events_created"] == 5
+
+
+@pytest.mark.asyncio
+async def test_each_run_takes_over_the_chain_with_the_next_seq(backfill):
+    job = _job(seq=2)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), job)
+
+    assert backfill.store[handlers._backfill_key(job)]["seq"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_backfill_stops_quietly(backfill):
+    job = _job()
+    backfill.store[handlers._backfill_key(job)] = {"done": True, "superseded": True, "created_so_far": 7}
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), job)
+
+    backfill.send.assert_not_called()
+    assert not _titles(backfill)
+
+
+@pytest.mark.asyncio
+async def test_changing_the_pull_filters_stops_the_backfill_and_says_so(backfill):
+    from app.actions.configurations import PullEventsConfig
+
+    started_with = handlers._filters_fingerprint(PullEventsConfig.parse_obj(PULL_SETTINGS))
+    changed = {**PULL_SETTINGS, "taxa": ["41944", "42007"]}
+    job = _job(filters=started_with)
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(changed), job)
+
+    backfill.send.assert_not_called()
+    assert backfill.store[handlers._backfill_key(job)]["done"] is True
+    assert "pull settings (projects, area, taxa, grades or annotations) changed" in _titles(backfill, LogLevel.ERROR)[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_start_with_other_filters_opens_a_new_window(backfill):
+    config = BackfillEventsConfig(days_back=365, max_events=2)
+    first = await handlers._backfill_job_for("i", config, "filters-a", now=END)
+
+    again = await handlers._backfill_job_for("i", config, "filters-b", now=END + timedelta(minutes=1))
+
+    assert again.created_to != first.created_to and again.filters == "filters-b"
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_start_right_after_the_backfill_ended_does_nothing(backfill):
+    config = BackfillEventsConfig(days_back=365, max_events=2)
+    first = await handlers._backfill_job_for("i", config, "f", now=END)
+    backfill.store[handlers._backfill_key(first)] = {"done": True, "ended_at": END.isoformat(), "created_so_far": 2}
+
+    again = await handlers._backfill_job_for("i", config, "f", now=END + timedelta(minutes=5))
+
+    assert again is None
+
+
+@pytest.mark.asyncio
+async def test_starts_choose_their_job_one_at_a_time(backfill, mocker):
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+    _fake_asyncio(mocker, sleep=sleep)
+    backfill.lock_free = [False, False, True]  # another start holds the start lock twice
+
+    await handlers._backfill_job_for("i", BackfillEventsConfig(), "f", now=END)
+
+    assert slept == [1, 1]
+    starting = [c for c in backfill.state.delete_state_if_value.call_args_list
+                if c.kwargs.get("source_id") == "backfill_starting"]
+    assert starting, "the start lock is released"
+
+
+@pytest.mark.asyncio
+async def test_a_backfill_start_with_bad_pull_settings_explains(backfill):
+    result = await handlers.action_backfill_events(_integration({"bounding_box": "", "projects": []}),
+                                                   BackfillEventsConfig())
+
+    backfill.read.assert_not_called()
+    assert result["result"]["events_extracted"] == 0
+    assert "pull settings aren't valid" in _titles(backfill, LogLevel.ERROR)[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_sighting_left_being_sent_by_a_cut_off_run_is_not_sent_again(backfill):
+    backfill.store["1"] = {"sending_since": "2026-11-05 10:00:00+0000"}
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    sent = [e["event_details"]["inat_id"] for c in backfill.send.call_args_list for e in c.kwargs["events"]]
+    assert sent == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_send_clears_its_being_sent_notes(backfill):
+    backfill.send.side_effect = RuntimeError("Gundi is down")
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)])]
+
+    with pytest.raises(RuntimeError):
+        await handlers._backfill(_integration(), _job())
+
+    assert "1" not in backfill.store and "2" not in backfill.store
+
+
+@pytest.mark.asyncio
+async def test_if_the_next_run_cant_be_started_the_log_says_the_backfill_stopped(backfill, mocker):
+    clock = [1000.0]
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "_pull_time_budget", return_value=100)
+    real_send = backfill.send.side_effect
+
+    def slow_send(events, integration_id):
+        clock[0] += 150
+        return real_send(events, integration_id)
+    backfill.send.side_effect = slow_send
+    backfill.trigger.side_effect = RuntimeError("topic unavailable")
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)]), (0, 1, [_ob(3)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    assert not [t for t in _titles(backfill, LogLevel.INFO) if t.startswith("Backfill continues")]
+    assert "its next run couldn't be started" in _titles(backfill, LogLevel.ERROR)[-1]
+
+
+def test_empty_limits_in_saved_pull_settings_fall_back_to_defaults():
+    from app import settings
+    from app.actions.configurations import PullEventsConfig
+
+    config = PullEventsConfig.parse_obj({**PULL_SETTINGS, "max_photos": None, "max_age_days": "",
+                                         "max_new_events_per_run": None})
+    assert (config.max_photos, config.max_age_days) == (1, 90)
+    assert config.max_new_events_per_run == min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000)

@@ -39,7 +39,7 @@ PubSub message → `POST /` (`app/main.py`) → `app/services/action_runner.py::
 `action_pull_events` is the single entry point and does:
 
 1. Loads cursor from `IntegrationStateManager` under key `STATE_LAST_RUN_KEY="last_run"` (falls back to legacy `"updated_to"`), but never further back than `now - days_to_load`; if absent, uses `now - days_to_load`.
-2. Calls `app/datasource/inaturalist.py::get_observations` (synchronous, uses `pyinaturalist.get_observations_v2`).
+2. Reads pages with `app/datasource/inaturalist.py::iter_observation_pages` (synchronous, `pyinaturalist.get_observations_v2`, run in a thread), oldest change first, until `max_new_events_per_run` new observations, the end of what changed, or the time budget.
 3. Sorts each observation (`_sort_observation`), reading per-observation state keyed by `source_id=inat_id`: **too old** (uploaded more than `max_age_days` ago by `created_at`; skipped, nothing stored), **new** (create in Gundi), **update** (in state and the payload hash differs from the stored `sent_hash`, or none is stored) or **unchanged** (skipped). `updated_at` never decides anything and is not in the payload.
 4. Transforms via `_transform_inat_to_gundi_event` and submits in chunks of `GUNDI_SUBMISSION_CHUNK_SIZE = 100` via `send_events_to_gundi`.
 5. If `include_photos`, records the first `max_photos` photos of each new event as pending and starts the separate `add_photos` action, which downloads each photo URL with `httpx.AsyncClient(verify=False)` and uploads it as a Gundi attachment.
@@ -50,7 +50,7 @@ If the iNat query returns nothing, the cursor is still advanced to `now()` so th
 
 ### Manual backfill (`backfill_events`)
 
-A generic, executable action (never scheduled) that a user runs from the portal: it creates events for sightings uploaded in the last `days_back` days (default 30), oldest first, using the connection's `pull_events` settings, until `max_events` (default 1000). Creations only: sightings already in state are skipped, nothing is updated, no photos are sent, and state is written like the pull's (with `sent_hash`). It reads with `iter_upload_pages` (upload window, id ascending, resumable by taxa batch and id), holds the same run lock as the pull (a pull that finds it taken leaves a `pull_waiting` note and the backfill hands over), and runs as an asynchronous chain: each run stops before the time budget and starts the internal `backfill_events_continue` action with its position, also saved under `backfill.<window end>`. Running it again is safe. Design: spec §5.
+A generic, executable action (never scheduled) that a user runs from the portal: it creates events for sightings uploaded in the last `days_back` days (default 30), oldest first, using the connection's `pull_events` settings, until `max_events` (default 1000). Creations only: sightings already in state are skipped, nothing is updated, no photos are sent, and state is written like the pull's (with `sent_hash`). It reads with `iter_upload_pages` (upload window, id ascending, resumable by taxa batch and id), holds the same run lock as the pull (a pull that finds it taken leaves a `pull_waiting` note and the backfill hands over), and runs as an asynchronous chain: each run stops before the time budget and starts the internal `backfill_events_continue` action with its position, also saved under `backfill.<window end>`. Running it again is safe. Each run carries a `seq`, so duplicate messages do nothing; a change to the pull filters stops it. With `TRIGGER_ACTIONS_ALWAYS_SYNC` (local) continuations run nested inside the first run. Design: spec §5.
 
 ### iNaturalist client (`app/datasource/inaturalist.py`)
 
@@ -105,8 +105,11 @@ Two distinct shapes stored under `(integration_id, "pull_events")`:
 | no `source_id` | `{last_run: "%Y-%m-%d %H:%M:%S%z"}` cursor | after each chunk of `action_pull_events`, and at the end when nothing matched |
 | `source_id=run_lock` / `pull_waiting` | the run lock a pull or backfill holds; the note a skipped pull leaves | `action_pull_events`, `_backfill` |
 | `source_id=backfill.<window end>` | a backfill's position, then a `done` marker once it ends (rows it creates carry `backfill_job` = this key and `backfill_batch`; patches keep them) | `_backfill_locked` |
-| `source_id=backfill_current` | the last started backfill's settings and window, so a repeated start continues it | `_backfill_job_for` |
-| `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` and `sent_hash` (SHA-256 of the payload last sent) | `save_events_state`, `save_patched_events_state` |
+| `source_id=backfill_current` | the last started backfill's settings, filter fingerprint and window, so a repeated start continues it | `_backfill_job_for` |
+| `source_id=backfill_starting` | short lock so backfill starts choose their job one at a time | `_backfill_job_for` |
+| `source_id=photos.<inat_id>` / `photos_lock.<inat_id>` | a new event's pending photos (`object_id`, `pending`); the lock held by the photo run adding them | `save_events_state`, `action_add_photos` |
+| `source_id=inat_down` | how many pulls in a row found iNaturalist down | `_handle_inat_down` |
+| `source_id=<inat_id>` | Gundi response (incl. `object_id`) plus `inat_updated_at` and `sent_hash` (SHA-256 of the payload last sent); while a new event is being sent, only `sending_since` (a row left with only that is never sent again) | `save_events_state`, `save_patched_events_state` |
 
 When changing state, preserve backward-compat reads of the legacy `"updated_to"` key (`_get_load_since`).
 

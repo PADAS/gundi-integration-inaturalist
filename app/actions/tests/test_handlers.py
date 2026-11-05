@@ -2173,3 +2173,38 @@ async def test_cursor_lag_uses_the_stored_cursor_when_a_run_saves_none(mocker):
     result = await action_pull_events(_lock_test_integration(), _config())
 
     assert result["result"]["cursor_lag_days"] == pytest.approx(10.0, abs=0.1)
+
+
+# --- round 4: the pull and interrupted or partial sends ---
+
+
+@pytest.mark.asyncio
+async def test_a_partial_gundi_answer_keeps_the_cursor_before_the_chunk(mocker):
+    _, send, store, mock_log = _pull_setup(mocker, 3)
+    send.side_effect = lambda events, integration_id: [{"object_id": "x"}]  # takes 1 of 3
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["events_extracted"] == 1
+    assert "no-source" not in store  # the next pull reads the chunk again and sends the other two
+    warning = [t for t in _titles(mock_log, LogLevel.WARNING)][-1]
+    assert warning.startswith("Gundi didn't accept 2 new observations of the last batch")
+
+
+@pytest.mark.asyncio
+async def test_sort_observation_skips_one_a_cut_off_run_was_sending(mocker):
+    ob, payload = _sortable(10, NOW)
+    _sort_state(mocker, saved={"sending_since": "2026-11-05 10:00:00+0000"})
+
+    outcome, new_ids, targets, _ = await _sort(mocker, ob, payload, NOW)
+
+    assert outcome == "unconfirmed" and not new_ids and not targets
+
+
+@pytest.mark.asyncio
+async def test_a_pull_that_ran_clears_the_pull_waiting_note(mocker):
+    _, _, store, _ = _pull_setup(mocker, 1, saved_state={"pull_waiting": 1})
+
+    await action_pull_events(_lock_test_integration(), _config())
+
+    assert "pull_waiting" not in store

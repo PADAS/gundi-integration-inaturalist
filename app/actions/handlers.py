@@ -83,6 +83,10 @@ STATE_DATETIME_FMT = "%Y-%m-%d %H:%M:%S%z"
 STATE_INAT_UPDATED_AT_KEY = "inat_updated_at"
 # Per-observation state: hash of the event payload last sent, so we only patch when what we send changed
 STATE_SENT_HASH_KEY = "sent_hash"
+# Per-observation state written just before a new event is sent and replaced once Gundi accepts it.
+# A row that still holds only this was being sent when a run was cut off: it may be in Gundi already,
+# so it is never sent again (no duplicate events).
+STATE_SENDING_KEY = "sending_since"
 # Set by a pull that found the run lock taken; a backfill holding the lock hands over when it sees it.
 STATE_PULL_WAITING_SOURCE_ID = "pull_waiting"
 # Per-backfill progress, keyed by the backfill's window end: {"batch_index", "after_id", "created_so_far"}.
@@ -248,6 +252,7 @@ class _PullProgress:
         self.photos_left_out = 0
         self.skipped_too_old = 0
         self.skipped_unchanged = 0
+        self.skipped_unconfirmed = 0
         # Set once the cursor for the next pull is saved: a stop after that
         # point (while publishing the summary) loses nothing.
         self.finished = False
@@ -268,6 +273,8 @@ class _PullProgress:
             skipped.append(f"{self.skipped_too_old} uploaded more than {self.max_age_days} days ago")
         if self.skipped_unchanged:
             skipped.append(f"{self.skipped_unchanged} with nothing changed")
+        if self.skipped_unconfirmed:
+            skipped.append(f"{self.skipped_unconfirmed} that an interrupted run may already have sent")
         if skipped:
             text += ", and skipped " + " and ".join(skipped)
         if self.photos_handed_off:
@@ -302,6 +309,7 @@ class _PullProgress:
             "photos_left_out": self.photos_left_out,
             "events_skipped_too_old": self.skipped_too_old,
             "events_skipped_unchanged": self.skipped_unchanged,
+            "events_skipped_unconfirmed": self.skipped_unconfirmed,
         }
 
 
@@ -440,6 +448,11 @@ async def action_pull_events(integration: Integration, action_config: PullEvents
         return await _run_pull(integration, action_config)
     finally:
         try:
+            # Any pull that was skipped while this one ran is covered by it.
+            await state_manager.delete_state(integration_id, "pull_events", source_id=STATE_PULL_WAITING_SOURCE_ID)
+        except Exception:
+            logger.exception(f"Could not clear the pull-waiting note for integration ID: {integration_id}.")
+        try:
             released = await state_manager.delete_state_if_value(
                 integration_id, "pull_events", lock_token, source_id=STATE_RUN_LOCK_SOURCE_ID
             )
@@ -506,6 +519,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     new_found = added_count = updated_count = attachment_count = 0
     done_through = None
     read_all = stopped_on_time = False
+    gundi_partial = 0  # new observations of a chunk that Gundi didn't accept
     try:
         while new_found < max_new:
             if time.monotonic() >= deadline:
@@ -554,6 +568,10 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                     added, photos = await _send_new_observations(integration, action_config, to_add, progress)
                     added_count += added
                     attachment_count += photos
+                    if added < len(to_add):
+                        # The cursor stays before this chunk: the next pull sends the ones Gundi didn't take.
+                        gundi_partial = len(to_add) - added
+                        break
                 for item in to_patch:
                     # One at a time, each saved as it lands: a chunk can hold 100 updates.
                     if time.monotonic() >= deadline:
@@ -583,7 +601,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 chunk_outcomes = [outcomes.get(ob.id) for ob in chunk]
                 progress.skipped_too_old += chunk_outcomes.count("too_old")
                 progress.skipped_unchanged += chunk_outcomes.count("unchanged")
-            if stopped_on_time:
+                progress.skipped_unconfirmed += chunk_outcomes.count("unconfirmed")
+            if stopped_on_time or gundi_partial:
                 break
     except (INatUnavailableError, INatRequestError) as e:
         if not _inat_is_down(e):
@@ -593,6 +612,13 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
         return _pull_result(added_count, updated_count, attachment_count, progress, done_through or previous_cursor)
     await _clear_inat_down(integration)
     progress.finished = True
+
+    if gundi_partial:
+        msg = (f"Gundi didn't accept {_count(gundi_partial, 'new observation', 'new observations')} of the last "
+               f"batch, so the pull stopped there; the next pull sends them again. Before that, {progress.counts()}.")
+        logger.warning(f"{msg} Integration ID: {integration.id}.")
+        await _publish_progress_log(integration, msg, LogLevel.WARNING, progress.data(), "partial-send notice")
+        return _pull_result(added_count, updated_count, attachment_count, progress, done_through or previous_cursor)
 
     if read_all and not progress.observations_read:
         since = load_since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -667,6 +693,8 @@ async def _sort_observation(integration: Integration, action_config: PullEventsC
     - "update": in Gundi, and what we would send differs from what was last
       sent (or no hash was stored yet); goes in patch_targets ({id: object_id}).
     - "unchanged": in Gundi and nothing we send changed.
+    - "unconfirmed": a run was cut off while sending it, so it may be in Gundi
+      already; it is never sent again, to avoid a duplicate event.
 
     An observation in Gundi whose photos are still pending also goes in
     photos_left_behind, unless it is too old: past max_age_days a sighting
@@ -681,6 +709,8 @@ async def _sort_observation(integration: Integration, action_config: PullEventsC
     if not saved_event:
         new_ids.add(observation.id)
         return "new"
+    if not saved_event.get("object_id") and saved_event.get(STATE_SENDING_KEY):
+        return "unconfirmed"
     photos = await state_manager.get_state(str(integration.id), "pull_events", STATE_PHOTOS_PREFIX + str(observation.id))
     if (photos or {}).get("pending"):
         photos_left_behind.add(observation.id)
@@ -715,7 +745,7 @@ async def _send_new_observations(integration, action_config, observations, progr
 
     logger.info(f"Submitting {len(events)} iNaturalist observations to Gundi")
     progress.step = "sending new observations to Gundi"
-    response = await send_events_to_gundi(events=events, integration_id=str(integration.id))
+    response = await _send_marked(str(integration.id), [str(ob.id) for ob in observations], events)
     progress.events_sent += len(response)
     if not response:
         return 0, 0
@@ -729,6 +759,33 @@ async def _send_new_observations(integration, action_config, observations, progr
         await trigger_action(str(integration.id), "add_photos", AddPhotosConfig(observation_ids=with_photos))
         progress.photos_handed_off += sum(len(pending_photos[i]) for i in with_photos)
     return len(response), 0
+
+
+async def _send_marked(integration_id: str, inat_ids: List[str], events: List[dict]) -> list:
+    """Send new events with a "being sent" note on each observation's row first.
+
+    Gundi accepted what comes back; save_events_state then replaces the note with the
+    event's state. The notes of events Gundi didn't take, or that failed, are removed.
+    Only a run cut off between the send and the save leaves a note behind, and that
+    observation is then never sent again (spec: no duplicate events)."""
+    since = datetime.now(tz=timezone.utc).strftime(STATE_DATETIME_FMT)
+    for inat_id in inat_ids:
+        await state_manager.set_state(integration_id, "pull_events", {STATE_SENDING_KEY: since}, source_id=inat_id)
+    try:
+        response = await send_events_to_gundi(events=events, integration_id=integration_id) or []
+    except BaseException:
+        await _clear_sending(integration_id, inat_ids)
+        raise
+    await _clear_sending(integration_id, inat_ids[len(response):])
+    return response
+
+
+async def _clear_sending(integration_id: str, inat_ids: List[str]):
+    for inat_id in inat_ids:
+        try:
+            await state_manager.delete_state(integration_id, "pull_events", source_id=inat_id)
+        except Exception:
+            logger.exception(f"Could not clear a being-sent note for integration ID: {integration_id}.")
 
 
 def _inat_is_down(error: Exception) -> bool:
@@ -1145,40 +1202,115 @@ def _reached(job: BackfillContinueConfig, uploaded_up_to: Optional[datetime], ba
     return where
 
 
+# Seconds after a backfill ended during which a start with the same settings counts as a
+# repeat of the one that just ended (a Pub/Sub redelivery), not a new pass.
+BACKFILL_REPEAT_GRACE_SECONDS = 600
+# Seconds a start waits for another start of the same connection to finish choosing its job.
+BACKFILL_START_LOCK_SECONDS = 30
+STATE_BACKFILL_STARTING = "backfill_starting"
+
+
+def _filters_fingerprint(pull_config: PullEventsConfig) -> str:
+    """What decides which sightings a backfill reads. A change means its saved position no
+    longer points at the same list of sightings."""
+    filters = {"taxa": pull_config.taxa_str, "projects": pull_config.projects,
+               "bounding_box": pull_config.bounding_box, "quality_grade": pull_config.quality_grade,
+               "annotations": pull_config.annotations_dict}
+    return hashlib.sha256(json.dumps(filters, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+async def _pull_settings(integration: Integration, job: BackfillContinueConfig) -> Optional[PullEventsConfig]:
+    """The connection's pull settings, or None after logging why the backfill can't run."""
+    pull_row = find_config_for_action(integration.configurations or [], "pull_events")
+    if not pull_row:
+        await _backfill_log(integration, LogLevel.ERROR,
+                            "The backfill didn't run because the connection has no pull settings. "
+                            "Save the pull settings (projects or area, event type) and run it again.",
+                            _backfill_data(job))
+        return None
+    try:
+        return PullEventsConfig.parse_obj(pull_row.data)
+    except pydantic.ValidationError as e:
+        fields = ", ".join(sorted({str(err["loc"][0]) for err in e.errors() if err.get("loc")})) or "the settings"
+        await _backfill_log(integration, LogLevel.ERROR,
+                            f"The backfill didn't run because the pull settings aren't valid ({fields}). "
+                            f"Fix them and run it again.", _backfill_data(job))
+        return None
+
+
 @action_title("Backfill iNaturalist Observations")
 @_clock_run
 @activity_logger()
 async def action_backfill_events(integration: Integration, action_config: BackfillEventsConfig):
     """Run by hand only: create events for sightings uploaded in the last
     days_back days, oldest first, until max_events. No updates, no photos."""
-    job = await _backfill_job_for(str(integration.id), action_config)
-    return await _backfill(integration, job)
-
-
-async def _backfill_job_for(integration_id: str, action_config: BackfillEventsConfig) -> BackfillContinueConfig:
-    """The job this start belongs to. While a backfill with the same settings hasn't ended,
-    a start (a redelivered message, or the user pressing Run again) continues it with the
-    same window instead of opening a second one with its own max_events."""
-    current = await state_manager.get_state(integration_id, "pull_events", STATE_BACKFILL_CURRENT) or {}
-    if (current.get("days_back"), current.get("max_events")) == (action_config.days_back, action_config.max_events):
-        job = BackfillContinueConfig(created_from=current["created_from"], created_to=current["created_to"],
-                                     max_events=action_config.max_events)
-        marker = await state_manager.get_state(integration_id, "pull_events", _backfill_key(job)) or {}
-        if not marker.get("done"):
-            return job
     created_to = datetime.now(tz=timezone.utc)
-    job = BackfillContinueConfig(
-        created_from=created_to - timedelta(days=action_config.days_back),
-        created_to=created_to,
-        max_events=action_config.max_events,
-    )
-    await state_manager.set_state(
-        integration_id, "pull_events",
-        {"days_back": action_config.days_back, "max_events": action_config.max_events,
-         "created_from": job.created_from.isoformat(), "created_to": job.created_to.isoformat()},
-        source_id=STATE_BACKFILL_CURRENT,
-    )
-    return job
+    placeholder = BackfillContinueConfig(created_from=created_to - timedelta(days=action_config.days_back),
+                                         created_to=created_to, max_events=action_config.max_events)
+    pull_config = await _pull_settings(integration, placeholder)
+    if pull_config is None:
+        return _backfill_result(0, placeholder, False, None)
+    job = await _backfill_job_for(str(integration.id), action_config, _filters_fingerprint(pull_config))
+    if job is None:
+        return _backfill_result(0, placeholder, False, None)
+    return await _backfill(integration, job, pull_config)
+
+
+async def _backfill_job_for(integration_id: str, action_config: BackfillEventsConfig, filters: str,
+                            now: Optional[datetime] = None) -> Optional[BackfillContinueConfig]:
+    """The job this start belongs to (spec §5, B10).
+
+    - Same settings and pull filters as a backfill that hasn't ended: continue it (same window,
+      same limit), so a redelivered start or a second press of Run never opens a second one.
+    - Same settings as one that ended less than BACKFILL_REPEAT_GRACE_SECONDS ago: a repeat of
+      that start (None: nothing to do).
+    - Otherwise a new window; a backfill still running for other settings is closed first.
+    Starts of the same connection choose one at a time (a short start lock)."""
+    now = now or datetime.now(tz=timezone.utc)
+    token = uuid4().hex
+    for _ in range(BACKFILL_START_LOCK_SECONDS):
+        if await state_manager.set_if_absent(integration_id, "pull_events", ttl_seconds=BACKFILL_START_LOCK_SECONDS,
+                                             source_id=STATE_BACKFILL_STARTING, value=token):
+            break
+        await asyncio.sleep(1)
+    try:
+        current = await state_manager.get_state(integration_id, "pull_events", STATE_BACKFILL_CURRENT) or {}
+        same = (current.get("days_back"), current.get("max_events"), current.get("filters")) == (
+            action_config.days_back, action_config.max_events, filters)
+        if current.get("created_to"):
+            running = BackfillContinueConfig(created_from=current["created_from"], created_to=current["created_to"],
+                                             max_events=current.get("max_events") or action_config.max_events,
+                                             filters=current.get("filters") or "")
+            marker = await state_manager.get_state(integration_id, "pull_events", _backfill_key(running)) or {}
+            if same and not marker.get("done"):
+                return running
+            if same and marker.get("ended_at"):
+                ended = datetime.fromisoformat(marker["ended_at"])
+                if (now - ended).total_seconds() < BACKFILL_REPEAT_GRACE_SECONDS:
+                    logger.info(f"Backfill start for integration ID: {integration_id} repeats one that ended at "
+                                f"{marker['ended_at']}; nothing to do.")
+                    return None
+            if not marker.get("done"):
+                # A different backfill replaces this one: its runs see the marker and stop.
+                await state_manager.set_state(
+                    integration_id, "pull_events",
+                    {**marker, "done": True, "superseded": True, "ended_at": now.isoformat()},
+                    source_id=_backfill_key(running))
+        job = BackfillContinueConfig(created_from=now - timedelta(days=action_config.days_back), created_to=now,
+                                     max_events=action_config.max_events, filters=filters)
+        await state_manager.set_state(
+            integration_id, "pull_events",
+            {"days_back": action_config.days_back, "max_events": action_config.max_events, "filters": filters,
+             "created_from": job.created_from.isoformat(), "created_to": job.created_to.isoformat()},
+            source_id=STATE_BACKFILL_CURRENT,
+        )
+        return job
+    finally:
+        try:
+            await state_manager.delete_state_if_value(integration_id, "pull_events", token,
+                                                      source_id=STATE_BACKFILL_STARTING)
+        except Exception:
+            logger.exception(f"Could not release the backfill start lock for integration ID: {integration_id}.")
 
 
 @action_title("Continue iNaturalist Backfill")
@@ -1189,27 +1321,61 @@ async def action_backfill_events_continue(integration: Integration, action_confi
     return await _backfill(integration, action_config)
 
 
-async def _backfill(integration: Integration, job: BackfillContinueConfig) -> dict:
+async def _backfill_is_stale(integration_id: str, job: BackfillContinueConfig) -> bool:
+    """True when this run should quietly do nothing: its backfill ended (or was replaced),
+    or a later run of the same chain already took over (a duplicate or late message)."""
+    position = await state_manager.get_state(integration_id, "pull_events", _backfill_key(job)) or {}
+    return bool(position.get("done")) or position.get("seq", 0) > job.seq
+
+
+async def _run_followups(integration: Integration, job: BackfillContinueConfig, followups: list, logs: list):
+    """Start the next runs (the backfill's continuation first), then publish the notes that say so.
+    If the continuation can't be started, say the backfill stopped instead."""
+    integration_id = str(integration.id)
+    for action_id, config in sorted(followups, key=lambda f: f[0] != "backfill_events_continue"):
+        try:
+            await trigger_action(integration_id, action_id, config)
+        except Exception as e:
+            logger.exception(f"Could not start '{action_id}' after a backfill run for integration ID: {integration_id}.")
+            if action_id == "backfill_events_continue":
+                logs = [(LogLevel.ERROR,
+                         f"The backfill stopped after creating {job.created_so_far:,} events because its next run "
+                         f"couldn't be started ({e!r}). Run it again to continue; sightings already sent are "
+                         f"skipped.", _backfill_data(job))]
+    for level, msg, data in logs:
+        await _backfill_log(integration, level, msg, data)
+
+
+async def _backfill(integration: Integration, job: BackfillContinueConfig,
+                    pull_config: Optional[PullEventsConfig] = None) -> dict:
     integration_id = str(integration.id)
     started = _run_started.get() or time.monotonic()
     deadline = started + _pull_time_budget()
+    if pull_config is None:
+        pull_config = await _pull_settings(integration, job)
+        if pull_config is None:
+            return _backfill_result(0, job, False, None)
 
-    pull_row = find_config_for_action(integration.configurations or [], "pull_events")
-    if not pull_row:
-        await _backfill_log(integration, LogLevel.ERROR,
-                            "The backfill didn't run because the connection has no pull settings. "
-                            "Save the pull settings (projects or area, event type) and run it again.",
-                            _backfill_data(job))
-        return _backfill_result(0, job, False, None)
-    try:
-        pull_config = PullEventsConfig.parse_obj(pull_row.data)
-    except pydantic.ValidationError as e:
-        fields = ", ".join(sorted({str(err["loc"][0]) for err in e.errors() if err.get("loc")})) or "the settings"
-        await _backfill_log(integration, LogLevel.ERROR,
-                            f"The backfill didn't run because the pull settings aren't valid ({fields}). "
-                            f"Fix them and run it again.", _backfill_data(job))
+    position = await state_manager.get_state(integration_id, "pull_events", _backfill_key(job)) or {}
+    if position.get("done") or position.get("seq", 0) > job.seq:
+        # Ended, replaced, or a later run of this chain already ran (a duplicate or late message).
+        logger.info(f"Backfill run for integration ID: {integration_id} has nothing to do (ended or taken over).")
+        job.created_so_far = max(job.created_so_far, position.get("created_so_far", 0))
+        return _backfill_result(0, job, bool(position.get("finished")), None)
+    if job.filters and _filters_fingerprint(pull_config) != job.filters:
+        position = await state_manager.get_state(integration_id, "pull_events", _backfill_key(job)) or {}
+        await state_manager.set_state(
+            integration_id, "pull_events",
+            {**position, "done": True, "settings_changed": True,
+             "ended_at": datetime.now(tz=timezone.utc).isoformat()}, source_id=_backfill_key(job))
+        await _backfill_log(
+            integration, LogLevel.ERROR,
+            f"The backfill stopped after creating {job.created_so_far:,} events because the pull settings "
+            f"(projects, area, taxa, grades or annotations) changed while it ran. Run it again to backfill with "
+            f"the new settings; sightings already sent are skipped.", _backfill_data(job))
         return _backfill_result(0, job, False, None)
 
+    followups, logs = [], []  # runs to start and notes to publish once the lock is released
     if job.yield_to_pull:
         # The previous run started a pull and handed over: let that pull take the lock first.
         job.yield_to_pull = False
@@ -1221,22 +1387,25 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig) -> di
         if time.monotonic() + BACKFILL_LOCK_WAIT_SECONDS < deadline:
             await asyncio.sleep(BACKFILL_LOCK_WAIT_SECONDS)
             continue
+        if await _backfill_is_stale(integration_id, job):
+            # The lock was held by this backfill's own other run, which has moved on.
+            return _backfill_result(0, job, False, None)
         if job.lock_waits + 1 < BACKFILL_MAX_LOCK_WAITS:
             job.lock_waits += 1
-            await trigger_action(integration_id, "backfill_events_continue", job)
-            await _backfill_log(integration, LogLevel.INFO,
-                                f"The backfill is waiting for another run of this connection (a pull or another "
-                                f"backfill) to finish; it tries again in a new run.", _backfill_data(job))
+            followups.append(("backfill_events_continue", job))
+            logs.append((LogLevel.INFO, "The backfill is waiting for another run of this connection (a pull or "
+                                        "another backfill) to finish; it tries again in a new run.",
+                         _backfill_data(job)))
         else:
-            await _backfill_log(integration, LogLevel.ERROR,
-                                f"The backfill stopped after creating {job.created_so_far:,} events because other "
-                                f"runs of this connection (a pull or another backfill) kept running. Run it again "
-                                f"to continue; sightings already sent are skipped.", _backfill_data(job))
+            logs.append((LogLevel.ERROR,
+                         f"The backfill stopped after creating {job.created_so_far:,} events because other runs of "
+                         f"this connection (a pull or another backfill) kept running. Run it again to continue; "
+                         f"sightings already sent are skipped.", _backfill_data(job)))
+        await _run_followups(integration, job, followups, logs)
         return _backfill_result(0, job, False, None)
     job.lock_waits = 0
-    followups = []  # (action_id, config) to start once the lock is released
     try:
-        result = await _backfill_locked(integration, pull_config, job, deadline, followups)
+        result = await _backfill_locked(integration, pull_config, job, deadline, followups, logs)
     finally:
         try:
             await state_manager.delete_state_if_value(
@@ -1246,26 +1415,33 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig) -> di
             # The lock expires on its own; don't mask the run's own outcome.
             logger.exception(f"Error releasing the run lock after a backfill for integration ID: {integration_id}.")
     # After the release: a pull started here must find the lock free.
-    for action_id, config in followups:
-        await trigger_action(integration_id, action_id, config)
+    await _run_followups(integration, job, followups, logs)
     return result
 
 
+def _position(job: BackfillContinueConfig, **extra) -> dict:
+    return {"seq": job.seq, "batch_index": job.batch_index, "after_id": job.after_id,
+            "created_so_far": job.created_so_far, **extra}
+
+
 async def _backfill_locked(integration: Integration, pull_config: PullEventsConfig, job: BackfillContinueConfig,
-                           deadline: float, followups: list) -> dict:
+                           deadline: float, followups: list, logs: list) -> dict:
     integration_id = str(integration.id)
     window = f"between {_day(job.created_from)} and {_day(job.created_to)}"
     key = _backfill_key(job)
 
-    # A redelivered or repeated run carries an older position: the saved one wins.
     saved = await state_manager.get_state(integration_id, "pull_events", key) or {}
-    job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
-    if saved.get("done"):
-        # This backfill already ended (a late or repeated message): nothing more to do.
-        logger.info(f"Backfill {key} already ended; ignoring a later run. Integration ID: {integration_id}.")
+    if saved.get("done") or saved.get("seq", 0) > job.seq:
+        # Ended, replaced, or a later run of this chain already ran (a duplicate or late message).
+        logger.info(f"Backfill {key} for integration ID: {integration_id} has nothing to do (ended or taken over).")
         return _backfill_result(0, job, bool(saved.get("finished")), None)
+    # A redelivered or repeated run carries an older position: the saved one wins.
+    job.created_so_far = max(job.created_so_far, saved.get("created_so_far", 0))
     if (saved.get("batch_index", 0), saved.get("after_id", 0)) > (job.batch_index, job.after_id):
         job.batch_index, job.after_id = saved["batch_index"], saved["after_id"]
+    # This run takes over the chain: older copies of its message now see a higher seq and stop.
+    job.seq += 1
+    await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
     start = (job.batch_index, job.after_id)
 
     projects = pull_config.projects
@@ -1328,13 +1504,13 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                         # Created by this backfill, in this taxa group, after its last saved position (a run
                         # that stopped between saving the event and saving its count): counted below.
                         if (row.get("backfill_job") == key and row.get("backfill_batch") == job.batch_index
-                                and (job.batch_index, ob.id) > (job.batch_index, job.after_id)):
+                                and ob.id > job.after_id):
                             recovered.append(ob.id)
                         continue
                     to_add.append(ob)
                 if to_add:
                     events = [_transform_inat_to_gundi_event(ob, pull_config) for ob in to_add]
-                    response = await send_events_to_gundi(events=events, integration_id=integration_id) or []
+                    response = await _send_marked(integration_id, [str(ob.id) for ob in to_add], events)
                     accepted = len(response)
                     if accepted:
                         await save_events_state(
@@ -1355,11 +1531,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 if last_seen is not None:
                     job.after_id = last_seen.id
                     uploaded_up_to = last_seen.created_at
-                await state_manager.set_state(
-                    integration_id, "pull_events",
-                    {"batch_index": job.batch_index, "after_id": job.after_id, "created_so_far": job.created_so_far},
-                    source_id=key,
-                )
+                await state_manager.set_state(integration_id, "pull_events", _position(job), source_id=key)
                 if outcome or job.created_so_far >= job.max_events:
                     break
     except (INatUnavailableError, INatRequestError) as e:
@@ -1382,13 +1554,12 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
             logger.exception(f"Could not clear the pull-waiting note for integration ID: {integration_id}.")
         job.runs_without_progress = 0
         job.yield_to_pull = True
-        followups.append(("pull_events", None))
         followups.append(("backfill_events_continue", job))
-        await _backfill_log(
-            integration, LogLevel.INFO,
-            f"Backfill paused for a pull and continues in a new run: {job.created_so_far:,} events created so far "
-            f"for sightings uploaded {window}" + (f"; {reached}." if reached else "."),
-            _backfill_data(job, uploaded_up_to))
+        followups.append(("pull_events", None))
+        logs.append((LogLevel.INFO,
+                     f"Backfill paused for a pull and continues in a new run: {job.created_so_far:,} events created "
+                     f"so far for sightings uploaded {window}" + (f"; {reached}." if reached else "."),
+                     _backfill_data(job, uploaded_up_to)))
         return _backfill_result(created, job, False, uploaded_up_to)
     if outcome == "handover":
         if (job.batch_index, job.after_id) == start and not created:
@@ -1403,17 +1574,15 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 f"Run it again later; sightings already sent are skipped.", _backfill_data(job, uploaded_up_to))
             return _backfill_result(created, job, False, uploaded_up_to)
         followups.append(("backfill_events_continue", job))
-        await _backfill_log(
-            integration, LogLevel.INFO,
-            f"Backfill continues in a new run: {job.created_so_far:,} events created so far for sightings "
-            f"uploaded {window}" + (f"; {reached}." if reached else "."), _backfill_data(job, uploaded_up_to))
+        logs.append((LogLevel.INFO,
+                     f"Backfill continues in a new run: {job.created_so_far:,} events created so far for sightings "
+                     f"uploaded {window}" + (f"; {reached}." if reached else "."), _backfill_data(job, uploaded_up_to)))
         return _backfill_result(created, job, False, uploaded_up_to)
 
     # Kept, not deleted: a late or repeated message for this backfill then does nothing.
     await state_manager.set_state(
         integration_id, "pull_events",
-        {"done": True, "finished": outcome == "finished", "created_so_far": job.created_so_far,
-         "batch_index": job.batch_index, "after_id": job.after_id},
+        _position(job, done=True, finished=outcome == "finished", ended_at=datetime.now(tz=timezone.utc).isoformat()),
         source_id=key,
     )
     if outcome == "limit":

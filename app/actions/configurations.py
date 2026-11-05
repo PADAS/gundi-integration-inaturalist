@@ -162,11 +162,11 @@ class PullEventsConfig(PullActionConfiguration):
         description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 90")
 
     max_new_events_per_run: int = FieldWithUIOptions(
-        settings.INAT_MAX_NEW_EVENTS_PER_PULL,
+        min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000),
         title="New events per run",
         ge=1,
         le=1000,
-        description=f"Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: {settings.INAT_MAX_NEW_EVENTS_PER_PULL}")
+        description=f"Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: {min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000)}")
 
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
@@ -266,6 +266,11 @@ class PullEventsConfig(PullActionConfiguration):
         return list(cleaned) or None
 
     # Temporary validator to cope with a limitation in Gundi Portal.
+    @pydantic.validator("max_photos", "max_age_days", "max_new_events_per_run", pre=True)
+    def _empty_limit_uses_default(cls, value, field):
+        # A portal that stores null or "" for an untouched number must not stop the pull.
+        return field.default if value is None or (isinstance(value, str) and not value.strip()) else value
+
     @pydantic.validator("event_type", "event_prefix", always=True)
     def validate_region_code(cls, v, values):
         if 'any' == str(v).lower():
@@ -401,9 +406,9 @@ class AddPhotosConfig(InternalActionConfiguration):
 
 
 class BackfillEventsConfig(GenericActionConfiguration, ExecutableActionMixin):
-    """Run by hand only (generic actions are never scheduled): create events
-    for older sightings, with the connection's pull settings. No updates, no
-    photos. Spec: docs/superpowers/specs/2026-11-05-pull-limits-design.md §5."""
+    """Loads older sightings into EarthRanger, using this connection's pull settings. Save these settings,
+    then run it. It creates events only: it doesn't update events, and backfilled sightings get no photos,
+    recent ones included. It runs only when started by hand."""
     days_back: int = FieldWithUIOptions(
         30,
         title="Days to backfill",
@@ -436,6 +441,10 @@ class BackfillContinueConfig(InternalActionConfiguration):
     runs_without_progress: int = 0
     # Set when this run handed over so a waiting pull could go first: the next run waits a moment.
     yield_to_pull: bool = False
+    # Which run of the chain this is: a run whose seq is behind the saved one is a duplicate and stops.
+    seq: int = 0
+    # Fingerprint of the pull filters the backfill started with; a change stops it.
+    filters: str = ""
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):
