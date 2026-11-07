@@ -2208,3 +2208,41 @@ async def test_a_pull_that_ran_clears_the_pull_waiting_note(mocker):
     await action_pull_events(_lock_test_integration(), _config())
 
     assert "pull_waiting" not in store
+
+
+# --- review round 5: the cursor floor says what it skipped; unconfirmed sightings are named ---
+
+
+@pytest.mark.asyncio
+async def test_a_pull_warns_when_the_cursor_floor_skips_a_gap(mocker):
+    stored = (datetime.now(tz=timezone.utc) - timedelta(days=20)).replace(microsecond=0)
+    _, _, _, mock_log = _pull_setup(mocker, 1, saved_state={"no-source": {STATE_LAST_RUN_KEY: stored.strftime(STATE_DATETIME_FMT)}})
+
+    await action_pull_events(_lock_test_integration(), _config())
+
+    warning = [c for c in mock_log.call_args_list if c.kwargs["level"] == LogLevel.WARNING][0]
+    assert warning.kwargs["title"].startswith("The pull started from ")
+    assert "(3 days ago) instead of where the previous pull ended" in warning.kwargs["title"]
+    assert warning.kwargs["title"].endswith("Run the backfill to create events for sightings uploaded in that window.")
+    assert warning.kwargs["data"]["skipped_from"] == stored.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_a_pull_whose_cursor_is_within_days_to_load_doesnt_warn(mocker):
+    stored = datetime.now(tz=timezone.utc) - timedelta(days=1)
+    _, _, _, mock_log = _pull_setup(mocker, 1, saved_state={"no-source": {STATE_LAST_RUN_KEY: stored.strftime(STATE_DATETIME_FMT)}})
+
+    await action_pull_events(_lock_test_integration(), _config())
+
+    assert not _titles(mock_log, LogLevel.WARNING)
+
+
+@pytest.mark.asyncio
+async def test_a_pull_names_the_unconfirmed_sightings_it_skips(mocker, caplog):
+    _pull_setup(mocker, 2, saved_state={"1": {"sending_since": "2026-11-05 10:00:00+0000"}})
+
+    with caplog.at_level(logging.WARNING, logger="app.actions.handlers"):
+        result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["events_extracted"] == 1
+    assert "may already have sent to Gundi" in caplog.text and "Observation ids: 1." in caplog.text

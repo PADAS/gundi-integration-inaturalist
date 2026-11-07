@@ -14,7 +14,7 @@ import pytest
 import stamina
 from gundi_client_v2.errors import AuthenticationError, GundiAPIError
 
-from app.services.retry_policies import is_transient_gundi_error
+from app.services.retry_policies import gundi_may_have_created, is_transient_gundi_error
 
 
 @pytest.fixture
@@ -155,3 +155,35 @@ async def test_registration_does_not_retry_a_rejected_registration(no_backoff, m
         await self_registration.register_integration_in_gundi(gundi_client=client, type_slug="acme_tracker")
 
     assert client.register_integration_type.await_count == 1
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.ReadTimeout("no answer"),
+    httpx.WriteTimeout("stalled mid-request"),
+    httpx.ReadError("reset mid-response"),
+    httpx.RemoteProtocolError("server closed the connection"),
+    asyncio.TimeoutError(),
+    asyncio.CancelledError(),
+    GundiAPIError(status_code=500),
+    GundiAPIError(status_code=502),
+    GundiAPIError(status_code=503),
+    GundiAPIError(status_code=504),
+    _status_error(503),
+])
+def test_a_failure_after_the_request_was_sent_may_have_created_the_records(exc):
+    assert gundi_may_have_created(exc) is True
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.ConnectError("refused"),
+    httpx.ConnectTimeout("no route"),
+    httpx.PoolTimeout("no free connection"),
+    GundiAPIError(status_code=429, detail="slow down"),
+    GundiAPIError(status_code=400, detail="bad payload"),
+    GundiAPIError(status_code=404),
+    AuthenticationError("keycloak 503", status_code=503),  # the token endpoint, not the data API
+    _status_error(404),
+    ValueError("not an HTTP problem at all"),
+])
+def test_a_failure_before_anything_reached_gundi_created_nothing(exc):
+    assert gundi_may_have_created(exc) is False

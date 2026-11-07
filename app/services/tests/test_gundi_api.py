@@ -218,10 +218,87 @@ def test_api_key_lookup_is_not_retried_on_its_own():
     """_get_gundi_api_key runs inside the send helpers' retry; a decorator of
     its own would nest a second GUNDI_API_RETRY inside the first and restart
     the inner attempts on every outer one, so a failing portal would cost up to
-    36 calls instead of 6 and blow the loop-overhead bound the tests above pin."""
+    36 calls instead of 6 and blow the loop-overhead bound the tests above pin.
+    send_events_to_gundi runs its one retry loop inline (its post is retried
+    only while nothing reached Gundi), so it is checked by source below."""
     assert not hasattr(_get_gundi_api_key, "__wrapped__")
-    for helper in (send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi, send_messages_to_gundi):
+    for helper in (send_observations_to_gundi, send_event_attachments_to_gundi, send_messages_to_gundi):
         assert hasattr(helper, "__wrapped__"), helper.__name__
+    assert not hasattr(send_events_to_gundi, "__wrapped__")
+    source = (_SERVICES_DIR / "gundi.py").read_text()
+    loops = re.findall(r"retry_context\(\*\*\{\*\*(\w+)", source)
+    assert loops == ["GUNDI_API_RETRY"], loops
+
+
+@pytest.fixture
+def no_backoff():
+    """stamina's testing mode: no sleeps between attempts, attempts capped."""
+    import stamina
+    stamina.set_testing(True, attempts=3)
+    yield
+    stamina.set_testing(False)
+
+
+def _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, post_outcomes):
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    sensors = mock_gundi_sensors_client_class.return_value
+    sensors.post_events = AsyncMock(side_effect=post_outcomes)
+    return sensors
+
+
+@pytest.mark.asyncio
+async def test_send_events_retries_a_post_that_never_reached_gundi(
+        no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
+):
+    from gundi_client_v2.errors import GundiAPIError
+
+    sensors = _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
+                      [httpx.ConnectError("refused"), GundiAPIError(status_code=429), [{"object_id": "g1"}]])
+
+    result = await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
+
+    assert result == [{"object_id": "g1"}]
+    assert sensors.post_events.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    pytest.param(httpx.ReadTimeout("no answer"), id="read timeout"),
+    pytest.param(httpx.RemoteProtocolError("connection closed"), id="connection closed"),
+    pytest.param(None, id="503"),  # built below: GundiAPIError isn't importable at collection in this list
+])
+async def test_send_events_does_not_retry_a_post_gundi_may_have_received(
+        no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, error,
+):
+    """Creating events twice is worse than failing the run: a timeout after the request was
+    sent, or a 5xx, is raised at once so the caller keeps the events marked as possibly sent."""
+    from gundi_client_v2.errors import GundiAPIError
+
+    error = error or GundiAPIError(status_code=503)
+    sensors = _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, [error, [{"object_id": "g1"}]])
+
+    with pytest.raises(type(error)):
+        await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
+
+    assert sensors.post_events.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_send_events_retries_the_key_lookup_on_a_portal_5xx(
+        no_backoff, mocker, mock_gundi_sensors_client_class,
+):
+    """The key lookup sends nothing to Gundi's data API, so a 503 from the portal is retried
+    even though the same status from the post itself is not."""
+    from gundi_client_v2.errors import GundiAPIError
+
+    key_lookup = AsyncMock(side_effect=[GundiAPIError(status_code=503), "api-key"])
+    sensors = _sender(mocker, mock_gundi_sensors_client_class, key_lookup, [[{"object_id": "g1"}]])
+
+    result = await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
+
+    assert result == [{"object_id": "g1"}]
+    assert key_lookup.await_count == 2 and sensors.post_events.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,7 @@ from app.services.gundi import (
     send_events_to_gundi,
     update_event_in_gundi,
 )
+from app.services.retry_policies import gundi_may_have_created
 from app.datasource.inaturalist import (
     INatRequestError,
     INatUnavailableError,
@@ -132,6 +133,21 @@ def _stored_cursor(state: dict) -> Optional[datetime]:
         return datetime.strptime(raw, STATE_DATETIME_FMT)
     except (TypeError, ValueError):
         return None
+
+
+async def _warn_cursor_floor(integration: Integration, cursor: datetime, floor: datetime, days_to_load: int):
+    """The saved cursor was older than days_to_load: the pull starts at the floor, and sightings
+    added or changed in between are not read (they are the backfill's to create)."""
+    msg = (f"The pull started from {_utc_minute(floor)} UTC ({days_to_load} days ago) instead of where the "
+           f"previous pull ended ({_utc_minute(cursor)} UTC), so sightings added or changed on iNaturalist "
+           f"between those times were not read. Run the backfill to create events for sightings uploaded "
+           f"in that window.")
+    logger.warning(f"{msg} Integration ID: {integration.id}.")
+    await _publish_progress_log(
+        integration, msg, LogLevel.WARNING,
+        {"skipped_from": cursor.isoformat(), "skipped_to": floor.isoformat(), "days_to_load": days_to_load},
+        "cursor-floor warning",
+    )
 
 
 def _build_pull_events_state(last_updated: datetime) -> dict:
@@ -483,6 +499,9 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
     # For cursor_lag_days when this run saves no cursor of its own: the stored
     # one, not load_since, whose days_to_load floor would hide how far behind it is.
     previous_cursor = _stored_cursor(state)
+    if previous_cursor is not None and previous_cursor < load_since:
+        # The floor skipped a gap (spec D4): say so, or nobody knows to run the backfill.
+        await _warn_cursor_floor(integration, previous_cursor, load_since, action_config.days_to_load)
 
     # The budget covers the iNaturalist calls too: a thread can't be stopped,
     # but the run stops waiting for it.
@@ -602,6 +621,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 progress.skipped_too_old += chunk_outcomes.count("too_old")
                 progress.skipped_unchanged += chunk_outcomes.count("unchanged")
                 progress.skipped_unconfirmed += chunk_outcomes.count("unconfirmed")
+                _warn_unconfirmed(integration, [ob.id for ob in chunk if outcomes.get(ob.id) == "unconfirmed"])
             if stopped_on_time or gundi_partial:
                 break
     except (INatUnavailableError, INatRequestError) as e:
@@ -721,6 +741,19 @@ async def _sort_observation(integration: Integration, action_config: PullEventsC
     return "update"
 
 
+def _warn_unconfirmed(integration: Integration, inat_ids: list):
+    """Name the observations a run skips because an earlier run was cut off while sending
+    them (B13): they may be in Gundi without a state row, so nothing finds them otherwise."""
+    if not inat_ids:
+        return
+    logger.warning(
+        f"Skipped {len(inat_ids)} iNaturalist observations that a run cut off while sending them may already "
+        f"have sent to Gundi; they are never sent again or updated. Look them up in EarthRanger by inat_id. "
+        f"Integration ID: {integration.id}. Observation ids: {', '.join(str(i) for i in inat_ids)}.",
+        extra={"integration_id": str(integration.id), "attention_needed": True},
+    )
+
+
 async def _send_new_observations(integration, action_config, observations, progress: _PullProgress):
     """Send one chunk of new observations and save their state, listing each
     one's photos as pending; then start a photo run to add them. Recording the
@@ -780,12 +813,20 @@ async def _send_marked(integration_id: str, inat_ids: List[str], events: List[di
         raise
     try:
         response = await send_events_to_gundi(events=events, integration_id=integration_id) or []
-    except (asyncio.CancelledError, asyncio.TimeoutError, httpx.TimeoutException):
-        # Cut off or timed out waiting for Gundi's answer: Gundi may have created them,
-        # so the notes stay and these sightings are never sent again.
-        raise
-    except Exception:
-        # Gundi answered with an error, or the request never got through: nothing was created.
+    except BaseException as e:
+        if gundi_may_have_created(e):
+            # Cut off, timed out waiting for Gundi's answer, or Gundi's side failed after the
+            # request reached it: it may have created them, so the notes stay and these
+            # sightings are never sent again. Their ids are logged here, once, so they can be
+            # looked up in EarthRanger (by inat_id) if an event is missing.
+            logger.warning(
+                f"Gundi may have created events for {len(inat_ids)} iNaturalist observations before the send "
+                f"failed ({e!r}); they stay marked as sent and are never sent again. Integration ID: "
+                f"{integration_id}. Observation ids: {', '.join(inat_ids)}.",
+                extra={"integration_id": integration_id, "attention_needed": True},
+            )
+            raise
+        # The request never got through, or Gundi refused it: nothing was created.
         await _clear_sending(integration_id, inat_ids)
         raise
     await _clear_sending(integration_id, inat_ids[len(response):])
@@ -1032,7 +1073,16 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
     the rows it creates with its job key)."""
     inat_updated_at_map = inat_updated_at_map or {}
     pending_photos = pending_photos or {}
+    # Gundi has these events, so every row that can be saved is saved: a row left with only its
+    # "being sent" note is never sent again and never patched. One failed row (after the state
+    # manager's own retries) is treated as a hiccup and the rest are still tried; a second one
+    # means Redis is down, and waiting on it for each remaining row would outlast the run.
+    failures = []  # (inat_id, exception)
+    unsaved = []
     for saved_event, event in zip(response, events):
+        if len(failures) >= 2:
+            unsaved.append(event.get("event_details", {}).get("inat_id", "unknown"))
+            continue
         try:
             event_id = event["event_details"]["inat_id"]
             state = dict(saved_event)
@@ -1064,7 +1114,16 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
-            raise e
+            failures.append((inat_id, e))
+    if failures:
+        left = [inat_id for inat_id, _ in failures] + unsaved
+        logger.error(
+            f"Gundi created events for {len(left)} iNaturalist observations whose state could not be saved; "
+            f"they stay marked as being sent and are never sent again or updated. Look them up in EarthRanger "
+            f"by inat_id. Integration ID: {integration.id}. Observation ids: {', '.join(left)}.",
+            extra={"integration_id": str(integration.id), "attention_needed": True},
+        )
+        raise failures[0][1]
 
 
 async def save_patched_events_state(events_to_patch, integration, action_config: PullEventsConfig):
@@ -1351,16 +1410,6 @@ async def action_backfill_events_continue(integration: Integration, action_confi
     return await _backfill(integration, action_config)
 
 
-async def _lock_held_by_backfill(integration_id: str, key: str) -> bool:
-    """True when the connection's run lock is held by a run of this backfill. A pull's lock
-    value is a plain token, which doesn't read as JSON; that counts as someone else."""
-    try:
-        holder = await state_manager.get_state(integration_id, "pull_events", STATE_RUN_LOCK_SOURCE_ID)
-    except Exception:
-        return False
-    return isinstance(holder, dict) and holder.get("backfill") == key
-
-
 async def _backfill_is_current(integration_id: str, job: BackfillContinueConfig) -> bool:
     """False once a different backfill was started for this connection (its window replaced
     this one in backfill_current). Kept apart from the position key, so checkpoint writes can't
@@ -1436,18 +1485,19 @@ async def _backfill(integration: Integration, job: BackfillContinueConfig,
     while not await state_manager.set_if_absent(
             integration_id, "pull_events", ttl_seconds=RUN_LOCK_TTL_SECONDS, source_id=STATE_RUN_LOCK_SOURCE_ID,
             value=lock_token):
-        if await _lock_held_by_backfill(integration_id, key):
-            # Another delivery of this same backfill holds the lock (Pub/Sub delivers at least once):
-            # that run hands over or finishes, so this copy has nothing to do.
-            logger.info(f"Backfill {key} for integration ID: {integration_id} is already running in another run; "
-                        f"this copy does nothing.")
+        # The holder may be a pull, or another delivery of this same backfill (Pub/Sub delivers at
+        # least once). A copy can't tell a running sibling from one that was cut off before it
+        # released the lock, so it waits for the lock either way: a running sibling hands over or
+        # finishes, which this copy sees below and leaves quietly; a cut-off one leaves its lock to
+        # expire, after which this copy (or the continuation it hands over) picks the chain up.
+        if await _backfill_is_stale(integration_id, job):
+            # This backfill's own other run has moved on (or it ended): nothing to do.
+            logger.info(f"Backfill {key} for integration ID: {integration_id} was continued or ended by another "
+                        f"run; this copy does nothing.")
             return _backfill_result(0, job, False, None)
         if time.monotonic() + BACKFILL_LOCK_WAIT_SECONDS < deadline:
             await asyncio.sleep(BACKFILL_LOCK_WAIT_SECONDS)
             continue
-        if await _backfill_is_stale(integration_id, job):
-            # The lock was held by this backfill's own other run, which has moved on.
-            return _backfill_result(0, job, False, None)
         # Copies of the same message that all waited: only the first one to claim this wait
         # hands over (or reports the stop), so they never start parallel chains.
         if not await state_manager.set_if_absent(
@@ -1508,6 +1558,11 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
         job.batch_index, job.after_id = saved["batch_index"], saved["after_id"]
     # Where the saved position got to, so a retry that stops at once still says it.
     saved_up_to = datetime.fromisoformat(saved["uploaded_up_to"]) if saved.get("uploaded_up_to") else None
+    if not await _backfill_is_current(integration_id, job):
+        # Replaced by a different start: checked before the first iNaturalist read, not only
+        # between chunks, so a stale copy doesn't spend a page read before stopping.
+        logger.info(f"Backfill {key} for integration ID: {integration_id} was replaced by a newer one; stopping.")
+        return _backfill_result(0, job, False, saved_up_to)
     # The seq moves on only when this run hands over (see below), so a copy of this message
     # redelivered after a cut-off run can still pick the chain up from the saved position.
     start = (job.batch_index, job.after_id)
@@ -1529,6 +1584,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
     uploaded_up_to = saved_up_to
     batch_count = 1
     pages_read = 0
+    rejected = 0  # events of the last chunk sent that Gundi didn't accept
     outcome = None  # "limit", "finished", "handover" or "pull"
     try:
         while outcome is None:
@@ -1563,6 +1619,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                     break
                 to_add = []
                 recovered = []  # ids created by this backfill after its last saved position
+                unconfirmed = []  # ids a cut-off run may already have sent (B13)
                 last_seen = None
                 for ob in chunk:
                     if job.created_so_far + len(recovered) + len(to_add) >= job.max_events:
@@ -1572,6 +1629,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                         continue
                     row = await state_manager.get_state(integration_id, "pull_events", str(ob.id))
                     if row:
+                        if not row.get("object_id") and row.get(STATE_SENDING_KEY):
+                            unconfirmed.append(ob.id)
                         # Created by this backfill, in this taxa group, after its last saved position (a run
                         # that stopped between saving the event and saving its count): counted below.
                         if (row.get("backfill_job") == key and row.get("backfill_batch") == job.batch_index
@@ -1579,6 +1638,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                             recovered.append(ob.id)
                         continue
                     to_add.append(ob)
+                _warn_unconfirmed(integration, unconfirmed)
                 if to_add:
                     events = [_transform_inat_to_gundi_event(ob, pull_config) for ob in to_add]
                     response = await _send_marked(integration_id, [str(ob.id) for ob in to_add], events)
@@ -1594,6 +1654,7 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                     job.created_so_far += accepted
                     if accepted < len(to_add):
                         # Gundi took part of the chunk: resume right after the last one it took.
+                        rejected = len(to_add) - accepted
                         last_seen = to_add[accepted - 1] if accepted else None
                         outcome = "handover"
                 # Only recovered sightings up to where the next run resumes: the rest are met again then.
@@ -1649,16 +1710,30 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
         else:
             job.runs_without_progress = 0
         if job.runs_without_progress >= BACKFILL_MAX_RUNS_WITHOUT_PROGRESS:
+            # Worded by what stopped this run: a repeated chunk Gundi won't take is Gundi's
+            # problem, not iNaturalist's.
+            if rejected:
+                why = (f"{job.runs_without_progress} runs in a row made no progress; the last one sent "
+                       f"{_count(rejected, 'event', 'events')} that Gundi didn't accept")
+            else:
+                why = (f"{job.runs_without_progress} runs in a row couldn't read anything new from "
+                       f"iNaturalist in time")
             await _backfill_log(
                 integration, LogLevel.ERROR,
-                f"The backfill stopped after creating {job.created_so_far:,} events because "
-                f"{job.runs_without_progress} runs in a row couldn't read anything new from iNaturalist in time. "
+                f"The backfill stopped after creating {job.created_so_far:,} events because {why}. "
                 f"Run it again later; sightings already sent are skipped.", _backfill_data(job, uploaded_up_to))
             return _backfill_result(created, job, False, uploaded_up_to)
         followups.append(("backfill_events_continue", job))
-        logs.append((LogLevel.INFO,
-                     f"Backfill continues in a new run: {job.created_so_far:,} events created so far for sightings "
-                     f"uploaded {window}" + (f"; {reached}." if reached else "."), _backfill_data(job, uploaded_up_to)))
+        so_far = (f"{job.created_so_far:,} events created so far for sightings uploaded {window}"
+                  + (f"; {reached}." if reached else "."))
+        if rejected:
+            logs.append((LogLevel.WARNING,
+                         f"Gundi didn't accept {_count(rejected, 'event', 'events')} the backfill sent, so it "
+                         f"continues in a new run from there and sends them again: {so_far}",
+                         _backfill_data(job, uploaded_up_to)))
+        else:
+            logs.append((LogLevel.INFO, f"Backfill continues in a new run: {so_far}",
+                         _backfill_data(job, uploaded_up_to)))
         return _backfill_result(created, job, False, uploaded_up_to)
 
     # Kept, not deleted: a late or repeated message for this backfill then does nothing.

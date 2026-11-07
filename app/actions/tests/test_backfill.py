@@ -2,7 +2,9 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from gundi_client_v2.errors import GundiAPIError
 from gundi_core.schemas.v2 import LogLevel
 
 from app.actions import handlers
@@ -984,23 +986,68 @@ async def test_a_replaced_backfill_doesnt_hand_over(backfill, mocker):
 
 
 @pytest.mark.asyncio
-async def test_a_copy_of_a_running_backfill_exits_without_waiting_or_logging(backfill, mocker):
+async def test_a_copy_of_a_running_backfill_waits_and_leaves_quietly_once_the_chain_moved_on(backfill, mocker):
+    """Pub/Sub delivered the same run twice: the copy can't tell a running sibling from one cut
+    off with the lock, so it waits; the sibling hands over (seq moves on) and the copy leaves."""
+    job = _job(seq=2)
+    key = handlers._backfill_key(job)
     slept = []
 
     async def sleep(seconds):
         slept.append(seconds)
+        backfill.store[key] = {"seq": 3, "batch_index": 0, "after_id": 1, "created_so_far": 1}
     _fake_asyncio(mocker, sleep=sleep)
-    job = _job(seq=2)
     backfill.lock_free = [False]
-    backfill.store["run_lock"] = {"backfill": handlers._backfill_key(job), "token": "other-copy"}
+    backfill.store["run_lock"] = {"backfill": key, "token": "other-copy"}
     backfill.pages = [(0, 1, [_ob(1)])]
 
     result = await handlers._backfill(_integration(), job)
 
-    assert not slept and not _titles(backfill)
+    assert len(slept) == 1 and not _titles(backfill)
     backfill.trigger.assert_not_called()
     backfill.send.assert_not_called()
     assert result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_copy_of_a_backfill_cut_off_with_the_lock_picks_the_chain_up_when_the_lock_expires(backfill, mocker):
+    """The run holding the lock died (the instance was killed) before releasing it: its
+    redelivered copy waits the lock out and continues, so the chain isn't stranded (B11)."""
+    async def sleep(seconds):
+        pass
+    _fake_asyncio(mocker, sleep=sleep)
+    job = _job(seq=2)
+    backfill.lock_free = [False, True]  # taken by the dead run, then expired
+    backfill.store["run_lock"] = {"backfill": handlers._backfill_key(job), "token": "dead-run"}
+    backfill.store[handlers._backfill_key(job)] = {"seq": 2, "batch_index": 0, "after_id": 0, "created_so_far": 0}
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    backfill.send.assert_called_once()
+    assert result["result"]["events_extracted"] == 1 and result["result"]["backfill_finished"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_copy_that_waits_out_its_budget_on_its_own_backfills_lock_hands_over(backfill, mocker):
+    """The dead run's lock outlives this copy's budget: it hands over like it would for a
+    pull, so a later run gets the lock once it expires."""
+    clock = [1000.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+    mocker.patch.object(handlers, "time", MagicMock(monotonic=lambda: clock[0]))
+    mocker.patch.object(handlers, "BACKFILL_LOCK_WAIT_SECONDS", 10)  # the fixture sets 0
+    _fake_asyncio(mocker, sleep=sleep)
+    job = _job(seq=2)
+    backfill.lock_free = [False]
+    backfill.store["run_lock"] = {"backfill": handlers._backfill_key(job), "token": "dead-run"}
+
+    await handlers._backfill(_integration(), job)
+
+    handed = [c for c in backfill.trigger.call_args_list if c.args[1] == "backfill_events_continue"]
+    assert len(handed) == 1 and handed[0].args[2].lock_waits == 1 and handed[0].args[2].seq == 2
+    assert [t for t in _titles(backfill, LogLevel.INFO) if t.startswith("The backfill is waiting")]
 
 
 @pytest.mark.asyncio
@@ -1049,3 +1096,145 @@ async def test_the_saved_position_carries_the_last_upload_date(backfill):
     await handlers._backfill(_integration(), job)
 
     assert backfill.store[handlers._backfill_key(job)]["uploaded_up_to"] == _ob(2).created_at.isoformat()
+
+
+# --- review round 5: send retries, stranded rows, replaced chains, Gundi rejections ---
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_backfill_stops_before_reading_inaturalist(backfill):
+    job = _job()
+    backfill.store["backfill_current"] = {"created_to": (END + timedelta(hours=1)).isoformat()}
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    backfill.read.assert_not_called()
+    backfill.send.assert_not_called()
+    backfill.trigger.assert_not_called()
+    assert not _titles(backfill) and result["result"]["events_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_chunk_gundi_rejects_is_reported_when_the_backfill_hands_over(backfill):
+    backfill.send.side_effect = lambda events, integration_id: []
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    job = backfill.trigger.call_args.args[2]
+    assert job.runs_without_progress == 1 and job.after_id == 0
+    warning = _titles(backfill, LogLevel.WARNING)[-1]
+    assert warning.startswith("Gundi didn't accept 2 events the backfill sent, so it continues in a new run")
+
+
+@pytest.mark.asyncio
+async def test_a_backfill_that_stops_on_a_chunk_gundi_rejects_blames_gundi(backfill):
+    backfill.send.side_effect = lambda events, integration_id: []
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    result = await handlers._backfill(_integration(), _job(runs_without_progress=2))
+
+    backfill.trigger.assert_not_called()
+    assert result["result"]["backfill_finished"] is False
+    error = _titles(backfill, LogLevel.ERROR)[-1]
+    assert "3 runs in a row made no progress; the last one sent 1 event that Gundi didn't accept" in error
+    assert "iNaturalist" not in error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_notes_stay_when_gundi_fails_after_the_request_reached_it(backfill, status):
+    """A 5xx can come after Gundi committed (a gateway's 502/504, a partial publish): the
+    events may exist, so the sightings are never sent again."""
+    backfill.send.side_effect = GundiAPIError(status_code=status)
+
+    with pytest.raises(GundiAPIError):
+        await handlers._send_marked("i", ["1", "2"], [{}, {}])
+
+    assert "sending_since" in backfill.store["1"] and "sending_since" in backfill.store["2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    pytest.param(httpx.ConnectError("refused"), id="no connection"),
+    pytest.param(GundiAPIError(status_code=429), id="429"),
+    pytest.param(GundiAPIError(status_code=400), id="400"),
+])
+async def test_notes_are_cleared_when_the_request_never_reached_gundi(backfill, error):
+    backfill.send.side_effect = error
+
+    with pytest.raises(Exception):
+        await handlers._send_marked("i", ["1", "2"], [{}, {}])
+
+    assert "1" not in backfill.store and "2" not in backfill.store
+
+
+@pytest.mark.asyncio
+async def test_the_sightings_a_kept_note_covers_are_logged_once(backfill, caplog):
+    import httpx
+    import logging
+
+    backfill.send.side_effect = httpx.ReadTimeout("slow")
+
+    with caplog.at_level(logging.WARNING, logger="app.actions.handlers"):
+        with pytest.raises(httpx.ReadTimeout):
+            await handlers._send_marked("i", ["11", "12"], [{}, {}])
+
+    assert "Observation ids: 11, 12" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_cant_be_saved_doesnt_strand_the_rest_of_the_chunk(backfill, caplog):
+    """Gundi took the chunk; Redis failed on one row: the others are still saved, the
+    stranded one is named."""
+    import logging
+
+    real_set = backfill.state.set_state.side_effect
+
+    async def flaky_set(integration_id, action_id, state, source_id="no-source"):
+        if source_id == "2":
+            raise RuntimeError("Redis hiccup")
+        return await real_set(integration_id, action_id, state, source_id)
+    backfill.state.set_state.side_effect = flaky_set
+    events = [{"event_details": {"inat_id": str(i)}} for i in (1, 2, 3)]
+    response = [{"object_id": f"g{i}"} for i in (1, 2, 3)]
+
+    with caplog.at_level(logging.ERROR, logger="app.actions.handlers"):
+        with pytest.raises(RuntimeError):
+            await handlers.save_events_state(response, events, _integration())
+
+    assert backfill.store["1"]["object_id"] == "g1" and backfill.store["3"]["object_id"] == "g3"
+    assert "2" not in backfill.store
+    assert "Observation ids: 2." in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_two_rows_that_cant_be_saved_stop_the_save_and_name_the_rest(backfill, caplog):
+    import logging
+
+    async def failing_set(integration_id, action_id, state, source_id="no-source"):
+        raise RuntimeError("Redis is down")
+    backfill.state.set_state.side_effect = failing_set
+    events = [{"event_details": {"inat_id": str(i)}} for i in (1, 2, 3, 4)]
+    response = [{"object_id": f"g{i}"} for i in (1, 2, 3, 4)]
+
+    with caplog.at_level(logging.ERROR, logger="app.actions.handlers"):
+        with pytest.raises(RuntimeError):
+            await handlers.save_events_state(response, events, _integration())
+
+    assert backfill.state.set_state.call_count == 2
+    assert "Observation ids: 1, 2, 3, 4." in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_backfill_names_the_unconfirmed_sightings_it_skips(backfill, caplog):
+    import logging
+
+    backfill.store["1"] = {"sending_since": "2026-11-05 10:00:00+0000"}
+    backfill.pages = [(0, 1, [_ob(1), _ob(2)])]
+
+    with caplog.at_level(logging.WARNING, logger="app.actions.handlers"):
+        await handlers._backfill(_integration(), _job())
+
+    assert "may already have sent to Gundi" in caplog.text and "Observation ids: 1." in caplog.text

@@ -122,6 +122,10 @@ When changing state, preserve backward-compat reads of the legacy `"updated_to"`
 
 - **`taxa` is a list in the config model and a comma-separated string at the datasource.** Downstream code uses `action_config.taxa_str`; coerce at the config boundary, do not branch on shape downstream.
 - New per-observation state must continue to be addressed by `source_id=str(inat_id)` so existing rows are found.
+- `send_events_to_gundi` retries the post only while nothing can have reached Gundi (`gundi_may_have_created` in
+  `app/services/retry_policies.py`): a timeout after the request was sent, or a 5xx, is raised at once and
+  `_send_marked` keeps the "being sent" notes. Creating events is not idempotent, so do not put the plain
+  `@stamina.retry(**GUNDI_API_RETRY)` back on it or wrap it in another retry.
 - Photo downloads use `verify=False` deliberately — iNat's photo CDN has had cert issues in the past. Do not "fix" without testing against production photo URLs.
 - The pull action returns `{"result": {"events_extracted": int, "events_updated": int, "photos_attached": int, ...}}` — these three numbers are used by Gundi monitoring; preserve them. It also returns `events_skipped_too_old`, `events_skipped_unchanged`, `photos_left_out` and `cursor_lag_days`.
 - Pull limits live on the connection (`PullEventsConfig`): `max_age_days` (150, about 5 months), `max_photos` (3, first photos in iNaturalist order; 0 = none) and `max_new_events_per_run` (defaults to `INAT_MAX_NEW_EVENTS_PER_PULL`). Design: `docs/superpowers/specs/2026-11-05-pull-limits-design.md`.

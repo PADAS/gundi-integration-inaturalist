@@ -10,6 +10,7 @@ time.sleep, which inside a coroutine stalls the whole event loop for the
 length of the back-off.
 """
 # app.settings before gundi_client_v2 (see app/services/errors.py).
+import asyncio
 from typing import Optional
 
 from app import settings  # noqa: F401
@@ -29,6 +30,33 @@ def _retryable_status(status_code: int) -> bool:
     # 429 and 5xx are the server's problem for now. Any other status is a
     # definite answer that will not change on the next attempt.
     return status_code == 429 or status_code >= 500
+
+
+def gundi_may_have_created(exc: BaseException) -> bool:
+    """Whether a request that creates records in Gundi, and failed with
+    ``exc``, may still have reached Gundi and created them.
+
+    Creating events is not idempotent: sending the same batch again after
+    such a failure can create every event twice, which the pull's "no
+    duplicate events" rule (spec B13) forbids. The answer is "may have" when
+    the request was on its way and the answer never came back (the run was
+    cancelled, a read or write timed out, the server closed the connection)
+    or when Gundi's side answered 5xx: a gateway answers 502 or 504 after the
+    backend committed, and a 500 can follow a partial publish. It is "no"
+    when nothing was sent: no connection (refused, connect timeout, no free
+    connection, proxy), a 429, or a definite 4xx.
+    """
+    if isinstance(exc, (asyncio.CancelledError, asyncio.TimeoutError, TimeoutError)):
+        return True
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError,
+                        httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+        return False
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, AuthenticationError):
+        return False  # the token endpoint, not Gundi's data API
+    status_code = source_status_code(exc)
+    return status_code is not None and status_code >= 500
 
 
 def is_transient_gundi_error(exc: BaseException) -> bool:
