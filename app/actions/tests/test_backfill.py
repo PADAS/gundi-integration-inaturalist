@@ -1143,13 +1143,14 @@ async def test_a_backfill_that_stops_on_a_chunk_gundi_rejects_blames_gundi(backf
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [500, 502, 503, 504])
-async def test_notes_stay_when_gundi_fails_after_the_request_reached_it(backfill, status):
-    """A 5xx can come after Gundi committed (a gateway's 502/504, a partial publish): the
-    events may exist, so the sightings are never sent again."""
-    backfill.send.side_effect = GundiAPIError(status_code=status)
+@pytest.mark.parametrize("error", [
+    pytest.param(httpx.RemoteProtocolError("connection closed"), id="connection closed"),
+    pytest.param(httpx.WriteTimeout("stalled"), id="write timeout"),
+])
+async def test_notes_stay_when_the_answer_was_lost_after_sending(backfill, error):
+    backfill.send.side_effect = error
 
-    with pytest.raises(GundiAPIError):
+    with pytest.raises(type(error)):
         await handlers._send_marked("i", ["1", "2"], [{}, {}])
 
     assert "sending_since" in backfill.store["1"] and "sending_since" in backfill.store["2"]
@@ -1160,8 +1161,11 @@ async def test_notes_stay_when_gundi_fails_after_the_request_reached_it(backfill
     pytest.param(httpx.ConnectError("refused"), id="no connection"),
     pytest.param(GundiAPIError(status_code=429), id="429"),
     pytest.param(GundiAPIError(status_code=400), id="400"),
+    # Gundi answered (after send_events_to_gundi's own retries): a 5xx is treated as nothing created.
+    pytest.param(GundiAPIError(status_code=503), id="503"),
+    pytest.param(GundiAPIError(status_code=504), id="504"),
 ])
-async def test_notes_are_cleared_when_the_request_never_reached_gundi(backfill, error):
+async def test_notes_are_cleared_when_gundi_answered_or_was_never_reached(backfill, error):
     backfill.send.side_effect = error
 
     with pytest.raises(Exception):

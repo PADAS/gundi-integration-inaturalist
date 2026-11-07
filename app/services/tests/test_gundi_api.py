@@ -3,6 +3,7 @@ import httpx
 from pathlib import Path
 import re
 import pytest
+import stamina
 from app.services.gundi import (
     send_events_to_gundi,
     send_observations_to_gundi,
@@ -233,7 +234,6 @@ def test_api_key_lookup_is_not_retried_on_its_own():
 @pytest.fixture
 def no_backoff():
     """stamina's testing mode: no sleeps between attempts, attempts capped."""
-    import stamina
     stamina.set_testing(True, attempts=3)
     yield
     stamina.set_testing(False)
@@ -254,28 +254,27 @@ async def test_send_events_retries_a_post_that_never_reached_gundi(
     from gundi_client_v2.errors import GundiAPIError
 
     sensors = _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
-                      [httpx.ConnectError("refused"), GundiAPIError(status_code=429), [{"object_id": "g1"}]])
+                      [httpx.ConnectError("refused"), GundiAPIError(status_code=429), GundiAPIError(status_code=503),
+                       [{"object_id": "g1"}]])
+    stamina.set_testing(True, attempts=4)
 
     result = await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
 
     assert result == [{"object_id": "g1"}]
-    assert sensors.post_events.await_count == 3
+    assert sensors.post_events.await_count == 4
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [
     pytest.param(httpx.ReadTimeout("no answer"), id="read timeout"),
     pytest.param(httpx.RemoteProtocolError("connection closed"), id="connection closed"),
-    pytest.param(None, id="503"),  # built below: GundiAPIError isn't importable at collection in this list
 ])
-async def test_send_events_does_not_retry_a_post_gundi_may_have_received(
+async def test_send_events_does_not_retry_a_post_whose_answer_was_lost(
         no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, error,
 ):
     """Creating events twice is worse than failing the run: a timeout after the request was
-    sent, or a 5xx, is raised at once so the caller keeps the events marked as possibly sent."""
-    from gundi_client_v2.errors import GundiAPIError
-
-    error = error or GundiAPIError(status_code=503)
+    sent, or a closed connection, is raised at once so the caller keeps the events marked as
+    possibly sent."""
     sensors = _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, [error, [{"object_id": "g1"}]])
 
     with pytest.raises(type(error)):

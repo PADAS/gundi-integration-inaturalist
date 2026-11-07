@@ -102,11 +102,12 @@ async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     sending it again can create every event a second time, and the pull's
     "no duplicate events" rule (spec B13) rests on never doing that. So this
     helper runs GUNDI_API_RETRY with one difference from the others: a
-    failure of the post itself is tried again only while nothing can have
-    reached Gundi (no connection, a 429; see gundi_may_have_created). A
-    timeout waiting for the answer, or a 5xx, is raised at once, and the
-    caller keeps the events marked as possibly sent. The API-key lookup
-    before the post sends nothing and is tried again on any transient error.
+    failure of the post itself is tried again only when Gundi answered (a
+    429 or 5xx) or was never reached (see gundi_may_have_created). A lost
+    answer (a timeout after the request was sent, a closed connection) is
+    raised at once, and the caller keeps the events marked as possibly
+    sent. The API-key lookup before the post sends nothing and is tried
+    again on any transient error.
     :param events: A list of events in the following format:
     [
         {

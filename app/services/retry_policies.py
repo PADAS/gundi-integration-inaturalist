@@ -39,24 +39,20 @@ def gundi_may_have_created(exc: BaseException) -> bool:
     Creating events is not idempotent: sending the same batch again after
     such a failure can create every event twice, which the pull's "no
     duplicate events" rule (spec B13) forbids. The answer is "may have" when
-    the request was on its way and the answer never came back (the run was
-    cancelled, a read or write timed out, the server closed the connection)
-    or when Gundi's side answered 5xx: a gateway answers 502 or 504 after the
-    backend committed, and a 500 can follow a partial publish. It is "no"
-    when nothing was sent: no connection (refused, connect timeout, no free
-    connection, proxy), a 429, or a definite 4xx.
+    the request was on its way and the answer never came back: the run was
+    cancelled, a read or write timed out, or the server closed the
+    connection. Any answer, a 5xx included, counts as "no": Gundi's sensors
+    API answers 5xx before it publishes, and retrying a 5xx is worth more
+    (an outage otherwise leaves every chunk's sightings unsent) than the
+    rare gateway 502/504 after a commit it can't rule out. No connection
+    (refused, connect timeout, no free connection, proxy) is "no" too.
     """
     if isinstance(exc, (asyncio.CancelledError, asyncio.TimeoutError, TimeoutError)):
         return True
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError,
                         httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
         return False
-    if isinstance(exc, httpx.TransportError):
-        return True
-    if isinstance(exc, AuthenticationError):
-        return False  # the token endpoint, not Gundi's data API
-    status_code = source_status_code(exc)
-    return status_code is not None and status_code >= 500
+    return isinstance(exc, httpx.TransportError)
 
 
 def is_transient_gundi_error(exc: BaseException) -> bool:
