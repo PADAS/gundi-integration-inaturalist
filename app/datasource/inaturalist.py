@@ -521,3 +521,53 @@ def iter_observation_pages(
     ordered = sorted(everything.values(), key=lambda o: o.updated_at or since)
     for i in range(0, len(ordered), INAT_PAGE_SIZE):
         yield ordered[i:i + INAT_PAGE_SIZE]
+
+
+def iter_upload_pages(
+    created_from: datetime,
+    created_to: datetime,
+    *,
+    batch_index: int = 0,
+    after_id: int = 0,
+    bounding_box: Optional[List[float]] = None,
+    taxa: Optional[str] = None,
+    projects: Optional[List[str]] = None,
+    quality_grade: Optional[List[str]] = None,
+    annotations: Optional[Dict] = None,
+) -> Iterator[Tuple[int, int, List[Observation]]]:
+    """Pages of observations uploaded between created_from and created_to, in
+    upload order (id ascending), as (taxa batch index, number of batches, page).
+
+    Paging is by id (id_above), so there is no 10,000-result limit and a caller
+    can resume exactly: start again at batch_index with after_id. Later taxa
+    batches start from the beginning of the window. Pages are not
+    annotation-filtered, like iter_observation_pages.
+    """
+    fields = ",".join(OBSERVATION_FIELDS)
+    base_params, batches = _observation_query(created_from, bounding_box, taxa, projects, quality_grade, annotations)
+    for key in ("updated_since", "order_by", "order"):
+        base_params.pop(key, None)
+    base_params.update({
+        "created_d1": created_from.isoformat(),
+        "created_d2": created_to.isoformat(),
+        "order_by": "id",
+        "order": "asc",
+        "per_page": INAT_PAGE_SIZE,
+        "fields": fields,
+    })
+    for index in range(batch_index, len(batches)):
+        params = {**base_params}
+        if batches[index]:
+            params["taxon_id"] = batches[index]
+        last_id = after_id if index == batch_index else 0
+        while True:
+            response = _call_inat(**params, **({"id_above": last_id} if last_id else {}))
+            observations = Observation.from_json_list(response)
+            if not observations:
+                break
+            logger.info("Loaded %s uploaded observations from iNaturalist before annotation filters.",
+                        len(observations))
+            last_id = observations[-1].id
+            yield index, len(batches), observations
+            if len(observations) < INAT_PAGE_SIZE:
+                break  # a short page is the last one; saves asking for an empty one

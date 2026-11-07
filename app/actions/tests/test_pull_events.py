@@ -27,13 +27,18 @@ async def test_execute_pull_observations_action(
     mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
     mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
     mocker.patch("app.datasource.inaturalist.get_observations_v2", mock_get_observations_v2)
+    # Gundi answers one created event per event sent.
+    mock_gundi_sensors_client_class.return_value.post_events.side_effect = lambda data: async_return(
+        [{"object_id": f"event-{i}", "created_at": "2024-07-04T13:15:26Z", "updated_at": None}
+         for i, _ in enumerate(data)])
+    mock_state_manager.delete_state.return_value = async_return(None)
 
     response = await execute_action(
         integration_id=str(inaturalist_integration_v2.id),
         action_id="pull_events"
     )
     assert "result" in response
-    assert response["result"].get("events_extracted") == 2
+    assert response["result"].get("events_extracted") == 7
     assert response["result"].get("events_updated") == 0
     # Photos are added by a separate photo run, started with the new observations that have photos.
     assert response["result"].get("photos_attached") == 0
@@ -48,8 +53,10 @@ async def test_execute_pull_observations_action(
         if getattr(c.kwargs["event"].payload, "title", None)
     ]
     summary = next(t for t in titles if t.startswith("Pull finished in "))
-    assert ("It sent 2 new iNaturalist observations to Gundi and updated 0, "
-            "and handed their 5 photos to a separate photo run") in summary
+    # Up to three photos per sighting by default; the rest are counted, not sent.
+    assert response["result"].get("photos_left_out") == 1
+    assert ("It sent 7 new iNaturalist observations to Gundi and updated 0, "
+            "and handed their 12 photos to a separate photo run (1 left out by the photo limit)") in summary
     assert "iNaturalist took " in summary
 
 
@@ -250,6 +257,10 @@ def test_actions_register_with_inaturalist_titles():
     assert titles["list_projects"] == "List Nearby iNaturalist Projects"
     assert titles["list_annotation_terms"] == "List iNaturalist Annotation Terms"
     assert titles["list_annotation_values"] == "List iNaturalist Annotation Values"
+    assert titles["list_taxa"] == "Search iNaturalist Taxa"
+    assert titles["backfill_events"] == "Backfill iNaturalist Observations"
+    # Every action shown in the portal has a friendly name, not one derived from its id.
+    assert all(titles.values()), [a for a, t in titles.items() if not t]
 
 
 SECRET_API_KEY = "inat-secret-api-key-do-not-log"

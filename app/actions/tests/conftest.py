@@ -89,7 +89,9 @@ def inaturalist_integration_v2():
     'days_to_load': 5,
     'event_prefix': 'iNat: ',
     'quality_grade': [],
-    'include_photos': True
+    'include_photos': True,
+    # The recorded observations below were uploaded in 2024.
+    'max_age_days': 3650
 })], webhook_configuration = None, default_route = ConnectionRoute(id = UUID('a3a1f096-43fe-4102-8742-bd4f2c539a4d'), name = 'Test iNaturalist - Default Route'), additional = {}, status = 'healthy', status_details = 'No issues detected')
 
 
@@ -176,7 +178,9 @@ def inaturalist_integration_v2_without_bounding_box():
     'days_to_load': 5,
     'event_prefix': 'iNat: ',
     'quality_grade': [],
-    'include_photos': True
+    'include_photos': True,
+    # The recorded observations below were uploaded in 2024.
+    'max_age_days': 3650
 })], webhook_configuration = None, default_route = ConnectionRoute(id = UUID('a3a1f096-43fe-4102-8742-bd4f2c539a4d'), name = 'Test iNaturalist - Default Route'), additional = {}, status = 'healthy', status_details = 'No issues detected')
 
 
@@ -191,7 +195,9 @@ def inaturalist_integration_v2_with_taxa_string():
     'days_to_load': 5,
     'event_prefix': 'iNat: ',
     'quality_grade': [],
-    'include_photos': True
+    'include_photos': True,
+    # The recorded observations below were uploaded in 2024.
+    'max_age_days': 3650
 })], webhook_configuration = None, default_route = ConnectionRoute(id = UUID('a3a1f096-43fe-4102-8742-bd4f2c539a4d'), name = 'Test iNaturalist - Default Route'), additional = {}, status = 'healthy', status_details = 'No issues detected')
 
 
