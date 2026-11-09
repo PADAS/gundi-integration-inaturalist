@@ -116,23 +116,22 @@ def _get_load_since(state: dict, fallback_days: int) -> datetime:
     further back than fallback_days, so a connection that fell behind reads
     recent changes instead of crawling months of old ones."""
     floor = datetime.now(tz=timezone.utc) - timedelta(days=fallback_days)
-    raw = state.get(STATE_LAST_RUN_KEY) or state.get("updated_to")
-    if not raw:
-        return floor
-    cursor = datetime.strptime(raw, STATE_DATETIME_FMT)
-    if cursor.tzinfo is None:
-        cursor = cursor.replace(tzinfo=timezone.utc)
-    return max(cursor, floor)
+    cursor = _stored_cursor(state)
+    return max(cursor, floor) if cursor else floor
 
 
 def _stored_cursor(state: dict) -> Optional[datetime]:
+    """The saved cursor (`last_run`, or the legacy `updated_to`), always tz-aware; None when there
+    is none or it can't be read (the pull then starts at the days_to_load floor)."""
     raw = (state or {}).get(STATE_LAST_RUN_KEY) or (state or {}).get("updated_to")
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, STATE_DATETIME_FMT)
+        cursor = datetime.strptime(raw, STATE_DATETIME_FMT)
     except (TypeError, ValueError):
+        logger.warning(f"Ignoring a saved pull cursor that can't be read: {raw!r}.")
         return None
+    return cursor if cursor.tzinfo else cursor.replace(tzinfo=timezone.utc)
 
 
 async def _warn_cursor_floor(integration: Integration, cursor: datetime, floor: datetime, days_to_load: int):
@@ -562,6 +561,7 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
 
             batch, new_ids, patch_targets, photos_left_behind = [], set(), {}, set()
             outcomes = {}  # id -> what _sort_observation decided, counted once its chunk is saved
+            prepared = {}  # id -> (saved row, payload, hash) for the updates, from _sort_observation
             progress.step = "checking which observations are new or changed"
             for ob in page:
                 if ob.id in seen:
@@ -571,7 +571,8 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                 if not annotations or _match_annotations_to_config(ob.annotations, annotations):
                     progress.observations_read += 1
                     outcomes[ob.id] = await _sort_observation(integration, action_config, ob, new_ids,
-                                                              patch_targets, photos_left_behind, now=now)
+                                                              patch_targets, photos_left_behind, now=now,
+                                                              prepared=prepared)
                 if new_found + len(new_ids) >= max_new:
                     break
             new_found += len(new_ids)
@@ -597,10 +598,10 @@ async def _pull_events(integration: Integration, action_config: PullEventsConfig
                         stopped_on_time = True
                         break
                     progress.step = "updating changed observations in Gundi"
-                    response = await patch_events([item], action_config, integration, progress)
+                    response = await patch_events([item], action_config, integration, progress, prepared=prepared)
                     updated_count += len(response)
                     progress.step = "saving which observations were updated"
-                    await save_patched_events_state([item], integration, action_config)
+                    await save_patched_events_state([item], integration, action_config, prepared=prepared)
                 if stopped_on_time:
                     break
                 to_resume = [ob.id for ob in chunk if ob.id in photos_left_behind]
@@ -705,7 +706,8 @@ def _payload_hash(event: dict) -> str:
 
 
 async def _sort_observation(integration: Integration, action_config: PullEventsConfig, observation: Observation,
-                            new_ids: set, patch_targets: dict, photos_left_behind: set, *, now: datetime) -> str:
+                            new_ids: set, patch_targets: dict, photos_left_behind: set, *, now: datetime,
+                            prepared: Optional[dict] = None) -> str:
     """Sort one observation by what to do with it, and say which:
 
     - "too_old": uploaded more than max_age_days ago; nothing is stored for it.
@@ -735,9 +737,13 @@ async def _sort_observation(integration: Integration, action_config: PullEventsC
     if (photos or {}).get("pending"):
         photos_left_behind.add(observation.id)
     payload = _transform_inat_to_gundi_event(observation, action_config)
-    if saved_event.get(STATE_SENT_HASH_KEY) == _payload_hash(payload):
+    payload_hash = _payload_hash(payload)
+    if saved_event.get(STATE_SENT_HASH_KEY) == payload_hash:
         return "unchanged"
     patch_targets[observation.id] = saved_event.get("object_id")
+    if prepared is not None:
+        # What the patch needs, so it neither reads the row nor builds and hashes the payload again.
+        prepared[observation.id] = (saved_event, payload, payload_hash)
     return "update"
 
 
@@ -794,7 +800,8 @@ async def _send_new_observations(integration, action_config, observations, progr
     return len(response), 0
 
 
-async def _send_marked(integration_id: str, inat_ids: List[str], events: List[dict]) -> list:
+async def _send_marked(integration_id: str, inat_ids: List[str], events: List[dict],
+                       extra: Optional[dict] = None) -> list:
     """Send new events with a "being sent" note on each observation's row first.
 
     Gundi accepted what comes back; save_events_state then replaces the note with the
@@ -805,7 +812,10 @@ async def _send_marked(integration_id: str, inat_ids: List[str], events: List[di
     marked = []
     try:
         for inat_id in inat_ids:
-            await state_manager.set_state(integration_id, "pull_events", {STATE_SENDING_KEY: since}, source_id=inat_id)
+            # `extra` tags the note (the backfill's job and batch), so a sighting that may have been
+            # created counts against the backfill's limit even if the run dies before saving it.
+            await state_manager.set_state(integration_id, "pull_events", {STATE_SENDING_KEY: since, **(extra or {})},
+                                          source_id=inat_id)
             marked.append(inat_id)
     except BaseException:
         # Nothing was sent: the notes written so far must not hide these sightings.
@@ -814,7 +824,8 @@ async def _send_marked(integration_id: str, inat_ids: List[str], events: List[di
     try:
         response = await send_events_to_gundi(events=events, integration_id=integration_id) or []
     except BaseException as e:
-        if gundi_may_have_created(e):
+        # A failure before the post (fetching the API key) sent nothing, whatever its kind.
+        if getattr(e, "gundi_post_started", True) and gundi_may_have_created(e):
             # Cut off, timed out waiting for Gundi's answer, or Gundi's side failed after the
             # request reached it: it may have created them, so the notes stay and these
             # sightings are never sent again. Their ids are logged here, once, so they can be
@@ -1048,12 +1059,15 @@ async def _log_photo_run(integration: Integration, run: _PhotoRun, left: List[st
     }, "photo run summary", action_id="add_photos")
 
 
-async def patch_events(events, updated_config_data, integration, progress: Optional[_PullProgress] = None):
+async def patch_events(events, updated_config_data, integration, progress: Optional[_PullProgress] = None,
+                       prepared: Optional[dict] = None):
+    """`prepared` ({id: (row, payload, hash)} from _sort_observation) saves building the payload again."""
     responses = []
     for event in events:
         gundi_object_id = event[0]
         new_event = event[1]
-        transformed_data = _transform_inat_to_gundi_event(new_event, updated_config_data)
+        known = (prepared or {}).get(new_event.id)
+        transformed_data = known[1] if known else _transform_inat_to_gundi_event(new_event, updated_config_data)
         if transformed_data:
             response = await update_event_in_gundi(
                 event_id=gundi_object_id,
@@ -1126,13 +1140,18 @@ async def save_events_state(response, events, integration, inat_updated_at_map=N
         raise failures[0][1]
 
 
-async def save_patched_events_state(events_to_patch, integration, action_config: PullEventsConfig):
-    """After patching, update per-observation state so we don't patch again until what we send changes."""
+async def save_patched_events_state(events_to_patch, integration, action_config: PullEventsConfig,
+                                    prepared: Optional[dict] = None):
+    """After patching, update per-observation state so we don't patch again until what we send changes.
+    `prepared` ({id: (row, payload, hash)} from _sort_observation, read under this run's lock) saves
+    reading the row and hashing the payload again."""
     for gundi_object_id, observation in events_to_patch:
         try:
             updated_at = observation.updated_at
+            known = (prepared or {}).get(observation.id)
             # Merged into the saved row, so fields other writers keep there (the backfill's tags) survive.
-            saved = await state_manager.get_state(str(integration.id), "pull_events", str(observation.id)) or {}
+            saved = known[0] if known else (
+                await state_manager.get_state(str(integration.id), "pull_events", str(observation.id)) or {})
             state = {
                 **saved,
                 "object_id": gundi_object_id,
@@ -1140,7 +1159,8 @@ async def save_patched_events_state(events_to_patch, integration, action_config:
                     updated_at.strftime(STATE_DATETIME_FMT)
                     if hasattr(updated_at, "strftime") else str(updated_at)
                 ),
-                STATE_SENT_HASH_KEY: _payload_hash(_transform_inat_to_gundi_event(observation, action_config)),
+                STATE_SENT_HASH_KEY: known[2] if known else _payload_hash(
+                    _transform_inat_to_gundi_event(observation, action_config)),
             }
             await state_manager.set_state(
                 integration_id=str(integration.id),
@@ -1431,7 +1451,11 @@ async def _run_followups(integration: Integration, job: BackfillContinueConfig, 
     """Start the next runs (the backfill's continuation first), then publish the notes that say so.
     If the continuation can't be started, say the backfill stopped instead."""
     integration_id = str(integration.id)
-    for action_id, config in sorted(followups, key=lambda f: f[0] != "backfill_events_continue"):
+    # Published (asynchronous) the continuation goes first: it waits before taking the lock, so the
+    # pull still gets it. Run in place (TRIGGER_ACTIONS_ALWAYS_SYNC) each start runs to its end, so the
+    # pull must go first there or the whole continuation chain would run before it.
+    pull_first = settings.TRIGGER_ACTIONS_ALWAYS_SYNC
+    for action_id, config in sorted(followups, key=lambda f: (f[0] == "backfill_events_continue") == pull_first):
         try:
             await trigger_action(integration_id, action_id, config)
         except Exception as e:
@@ -1641,7 +1665,8 @@ async def _backfill_locked(integration: Integration, pull_config: PullEventsConf
                 _warn_unconfirmed(integration, unconfirmed)
                 if to_add:
                     events = [_transform_inat_to_gundi_event(ob, pull_config) for ob in to_add]
-                    response = await _send_marked(integration_id, [str(ob.id) for ob in to_add], events)
+                    response = await _send_marked(integration_id, [str(ob.id) for ob in to_add], events,
+                                                  extra={"backfill_job": key, "backfill_batch": job.batch_index})
                     accepted = len(response)
                     if accepted:
                         await save_events_state(

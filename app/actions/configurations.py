@@ -265,12 +265,12 @@ class PullEventsConfig(PullActionConfiguration):
                     cleaned[part.strip()] = None
         return list(cleaned) or None
 
-    # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("max_photos", "max_age_days", "max_new_events_per_run", pre=True)
     def _empty_limit_uses_default(cls, value, field):
         # A portal that stores null or "" for an untouched number must not stop the pull.
         return field.default if value is None or (isinstance(value, str) and not value.strip()) else value
 
+    # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
     def validate_region_code(cls, v, values):
         if 'any' == str(v).lower():

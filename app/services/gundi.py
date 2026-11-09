@@ -135,12 +135,20 @@ async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     def nothing_reached_gundi(exc: BaseException) -> bool:
         return is_transient_gundi_error(exc) and not (posting and gundi_may_have_created(exc))
 
-    async for attempt in stamina.retry_context(**{**GUNDI_API_RETRY, "on": nothing_reached_gundi}):
-        with attempt:
-            posting = False
-            sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
-            posting = True
-            return await sensors_api_client.post_events(data=events)
+    try:
+        async for attempt in stamina.retry_context(**{**GUNDI_API_RETRY, "on": nothing_reached_gundi}):
+            with attempt:
+                posting = False
+                sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
+                posting = True
+                return await sensors_api_client.post_events(data=events)
+    except BaseException as exc:
+        # Tells the caller whether the failure came before the post (nothing sent) or during it.
+        try:
+            exc.gundi_post_started = posting
+        except Exception:
+            pass
+        raise
 
 
 @stamina.retry(**GUNDI_API_RETRY)

@@ -284,6 +284,26 @@ async def test_send_events_does_not_retry_a_post_whose_answer_was_lost(
 
 
 @pytest.mark.asyncio
+async def test_send_events_says_whether_the_post_had_started(
+        no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
+):
+    """The caller keeps "being sent" notes only for a failure during the post: one in the key
+    lookup sent nothing."""
+    import asyncio
+
+    _sender(mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key, [httpx.ReadTimeout("no answer")])
+    with pytest.raises(httpx.ReadTimeout) as during:
+        await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
+    assert during.value.gundi_post_started is True
+
+    key_lookup = AsyncMock(side_effect=asyncio.TimeoutError())
+    _sender(mocker, mock_gundi_sensors_client_class, key_lookup, [[{"object_id": "g1"}]])
+    with pytest.raises(asyncio.TimeoutError) as before:
+        await send_events_to_gundi(events=[{"title": "x"}], integration_id="abc-123")
+    assert before.value.gundi_post_started is False
+
+
+@pytest.mark.asyncio
 async def test_send_events_retries_the_key_lookup_on_a_portal_5xx(
         no_backoff, mocker, mock_gundi_sensors_client_class,
 ):

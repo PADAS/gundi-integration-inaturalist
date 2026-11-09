@@ -2246,3 +2246,40 @@ async def test_a_pull_names_the_unconfirmed_sightings_it_skips(mocker, caplog):
 
     assert result["result"]["events_extracted"] == 1
     assert "may already have sent to Gundi" in caplog.text and "Observation ids: 1." in caplog.text
+
+
+# --- Chris's review (Nov 9) ---
+
+
+def test_an_unreadable_saved_cursor_starts_at_the_floor():
+    result = _get_load_since({STATE_LAST_RUN_KEY: "not a date"}, 3)
+    floor = datetime.now(tz=timezone.utc) - timedelta(days=3)
+    assert abs((result - floor).total_seconds()) < 5
+
+
+@pytest.mark.asyncio
+async def test_an_update_reuses_the_row_and_payload_from_the_sort(mocker):
+    from app.actions.handlers import save_patched_events_state, patch_events  # the real ones, before the mocks
+    _, _, store, _ = _pull_setup(mocker, 1, saved_state=_synced(1, changed=True))
+    mocker.patch("app.actions.handlers.save_patched_events_state", side_effect=save_patched_events_state)
+    mocker.patch("app.actions.handlers.patch_events", side_effect=patch_events)
+    update = mocker.patch("app.actions.handlers.update_event_in_gundi", AsyncMock(return_value={}))
+    transform = mocker.patch("app.actions.handlers._transform_inat_to_gundi_event",
+                             side_effect=lambda ob, config: {"event_details": {"inat_id": str(ob.id)}})
+    from app.actions import handlers as h
+    real_get = h.state_manager.get_state.side_effect
+    row_reads = []
+
+    def counting_get(integration_id, action_id, source_id="no-source"):
+        if source_id == "1":
+            row_reads.append(source_id)
+        return real_get(integration_id, action_id, source_id)
+    h.state_manager.get_state.side_effect = counting_get
+
+    result = await action_pull_events(_lock_test_integration(), _config())
+
+    assert result["result"]["events_updated"] == 1
+    assert transform.call_count == 1  # built once, in the sort; the patch and the saved hash reuse it
+    assert len(row_reads) == 1  # read once, in the sort; the state save reuses it
+    assert update.call_args.kwargs["event"] == {"event_details": {"inat_id": "1"}}
+    assert store["1"][STATE_SENT_HASH_KEY] == _payload_hash({"event_details": {"inat_id": "1"}})

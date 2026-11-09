@@ -1242,3 +1242,81 @@ async def test_the_backfill_names_the_unconfirmed_sightings_it_skips(backfill, c
         await handlers._backfill(_integration(), _job())
 
     assert "may already have sent to Gundi" in caplog.text and "Observation ids: 1." in caplog.text
+
+
+# --- Chris's and Copilot's review (Nov 9) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancelled", "timeout"])
+async def test_a_failure_before_the_post_clears_the_notes(backfill, failure):
+    """Fetching the API key failed: nothing was sent, so the sightings must not stay marked."""
+    import asyncio
+
+    exc = asyncio.CancelledError() if failure == "cancelled" else asyncio.TimeoutError()
+    exc.gundi_post_started = False
+    backfill.send.side_effect = exc
+
+    with pytest.raises(type(exc)):
+        await handlers._send_marked("i", ["1", "2"], [{}, {}])
+
+    assert "1" not in backfill.store and "2" not in backfill.store
+
+
+@pytest.mark.asyncio
+async def test_a_lost_answer_during_the_post_keeps_the_notes(backfill):
+    import httpx
+
+    exc = httpx.ReadTimeout("slow")
+    exc.gundi_post_started = True
+    backfill.send.side_effect = exc
+
+    with pytest.raises(httpx.ReadTimeout):
+        await handlers._send_marked("i", ["1"], [{}])
+
+    assert "sending_since" in backfill.store["1"]
+
+
+@pytest.mark.asyncio
+async def test_sightings_left_being_sent_by_this_backfill_count_against_its_limit(backfill):
+    """Gundi may have created them before the run died: they use up the limit like saved ones."""
+    job = _job(max_events=2)
+    key = handlers._backfill_key(job)
+    for i in ("1", "2"):
+        backfill.store[i] = {"sending_since": "2026-11-09 10:00:00+0000", "backfill_job": key, "backfill_batch": 0}
+    backfill.pages = [(0, 1, [_ob(1), _ob(2), _ob(3)])]
+
+    result = await handlers._backfill(_integration(), job)
+
+    backfill.send.assert_not_called()
+    assert result["result"]["backfill_events_created"] == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_notes_carry_the_job_and_batch(backfill):
+    job = _job()
+    seen_notes = []
+    real_set = backfill.state.set_state.side_effect
+
+    async def watch(integration_id, action_id, state, source_id="no-source"):
+        if "sending_since" in state:
+            seen_notes.append(state)
+        return await real_set(integration_id, action_id, state, source_id)
+    backfill.state.set_state.side_effect = watch
+    backfill.pages = [(0, 1, [_ob(1)])]
+
+    await handlers._backfill(_integration(), job)
+
+    assert seen_notes and seen_notes[0]["backfill_job"] == handlers._backfill_key(job)
+    assert seen_notes[0]["backfill_batch"] == 0
+
+
+@pytest.mark.asyncio
+async def test_in_synchronous_mode_the_pull_starts_before_the_continuation(backfill, mocker):
+    mocker.patch.object(handlers.settings, "TRIGGER_ACTIONS_ALWAYS_SYNC", True)
+    backfill.store["pull_waiting"] = 1
+    backfill.pages = [(0, 1, [_ob(1)]), (0, 1, [_ob(2)])]
+
+    await handlers._backfill(_integration(), _job())
+
+    assert [c.args[1] for c in backfill.trigger.call_args_list] == ["pull_events", "backfill_events_continue"]
