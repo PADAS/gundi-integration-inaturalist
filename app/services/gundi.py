@@ -22,7 +22,7 @@ from app import settings  # noqa: F401
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
 
 from .activity_logger import ephemeral_run
-from .retry_policies import is_transient_gundi_error
+from .retry_policies import gundi_may_have_created, is_transient_gundi_error
 
 
 class EphemeralWriteBlocked(RuntimeError):
@@ -94,10 +94,20 @@ async def _get_sensors_api_client(integration_id):
     return sensors_api_client
 
 
-@stamina.retry(**GUNDI_API_RETRY)
 async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     """
-    Send Events to Gundi using the REST API v2
+    Send Events to Gundi using the REST API v2.
+
+    Creating events is not idempotent: once the request has reached Gundi,
+    sending it again can create every event a second time, and the pull's
+    "no duplicate events" rule (spec B13) rests on never doing that. So this
+    helper runs GUNDI_API_RETRY with one difference from the others: a
+    failure of the post itself is tried again only when Gundi answered (a
+    429 or 5xx) or was never reached (see gundi_may_have_created). A lost
+    answer (a timeout after the request was sent, a closed connection) is
+    raised at once, and the caller keeps the events marked as possibly
+    sent. The API-key lookup before the post sends nothing and is tried
+    again on any transient error.
     :param events: A list of events in the following format:
     [
         {
@@ -120,8 +130,25 @@ async def send_events_to_gundi(events: List[dict], **kwargs) -> dict:
     _block_if_ephemeral("send_events_to_gundi")
     integration_id = kwargs.get("integration_id")
     assert integration_id, "integration_id is required"
-    sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
-    return await sensors_api_client.post_events(data=events)
+    posting = False
+
+    def nothing_reached_gundi(exc: BaseException) -> bool:
+        return is_transient_gundi_error(exc) and not (posting and gundi_may_have_created(exc))
+
+    try:
+        async for attempt in stamina.retry_context(**{**GUNDI_API_RETRY, "on": nothing_reached_gundi}):
+            with attempt:
+                posting = False
+                sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
+                posting = True
+                return await sensors_api_client.post_events(data=events)
+    except BaseException as exc:
+        # Tells the caller whether the failure came before the post (nothing sent) or during it.
+        try:
+            exc.gundi_post_started = posting
+        except Exception:
+            pass
+        raise
 
 
 @stamina.retry(**GUNDI_API_RETRY)

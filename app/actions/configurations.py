@@ -1,11 +1,13 @@
+from datetime import datetime
 from typing import Optional, List, Dict, Literal
 import json
 import pydantic
 from pyinaturalist.constants import QUALITY_GRADES
 from .core import (
     PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin, ReferenceActionConfiguration,
-    InternalActionConfiguration,
+    InternalActionConfiguration, GenericActionConfiguration,
 )
+from app import settings
 from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
@@ -110,7 +112,7 @@ class PullEventsConfig(PullActionConfiguration):
         ui_options=UIOptions(
             widget="range",  # This will be rendered ad a range slider
         ),
-        description="The number of days of data to load from iNaturalist.  If the integration state contains a last_run value, this parameter will be ignored and data will be loaded since the last_run value.")
+        description="The number of days of data to load from iNaturalist. If the integration state contains a last_run value, data is loaded since that value, but never from further back than this many days.")
 
     bounding_box: Optional[str] = pydantic.Field(title = "Bounding box",
         description="Required when no project is selected. Draw a box on the map or enter its coordinates.")
@@ -145,6 +147,27 @@ class PullEventsConfig(PullActionConfiguration):
     include_photos: Optional[bool] = pydantic.Field(True, title="Include photos",
         description = "Whether or not to include the photos from iNaturalist observations.  Default: True")
 
+    max_photos: int = FieldWithUIOptions(
+        3,
+        title="Photos per sighting",
+        ge=0,
+        le=50,
+        description="How many of a sighting's photos to send, in iNaturalist order. 0 sends none. Default: 3")
+
+    max_age_days: int = FieldWithUIOptions(
+        150,
+        title="Max age (days)",
+        ge=1,
+        le=3650,
+        description="Sightings uploaded to iNaturalist more than this many days ago are neither created nor updated in EarthRanger. Default: 150 (about 5 months)")
+
+    max_new_events_per_run: int = FieldWithUIOptions(
+        min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000),
+        title="New events per run",
+        ge=1,
+        le=1000,
+        description=f"Most new events one run sends; updates don't count. A larger backlog drains over several runs. Default: {min(settings.INAT_MAX_NEW_EVENTS_PER_PULL, 1000)}")
+
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
             "taxa",
@@ -156,6 +179,9 @@ class PullEventsConfig(PullActionConfiguration):
             "event_type",
             "event_prefix",
             "include_photos",
+            "max_photos",
+            "max_age_days",
+            "max_new_events_per_run",
             "run_on_schedule",
         ],
     )
@@ -238,6 +264,11 @@ class PullEventsConfig(PullActionConfiguration):
                 if part.strip():
                     cleaned[part.strip()] = None
         return list(cleaned) or None
+
+    @pydantic.validator("max_photos", "max_age_days", "max_new_events_per_run", pre=True)
+    def _empty_limit_uses_default(cls, value, field):
+        # A portal that stores null or "" for an untouched number must not stop the pull.
+        return field.default if value is None or (isinstance(value, str) and not value.strip()) else value
 
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("event_type", "event_prefix", always=True)
@@ -372,6 +403,48 @@ class AddPhotosConfig(InternalActionConfiguration):
     observation_ids: List[str] = pydantic.Field(default_factory=list)
     # Photo runs in a row that couldn't add any photo, for the warning/error choice.
     runs_without_progress: int = 0
+
+
+class BackfillEventsConfig(GenericActionConfiguration, ExecutableActionMixin):
+    """Loads older sightings into EarthRanger, using this connection's pull settings. Save these settings,
+    then run it. It creates events only: it doesn't update events, and backfilled sightings get no photos,
+    recent ones included. It runs only when started by hand."""
+    days_back: int = FieldWithUIOptions(
+        30,
+        title="Days to backfill",
+        ge=1,
+        le=3650,
+        description="Sightings uploaded to iNaturalist in this many days before the backfill starts are loaded, "
+                    "oldest first. Default: 30")
+    max_events: int = FieldWithUIOptions(
+        1000,
+        title="Most events to create",
+        ge=1,
+        le=100_000,
+        description="The backfill stops once it has created this many events, even if it hasn't reached the end "
+                    "of the window. Running it again continues; sightings already sent are skipped. Default: 1000")
+
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(order=["days_back", "max_events"])
+
+
+class BackfillContinueConfig(InternalActionConfiguration):
+    """Started by a backfill run that reached its time budget: where it is."""
+    created_from: datetime
+    created_to: datetime
+    max_events: int
+    created_so_far: int = 0
+    batch_index: int = 0
+    after_id: int = 0
+    # Runs in a row that handed over because another run held the lock.
+    lock_waits: int = 0
+    # Runs in a row that ended where they started, for the stop on no progress.
+    runs_without_progress: int = 0
+    # Set when this run handed over so a waiting pull could go first: the next run waits a moment.
+    yield_to_pull: bool = False
+    # Which run of the chain this is: a run whose seq is behind the saved one is a duplicate and stops.
+    seq: int = 0
+    # Fingerprint of the pull filters the backfill started with; a change stops it.
+    filters: str = ""
 
 
 class ListProjectsQuery(ReferenceActionConfiguration):

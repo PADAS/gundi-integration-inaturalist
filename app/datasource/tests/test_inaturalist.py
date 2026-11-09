@@ -837,3 +837,59 @@ def test_reads_without_annotations_send_no_annotation_filter(mocker):
     list(iter_observation_pages(datetime(2026, 6, 19, tzinfo=timezone.utc)))
 
     assert calls and all("term_id" not in c for c in calls)
+
+
+# --- iter_upload_pages (manual backfill) ---
+
+
+def _upload_json(i):
+    return {"id": i, "created_at": "2025-01-01T00:00:00+00:00", "updated_at": "2025-01-02T00:00:00+00:00"}
+
+
+def test_iter_upload_pages_walks_the_window_by_id_and_batch(mocker):
+    from app.datasource.inaturalist import iter_upload_pages, TAXA_BATCH_SIZE
+
+    calls = []
+    answers = {(None, "batch0"): [[1, 2], [3], []], (5, "batch1"): [[4], []]}
+    served = {}
+
+    def fake(**params):
+        calls.append(params)
+        key = "batch0" if params["taxon_id"].startswith("1,") else "batch1"
+        pages = answers[(None, key)] if key == "batch0" else answers[(5, key)]
+        n = served.get(key, 0)
+        served[key] = n + 1
+        return {"results": [_upload_json(i) for i in pages[n]]}
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=fake)
+    mocker.patch("app.datasource.inaturalist.INAT_PAGE_SIZE", 2)  # a page of 1 is then the last one
+    taxa = ",".join(str(i) for i in range(1, TAXA_BATCH_SIZE + 2))  # two batches
+    start, end = datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    pages = list(iter_upload_pages(start, end, taxa=taxa, quality_grade=["research"], bounding_box=[1, 1, 0, 0]))
+
+    assert [(i, n, [o.id for o in page]) for i, n, page in pages] == [(0, 2, [1, 2]), (0, 2, [3]), (1, 2, [4])]
+    first = calls[0]
+    assert (first["order_by"], first["order"]) == ("id", "asc")
+    assert first["created_d1"] == start.isoformat() and first["created_d2"] == end.isoformat()
+    assert "updated_since" not in first and "id_above" not in first
+    assert first["quality_grade"] == ["research"] and first["nelat"] == 1
+    assert first["per_page"] == 2 and "id" in first["fields"]
+    assert calls[1]["id_above"] == 2
+    assert len(calls) == 3  # the short page [3] ends batch 0 without asking for an empty one
+    assert "id_above" not in calls[2]  # the next taxa batch starts at the beginning of the window
+
+
+def test_iter_upload_pages_resumes_from_a_batch_and_id(mocker):
+    from app.datasource.inaturalist import iter_upload_pages
+
+    calls = []
+
+    def fake(**params):
+        calls.append(params)
+        return {"results": []}
+    mocker.patch("app.datasource.inaturalist.get_observations_v2", side_effect=fake)
+
+    list(iter_upload_pages(datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2026, 1, 1, tzinfo=timezone.utc),
+                           batch_index=0, after_id=99, bounding_box=[1, 1, 0, 0]))
+
+    assert calls[0]["id_above"] == 99

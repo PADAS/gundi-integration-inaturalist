@@ -405,3 +405,47 @@ def test_annotations_ask_for_one_row_per_filter():
     # The row layout is opt-in on the array only; the items keep their references.
     assert "gundi:reference" in ui["annotations"]["items"]["term"]
 
+
+
+# --- pull limits ---
+
+
+def _limits_config(**kwargs):
+    from app.actions.configurations import PullEventsConfig
+    return PullEventsConfig(bounding_box="[1, 1, 0, 0]", event_prefix="iNat: ", **kwargs)
+
+
+def test_pull_limits_have_defaults():
+    from app import settings
+
+    config = _limits_config()
+    assert config.max_age_days == 150
+    assert config.max_photos == 3
+    assert config.max_new_events_per_run == settings.INAT_MAX_NEW_EVENTS_PER_PULL
+
+
+def test_pull_limits_accept_a_stored_config_without_them():
+    from app.actions.configurations import PullEventsConfig
+
+    config = PullEventsConfig.parse_obj({"bounding_box": "[1, 1, 0, 0]", "event_prefix": "iNat: ", "days_to_load": 3})
+    assert (config.max_age_days, config.max_photos) == (150, 3)
+
+
+@pytest.mark.parametrize("field, bad", [
+    ("max_age_days", 0), ("max_age_days", 3651),
+    ("max_photos", -1), ("max_photos", 51),
+    ("max_new_events_per_run", 0), ("max_new_events_per_run", 1001),
+])
+def test_pull_limits_reject_out_of_range(field, bad):
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _limits_config(**{field: bad})
+
+
+def test_pull_limits_are_in_the_form_after_include_photos():
+    from app.actions.configurations import PullEventsConfig
+
+    order = PullEventsConfig.__fields__["ui_global_options"].default.order
+    assert order.index("include_photos") < order.index("max_photos") < order.index("max_age_days") \
+        < order.index("max_new_events_per_run") < order.index("run_on_schedule")
